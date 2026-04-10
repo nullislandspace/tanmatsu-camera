@@ -148,8 +148,11 @@ static void render_task(void *arg) {
             .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
             .scale_x        = scale_x,
             .scale_y        = scale_y,
-            .mirror_x       = false,
-            .mirror_y       = true,  // sensor delivers vertically flipped; undo at no CPU cost
+            // Sensor feed is vertically flipped AND left/right mirrored
+            // relative to how the user expects to see it on the display.
+            // Both flips are free on the PPA.
+            .mirror_x       = true,
+            .mirror_y       = true,
             .rgb_swap       = false,
             .byte_swap      = false,
             .mode           = PPA_TRANS_MODE_NON_BLOCKING,
@@ -244,6 +247,10 @@ esp_err_t camera_preview_start(uint32_t preview_w, uint32_t preview_h) {
     ESP_ERROR_CHECK(esp_cam_ctlr_register_event_callbacks(s_csi, &cbs, NULL));
     ESP_ERROR_CHECK(esp_cam_ctlr_enable(s_csi));
 
+    // OV5647 sensor reports bayer_type=GBRG in its isp_info. Without this
+    // the ISP defaults to BGGR (enum value 0), which demosaics the wrong
+    // colour for every pixel and produces the classic green/magenta
+    // speckle pattern on coloured regions.
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_hz                 = 80 * 1000 * 1000,
         .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
@@ -253,6 +260,7 @@ esp_err_t camera_preview_start(uint32_t preview_w, uint32_t preview_h) {
         .has_line_end_packet    = false,
         .h_res                  = PREVIEW_WIDTH,
         .v_res                  = PREVIEW_HEIGHT,
+        .bayer_order            = COLOR_RAW_ELEMENT_ORDER_GBRG,
     };
     err = esp_isp_new_processor(&isp_cfg, &s_isp);
     if (err != ESP_OK) {
@@ -345,3 +353,7 @@ esp_err_t camera_preview_wait_frame(uint32_t timeout_ms) {
 const uint8_t *camera_preview_get_pixels(void) { return s_preview_buffer; }
 uint32_t       camera_preview_get_width(void)  { return s_preview_w; }
 uint32_t       camera_preview_get_height(void) { return s_preview_h; }
+
+const uint8_t *camera_preview_get_raw_pixels(void) { return s_camera_buffer; }
+uint32_t       camera_preview_get_raw_width(void)  { return PREVIEW_WIDTH; }
+uint32_t       camera_preview_get_raw_height(void) { return PREVIEW_HEIGHT; }

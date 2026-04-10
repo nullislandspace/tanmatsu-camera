@@ -5,6 +5,7 @@ idf_component_register(
 		"fastopen.c"
 		"camera_sensor.c"
 		"camera_pipeline.c"
+		"bmp_writer.c"
 		"usb_device.c"
 	PRIV_REQUIRES
 		esp_lcd

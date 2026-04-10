@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
@@ -18,12 +19,28 @@
 #include "pax_gfx.h"
 #include "pax_text.h"
 #include "pax_shapes.h"
+#include "bmp_writer.h"
 #include "camera_pipeline.h"
 #include "camera_sensor.h"
 #include "sdcard.h"
 #include "usb_device.h"
 
 #define DCIM_PATH "/sd/DCIM"
+
+typedef enum {
+    MODE_PHOTO = 0,
+    MODE_VIDEO,
+    MODE_VIEW,
+} app_mode_t;
+
+static const char *mode_name(app_mode_t m) {
+    switch (m) {
+        case MODE_PHOTO: return "PHOTO";
+        case MODE_VIDEO: return "VIDEO";
+        case MODE_VIEW:  return "VIEW";
+    }
+    return "?";
+}
 
 static char const TAG[] = "main";
 
@@ -245,20 +262,112 @@ void app_main(void) {
     int preview_x = ((int)logical_w - (int)camera_preview_get_width())  / 2;
     int preview_y = ((int)logical_h - (int)camera_preview_get_height()) / 2;
 
-    while (1) {
-        if (camera_preview_wait_frame(100) == ESP_OK) {
-            pax_background(&fb, BLACK);
-            pax_draw_image(&fb, &preview_pax, preview_x, preview_y);
-            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 8, 8, "PHOTO  F1 view  F2 photo  F3 video  ESC exit");
-            blit();
-            camera_preview_give_render_ready();
-        }
+    app_mode_t mode          = MODE_PHOTO;
+    bool       space_pending = false;
 
+    // Banner state for brief on-screen messages after a save.
+    char       banner_text[64] = {0};
+    TickType_t banner_until    = 0;
+
+    while (1) {
+        // Drain any queued input events. Mode switches apply on the next
+        // frame; space is latched so the snapshot runs after the blit.
         bsp_input_event_t event;
         while (xQueueReceive(input_event_queue, &event, 0) == pdTRUE) {
-            if (event.type == INPUT_EVENT_TYPE_NAVIGATION && event.args_navigation.state &&
-                event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_ESC) {
-                bsp_device_restart_to_launcher();
+            if (event.type == INPUT_EVENT_TYPE_NAVIGATION && event.args_navigation.state) {
+                switch (event.args_navigation.key) {
+                    case BSP_INPUT_NAVIGATION_KEY_ESC:
+                        bsp_device_restart_to_launcher();
+                        break;
+                    case BSP_INPUT_NAVIGATION_KEY_F1:
+                        mode = MODE_VIEW;
+                        break;
+                    case BSP_INPUT_NAVIGATION_KEY_F2:
+                        mode = MODE_PHOTO;
+                        break;
+                    case BSP_INPUT_NAVIGATION_KEY_F3:
+                        mode = MODE_VIDEO;
+                        break;
+                    default:
+                        break;
+                }
+            }
+            if (event.type == INPUT_EVENT_TYPE_KEYBOARD && event.args_keyboard.ascii == ' ') {
+                space_pending = true;
+            }
+        }
+
+        if (camera_preview_wait_frame(100) != ESP_OK) {
+            continue;
+        }
+
+        // Draw the live preview into the rotated PAX framebuffer. The
+        // preview_pax buffer aliases s_preview_buffer (RGB565); PAX handles
+        // the RGB565 → RGB888 conversion into fb.
+        pax_background(&fb, BLACK);
+        pax_draw_image(&fb, &preview_pax, preview_x, preview_y);
+
+        // HUD: top bar with mode name and key hints.
+        char hud[96];
+        snprintf(hud, sizeof(hud), "%s   F1 view  F2 photo  F3 video  Esc exit",
+                 mode_name(mode));
+        pax_simple_rect(&fb, 0xC0000000, 0, 0, (float)logical_w, 22);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 8, 3, hud);
+
+        // Context-specific bottom bar.
+        const char *bottom_hint = "";
+        switch (mode) {
+            case MODE_PHOTO: bottom_hint = "SPACE = snapshot (BMP debug dump)"; break;
+            case MODE_VIDEO: bottom_hint = "SPACE = start/stop record  (not implemented)"; break;
+            case MODE_VIEW:  bottom_hint = "<- / -> navigate  (not implemented)"; break;
+        }
+        int bottom_y = (int)logical_h - 22;
+        pax_simple_rect(&fb, 0xC0000000, 0, (float)bottom_y, (float)logical_w, 22);
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 8, (float)(bottom_y + 3), bottom_hint);
+
+        // Transient banner (e.g. "Saved IMG_xxx.bmp").
+        if (banner_text[0] && xTaskGetTickCount() < banner_until) {
+            pax_simple_rect(&fb, 0xC0000000, 0, 28, (float)logical_w, 22);
+            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 8, 31, banner_text);
+        } else {
+            banner_text[0] = 0;
+        }
+
+        blit();
+
+        // The UI is done with s_preview_buffer. Release the back-pressure
+        // gate so the render task can start the next PPA transform.
+        camera_preview_give_render_ready();
+
+        // Act on space AFTER the blit so the banner can show on the next
+        // frame. snapshot_dbg uses the same s_preview_buffer we just drew,
+        // plus a racy best-effort dump of s_camera_buffer (pre-PPA).
+        if (space_pending) {
+            space_pending = false;
+            if (mode == MODE_PHOTO) {
+                time_t    now     = time(NULL);
+                struct tm tmv;
+                localtime_r(&now, &tmv);
+                char ts[32];
+                strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tmv);
+
+                char path[128];
+                snprintf(path, sizeof(path), "%s/dbg_prev_%s.bmp", DCIM_PATH, ts);
+                esp_err_t e1 = bmp_writer_save_rgb565(path,
+                    (const uint16_t *)camera_preview_get_pixels(),
+                    camera_preview_get_width(), camera_preview_get_height());
+
+                snprintf(path, sizeof(path), "%s/dbg_full_%s.bmp", DCIM_PATH, ts);
+                esp_err_t e2 = bmp_writer_save_rgb565(path,
+                    (const uint16_t *)camera_preview_get_raw_pixels(),
+                    camera_preview_get_raw_width(), camera_preview_get_raw_height());
+
+                if (e1 == ESP_OK && e2 == ESP_OK) {
+                    snprintf(banner_text, sizeof(banner_text), "Saved dbg_prev/full_%s.bmp", ts);
+                } else {
+                    snprintf(banner_text, sizeof(banner_text), "Save failed (%d / %d)", e1, e2);
+                }
+                banner_until = xTaskGetTickCount() + pdMS_TO_TICKS(2500);
             }
         }
     }

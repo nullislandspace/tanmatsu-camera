@@ -36,3 +36,12 @@ esp_err_t camera_preview_wait_frame(uint32_t timeout_ms);
 const uint8_t *camera_preview_get_pixels(void);
 uint32_t       camera_preview_get_width(void);
 uint32_t       camera_preview_get_height(void);
+
+// Pointer to the full-size 800x640 RGB565 frame that the ISP writes into
+// (pre-PPA, no scale/mirror applied). CSI DMA is continuously overwriting
+// this buffer — reads are inherently racy — but it's useful for diagnostic
+// dumps to see what the ISP is producing before the PPA touches it.
+// Dimensions are fixed at 800x640 for the preview format.
+const uint8_t *camera_preview_get_raw_pixels(void);
+uint32_t       camera_preview_get_raw_width(void);
+uint32_t       camera_preview_get_raw_height(void);
