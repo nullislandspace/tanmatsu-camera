@@ -25,6 +25,7 @@
 #include "photo.h"
 #include "sdcard.h"
 #include "usb_device.h"
+#include "viewer.h"
 
 #define DCIM_PATH "/sd/DCIM"
 
@@ -307,25 +308,66 @@ void app_main(void) {
     char       banner_text[64] = {0};
     TickType_t banner_until    = 0;
 
+    // Helper lambda-ish: a transient banner with a default 2.5s duration.
+    #define SHOW_BANNER(fmt, ...) do { \
+        snprintf(banner_text, sizeof(banner_text), fmt, ##__VA_ARGS__); \
+        banner_until = xTaskGetTickCount() + pdMS_TO_TICKS(2500); \
+    } while (0)
+
     while (1) {
-        // Drain any queued input events. Mode switches apply on the next
-        // frame; space is latched so the snapshot runs after the blit.
+        // Drain any queued input events. Mode switches apply immediately;
+        // space is latched so capture runs AFTER the blit of the current
+        // frame (so the user gets visual feedback that the shutter fired).
         bsp_input_event_t event;
         while (xQueueReceive(input_event_queue, &event, 0) == pdTRUE) {
             if (event.type == INPUT_EVENT_TYPE_NAVIGATION && event.args_navigation.state) {
                 switch (event.args_navigation.key) {
                     case BSP_INPUT_NAVIGATION_KEY_ESC:
+                        viewer_close();
                         bsp_device_restart_to_launcher();
                         break;
+
                     case BSP_INPUT_NAVIGATION_KEY_F1:
-                        mode = MODE_VIEW;
+                        if (mode != MODE_VIEW) {
+                            // Entering view mode: scan DCIM and decode the
+                            // newest image. The live preview keeps running
+                            // in the background so we can bounce back to
+                            // photo/video mode instantly.
+                            esp_err_t verr = viewer_open(DCIM_PATH, logical_w, logical_h);
+                            if (verr == ESP_OK) {
+                                mode = MODE_VIEW;
+                            } else if (verr == ESP_ERR_NOT_FOUND) {
+                                SHOW_BANNER("No photos in /sd/DCIM");
+                            } else {
+                                SHOW_BANNER("Viewer open failed (%d)", verr);
+                            }
+                        }
                         break;
+
                     case BSP_INPUT_NAVIGATION_KEY_F2:
+                        if (mode == MODE_VIEW) viewer_close();
                         mode = MODE_PHOTO;
                         break;
+
                     case BSP_INPUT_NAVIGATION_KEY_F3:
+                        if (mode == MODE_VIEW) viewer_close();
                         mode = MODE_VIDEO;
                         break;
+
+                    case BSP_INPUT_NAVIGATION_KEY_LEFT:
+                        if (mode == MODE_VIEW) {
+                            // ◄ = newer. Ends at index 0.
+                            viewer_prev();
+                        }
+                        break;
+
+                    case BSP_INPUT_NAVIGATION_KEY_RIGHT:
+                        if (mode == MODE_VIEW) {
+                            // ► = older. Ends at last index.
+                            viewer_next();
+                        }
+                        break;
+
                     default:
                         break;
                 }
@@ -335,15 +377,36 @@ void app_main(void) {
             }
         }
 
-        if (camera_preview_wait_frame(100) != ESP_OK) {
-            continue;
+        // Pull one frame from the preview pipeline in photo/video mode.
+        // View mode ignores camera frames — it renders the decoded JPEG
+        // instead — but we still need the preview pipeline to keep running
+        // so entering photo/video mode is instant.
+        bool got_preview_frame = false;
+        if (mode != MODE_VIEW) {
+            if (camera_preview_wait_frame(100) == ESP_OK) {
+                got_preview_frame = true;
+            } else {
+                // No fresh frame — skip this iteration so we don't redraw
+                // an identical HUD over a stale preview 10 times a second.
+                continue;
+            }
         }
 
-        // Draw the live preview into the rotated PAX framebuffer. The
-        // preview_pax buffer aliases s_preview_buffer (RGB565); PAX handles
-        // the RGB565 → RGB888 conversion into fb.
         pax_background(&fb, BLACK);
-        pax_draw_image(&fb, &preview_pax, preview_x, preview_y);
+
+        if (mode == MODE_VIEW && viewer_has_image()) {
+            pax_buf_t img_pax = {0};
+            pax_buf_init(&img_pax, (void *)viewer_get_pixels(),
+                         viewer_get_width(), viewer_get_height(),
+                         PAX_BUF_16_565RGB);
+            int img_x = ((int)logical_w - (int)viewer_get_width())  / 2;
+            int img_y = ((int)logical_h - (int)viewer_get_height()) / 2;
+            pax_draw_image(&fb, &img_pax, img_x, img_y);
+        } else if (mode != MODE_VIEW) {
+            // preview_pax aliases s_preview_buffer (RGB565); PAX handles
+            // the RGB565 → display format conversion into fb.
+            pax_draw_image(&fb, &preview_pax, preview_x, preview_y);
+        }
 
         // HUD: top bar with mode name and key hints.
         char hud[96];
@@ -353,17 +416,32 @@ void app_main(void) {
         hershey_draw_string(&fb, WHITE, 8, 3, hud, 18);
 
         // Context-specific bottom bar.
+        char bottom_buf[96];
         const char *bottom_hint = "";
         switch (mode) {
-            case MODE_PHOTO: bottom_hint = "SPACE = take photo"; break;
-            case MODE_VIDEO: bottom_hint = "SPACE = start/stop record  (not implemented)"; break;
-            case MODE_VIEW:  bottom_hint = "<- / -> navigate  (not implemented)"; break;
+            case MODE_PHOTO:
+                bottom_hint = "SPACE = take photo";
+                break;
+            case MODE_VIDEO:
+                bottom_hint = "SPACE = start/stop record  (not implemented)";
+                break;
+            case MODE_VIEW:
+                if (viewer_has_image()) {
+                    snprintf(bottom_buf, sizeof(bottom_buf),
+                             "%d / %d  %.48s   <- newer  -> older",
+                             viewer_get_index() + 1, viewer_get_total(),
+                             viewer_get_filename());
+                    bottom_hint = bottom_buf;
+                } else {
+                    bottom_hint = "(no images)";
+                }
+                break;
         }
         int bottom_y = (int)logical_h - 22;
         pax_simple_rect(&fb, 0xC0000000, 0, (float)bottom_y, (float)logical_w, 22);
         hershey_draw_string(&fb, WHITE, 8, (float)(bottom_y + 3), bottom_hint, 18);
 
-        // Transient banner (e.g. "Saved IMG_xxx.bmp").
+        // Transient banner (e.g. "Saved IMG_xxx.jpg").
         if (banner_text[0] && xTaskGetTickCount() < banner_until) {
             pax_simple_rect(&fb, 0xC0000000, 0, 28, (float)logical_w, 22);
             hershey_draw_string(&fb, WHITE, 8, 31, banner_text, 18);
@@ -375,9 +453,7 @@ void app_main(void) {
 
         // Photo capture: the preview pipeline is torn down and rebuilt
         // at 1920x1080 inside photo_capture(), so the UI is frozen on
-        // the last blitted frame for most of a second. That's fine —
-        // we haven't released render_ready yet, so the preview buffer
-        // is stable, and photo_capture() owns the pipeline lifecycle.
+        // the last blitted frame for most of a second.
         if (space_pending) {
             space_pending = false;
             if (mode == MODE_PHOTO) {
@@ -388,16 +464,28 @@ void app_main(void) {
                 if (err == ESP_OK && saved_path[0]) {
                     const char *basename = strrchr(saved_path, '/');
                     basename = basename ? basename + 1 : saved_path;
-                    snprintf(banner_text, sizeof(banner_text), "Saved %.48s", basename);
+                    SHOW_BANNER("Saved %.48s", basename);
                 } else {
-                    snprintf(banner_text, sizeof(banner_text), "Capture failed (%d)", err);
+                    SHOW_BANNER("Capture failed (%d)", err);
                 }
-                banner_until = xTaskGetTickCount() + pdMS_TO_TICKS(2500);
             }
         }
 
-        // The UI is done with s_preview_buffer. Release the back-pressure
-        // gate so the render task can start the next PPA transform.
-        camera_preview_give_render_ready();
+        // The UI is done with s_preview_buffer (if we actually consumed
+        // a frame this iteration). Releasing render_ready lets the render
+        // task start the next PPA transform. In view mode we never took
+        // a frame, so nothing to release — the render task will keep
+        // dropping frames while we show the decoded JPEG.
+        if (got_preview_frame) {
+            camera_preview_give_render_ready();
+        }
+
+        // View mode doesn't block on camera frames, so throttle the loop
+        // manually to ~30 Hz so we aren't spinning at 100% CPU while
+        // showing a static image. Key events still arrive on the next
+        // iteration within 33 ms which feels responsive.
+        if (mode == MODE_VIEW) {
+            vTaskDelay(pdMS_TO_TICKS(33));
+        }
     }
 }

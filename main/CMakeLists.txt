@@ -7,6 +7,7 @@ idf_component_register(
 		"camera_pipeline.c"
 		"bmp_writer.c"
 		"photo.c"
+		"viewer.c"
 		"usb_device.c"
 	PRIV_REQUIRES
 		esp_lcd
