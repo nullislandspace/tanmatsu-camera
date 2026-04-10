@@ -25,15 +25,24 @@ static const char *TAG = "camera_sensor";
 #define OV_REG_TIMING_VTS_H     0x380E
 #define OV_REG_TIMING_VTS_L     0x380F
 
-// Base VTS and nominal frame rate of the preview format programmed by
-// camera_sensor_set_format_preview(). Matches
-// OV5647 MIPI_2lane_24Minput_RAW8_800x640_50fps (see
-// managed_components/espressif__esp_cam_sensor/sensors/ov5647/private_include/ov5647_settings.h:81-82).
-// OV5645's 800x640 preset uses the same VTS=984 base; OV5640 differs
-// per resolution mode and would need a different base constant if we
-// ever switch the preview format to OV5640.
+// Base VTS and EFFECTIVE frame rate of the preview format programmed
+// by camera_sensor_set_format_preview(). VTS=984 comes from
+// managed_components/espressif__esp_cam_sensor/sensors/ov5647/private_include/ov5647_settings.h:81-82.
+//
+// The format NAME claims 50 fps but empirical measurement on the
+// Tanmatsu's OV5647 board shows the actual PCLK × HTS × VTS timing
+// produces ~36 fps at VTS=984 — the "50" in the format name is a
+// marketing nominal that doesn't match the register table as shipped.
+// Derived by observation: at VTS=3280 the sensor was running at
+// ~10.7 fps (ISR fin counter / wall clock), which back-solves to
+// 10.7 × 3280 / 984 ≈ 35.7 fps at the base VTS. Rounding to 36
+// gives a clean 15 fps target via VTS=2362.
+//
+// OV5645's 800x640 preset uses the same VTS=984 base and may or may
+// not have the same marketing-vs-reality gap; OV5640 differs per
+// resolution mode.
 #define PREVIEW_BASE_VTS_LINES  984u
-#define PREVIEW_BASE_FPS        50u
+#define PREVIEW_BASE_FPS        36u
 
 esp_err_t camera_sensor_detect(camera_sensor_t *out) {
     if (out == NULL) return ESP_ERR_INVALID_ARG;

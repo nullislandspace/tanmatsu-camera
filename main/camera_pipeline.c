@@ -30,6 +30,20 @@ static const char *TAG = "camera_pipeline";
 
 #define BYTES_PER_PIXEL     2     // RGB565
 
+// The preview pipeline bakes the display's 90° rotation into the PPA
+// output so the main UI can skip per-pixel rotation in software. The
+// three flags below describe the exact combination of rotation + mirrors
+// that produces a user-correct landscape image when the panel-native
+// RGB565 buffer is handed straight to bsp_display_blit.
+//
+// ANGLE_270 was picked after empirical testing — with ANGLE_90 the
+// preview came out 180° rotated because PPA's "90°" turned out to
+// rotate in the opposite sense to the fbdraw CCW3 panel transform
+// derived from pax_orientation.c.
+#define PREVIEW_PPA_ROTATION   PPA_SRM_ROTATION_ANGLE_270
+#define PREVIEW_PPA_MIRROR_X   true
+#define PREVIEW_PPA_MIRROR_Y   true
+
 static esp_cam_ctlr_handle_t s_csi      = NULL;
 static isp_proc_handle_t     s_isp      = NULL;
 static ppa_client_handle_t   s_ppa      = NULL;
@@ -37,10 +51,11 @@ static ppa_client_handle_t   s_ppa      = NULL;
 static uint8_t *s_camera_buffer   = NULL;  // Full 800x640 RGB565 CSI output
 static size_t   s_camera_buffer_sz = 0;
 
-static uint8_t *s_preview_buffer  = NULL;  // Scaled preview (display-size) RGB565
+static uint8_t *s_preview_buffer  = NULL;  // Scaled + rotated preview RGB565 (panel-native)
 static size_t   s_preview_buffer_sz = 0;
-static uint32_t s_preview_w       = 0;
-static uint32_t s_preview_h       = 0;
+static uint32_t s_preview_w       = 0;     // buffer width  (stride in pixels, panel-native)
+static uint32_t s_preview_h       = 0;     // buffer height (row count,       panel-native)
+static float    s_preview_scale   = 0.0f;  // uniform scale applied by the PPA SRM op
 
 static SemaphoreHandle_t s_transfer_done = NULL; // given from CSI trans_finished ISR
 static SemaphoreHandle_t s_srm_done     = NULL;  // given from PPA srm_done ISR
@@ -122,9 +137,6 @@ static void render_task(void *arg) {
         }
         if (!s_running) break;
 
-        float scale_x = (float)s_preview_w / (float)PREVIEW_WIDTH;
-        float scale_y = (float)s_preview_h / (float)PREVIEW_HEIGHT;
-
         ppa_srm_oper_config_t srm = {
             .in = {
                 .buffer         = s_camera_buffer,
@@ -139,20 +151,26 @@ static void render_task(void *arg) {
             .out = {
                 .buffer         = s_preview_buffer,
                 .buffer_size    = s_preview_buffer_sz,
+                // With rotation 90/270 the PPA produces an image whose
+                // memory dimensions are input × scale with the axes
+                // swapped — i.e. width = PREVIEW_HEIGHT*scale,
+                // height = PREVIEW_WIDTH*scale. s_preview_w/h already
+                // reflect that post-rotation layout.
                 .pic_w          = s_preview_w,
                 .pic_h          = s_preview_h,
                 .block_offset_x = 0,
                 .block_offset_y = 0,
                 .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
             },
-            .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-            .scale_x        = scale_x,
-            .scale_y        = scale_y,
+            .rotation_angle = PREVIEW_PPA_ROTATION,
+            // scale_x and scale_y are uniform — aspect ratio preserved.
+            .scale_x        = s_preview_scale,
+            .scale_y        = s_preview_scale,
             // Sensor feed is vertically flipped AND left/right mirrored
             // relative to how the user expects to see it on the display.
             // Both flips are free on the PPA.
-            .mirror_x       = true,
-            .mirror_y       = true,
+            .mirror_x       = PREVIEW_PPA_MIRROR_X,
+            .mirror_y       = PREVIEW_PPA_MIRROR_Y,
             .rgb_swap       = false,
             .byte_swap      = false,
             .mode           = PPA_TRANS_MODE_NON_BLOCKING,
@@ -197,6 +215,11 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
     // Snap the scale factor to the largest n/16 that still fits inside the
     // requested box. Input is the fixed 800x640 sensor frame, so output is
     // always (n*50) x (n*40), with n in 1..16.
+    // req_w / req_h are still expressed in user-landscape space: "fit
+    // the 800x640 camera frame in this many landscape pixels, axis-
+    // aligned, keeping aspect ratio". That's what the PPA scale factor
+    // is computed against — the rotation that follows doesn't change
+    // how many source pixels we consume, just how they're laid out.
     float scale_max_x = (float)req_w / (float)PREVIEW_WIDTH;
     float scale_max_y = (float)req_h / (float)PREVIEW_HEIGHT;
     float scale_max   = scale_max_x < scale_max_y ? scale_max_x : scale_max_y;
@@ -204,11 +227,19 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
     if (frag < 1)  frag = 1;
     if (frag > 16) frag = 16;
 
-    s_preview_w = (PREVIEW_WIDTH  * frag) / 16u;
-    s_preview_h = (PREVIEW_HEIGHT * frag) / 16u;
+    s_preview_scale = (float)frag / 16.0f;
+
+    // After PPA rotation 90°/270° the buffer dimensions swap relative
+    // to the unrotated scaled image: the panel-native output is
+    // (PREVIEW_HEIGHT * scale) wide × (PREVIEW_WIDTH * scale) tall, i.e.
+    // 480 × 600 at the default 12/16 scale. The buffer is already laid
+    // out in the order bsp_display_blit expects, so the main UI can
+    // feed it straight in via fbdraw_blit_panel (memcpy per row).
+    s_preview_w = (PREVIEW_HEIGHT * frag) / 16u;
+    s_preview_h = (PREVIEW_WIDTH  * frag) / 16u;
 
     uint32_t cache_line = cache_hal_get_cache_line_size(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_DATA);
-    ESP_LOGI(TAG, "preview=%" PRIu32 "x%" PRIu32 " (scale %" PRIu32 "/16) cache_line=%" PRIu32,
+    ESP_LOGI(TAG, "preview buf %" PRIu32 "x%" PRIu32 " (panel-native, scale %" PRIu32 "/16) cache_line=%" PRIu32,
              s_preview_w, s_preview_h, frag, cache_line);
 
     s_camera_buffer_sz = PREVIEW_WIDTH * PREVIEW_HEIGHT * BYTES_PER_PIXEL;

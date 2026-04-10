@@ -6,6 +6,7 @@ idf_component_register(
 		"camera_sensor.c"
 		"camera_pipeline.c"
 		"bmp_writer.c"
+		"fbdraw.c"
 		"photo.c"
 		"viewer.c"
 		"usb_device.c"

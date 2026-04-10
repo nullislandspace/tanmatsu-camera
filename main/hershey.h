@@ -1,4 +1,7 @@
-int simplex[95][112] = {
+// Marked static const so this header can be included by exactly one
+// implementation file (fbdraw.c) without colliding at link time with
+// other translation units and without needing a separate .c file.
+static const int simplex[95][112] = {
     {0,16, /* Ascii 32 */
    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
