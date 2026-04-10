@@ -42,10 +42,13 @@ static size_t   s_preview_buffer_sz = 0;
 static uint32_t s_preview_w       = 0;
 static uint32_t s_preview_h       = 0;
 
-static SemaphoreHandle_t s_render_ready = NULL;  // given by the main loop after a blit
 static SemaphoreHandle_t s_transfer_done = NULL; // given from CSI trans_finished ISR
 static SemaphoreHandle_t s_srm_done     = NULL;  // given from PPA srm_done ISR
 static SemaphoreHandle_t s_frame_ready  = NULL;  // given to the main loop after PPA
+static SemaphoreHandle_t s_render_ready = NULL;  // given by the main loop after it has
+                                                  // finished drawing; gates the next PPA
+                                                  // transform so it doesn't overwrite the
+                                                  // preview buffer mid-draw.
 
 static esp_cam_ctlr_trans_t s_trans;
 
@@ -53,26 +56,35 @@ static TaskHandle_t s_receive_task = NULL;
 static TaskHandle_t s_render_task  = NULL;
 static volatile bool s_running     = false;
 
+// DRAM counters so we can see from task context whether the ISR callbacks
+// are running at all.
+static DRAM_ATTR volatile uint32_t s_cnt_get_new_trans  = 0;
+static DRAM_ATTR volatile uint32_t s_cnt_trans_finished = 0;
+static DRAM_ATTR volatile uint32_t s_cnt_srm_done       = 0;
+
 // CSI and PPA ISR callbacks must live in IRAM when the CAM CSI ISR is
 // configured cache-safe (CONFIG_CAM_CTLR_MIPI_CSI_ISR_CACHE_SAFE=y), because
 // they may run while the flash cache is disabled.
+//
+// Matches the ESP-IDF mipi_isp_dsi example: unconditionally provide the
+// buffer. Back-pressure with the UI is handled task-side via a binary
+// frame_ready semaphore, not in the ISR.
 static bool IRAM_ATTR on_get_new_trans(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data) {
-    BaseType_t hpw = pdFALSE;
-    if (xSemaphoreTakeFromISR(s_render_ready, &hpw) == pdTRUE) {
-        trans->buffer = s_trans.buffer;
-        trans->buflen = s_trans.buflen;
-        return hpw == pdTRUE;
-    }
+    s_cnt_get_new_trans++;
+    trans->buffer = s_trans.buffer;
+    trans->buflen = s_trans.buflen;
     return false;
 }
 
 static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data) {
+    s_cnt_trans_finished++;
     BaseType_t hpw = pdFALSE;
     xSemaphoreGiveFromISR(s_transfer_done, &hpw);
     return hpw == pdTRUE;
 }
 
 static bool IRAM_ATTR on_srm_done(ppa_client_handle_t ppa_handle, ppa_event_data_t *event, void *user_data) {
+    s_cnt_srm_done++;
     BaseType_t hpw = pdFALSE;
     xSemaphoreGiveFromISR(s_srm_done, &hpw);
     return hpw == pdTRUE;
@@ -86,8 +98,26 @@ static void receive_task(void *arg) {
 }
 
 static void render_task(void *arg) {
+    uint32_t n_frames = 0;
+    uint32_t n_timeouts = 0;
     while (s_running) {
-        if (xSemaphoreTake(s_transfer_done, pdMS_TO_TICKS(200)) != pdTRUE) {
+        if (xSemaphoreTake(s_transfer_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            n_timeouts++;
+            if ((n_timeouts % 2) == 0) {
+                ESP_LOGW(TAG, "no transfer_done: %" PRIu32 " timeouts, frames=%" PRIu32
+                              "  ISR cnts get=%" PRIu32 " fin=%" PRIu32 " srm=%" PRIu32,
+                         n_timeouts, n_frames,
+                         s_cnt_get_new_trans, s_cnt_trans_finished, s_cnt_srm_done);
+            }
+            continue;
+        }
+        if (!s_running) break;
+
+        // Wait until the UI has finished drawing the previous preview frame
+        // before we overwrite the preview buffer with a new PPA transform.
+        // If the UI never consumes, we just drop CSI frames (the CSI DMA
+        // keeps running into s_camera_buffer but we don't PPA-convert them).
+        if (xSemaphoreTake(s_render_ready, pdMS_TO_TICKS(500)) != pdTRUE) {
             continue;
         }
         if (!s_running) break;
@@ -125,12 +155,21 @@ static void render_task(void *arg) {
             .mode           = PPA_TRANS_MODE_NON_BLOCKING,
         };
 
-        if (ppa_do_scale_rotate_mirror(s_ppa, &srm) != ESP_OK) {
+        esp_err_t rerr = ppa_do_scale_rotate_mirror(s_ppa, &srm);
+        if (rerr != ESP_OK) {
+            ESP_LOGW(TAG, "ppa_do_scale_rotate_mirror: %d", rerr);
             continue;
         }
 
-        xSemaphoreTake(s_srm_done, portMAX_DELAY);
+        if (xSemaphoreTake(s_srm_done, pdMS_TO_TICKS(500)) != pdTRUE) {
+            ESP_LOGW(TAG, "srm_done timeout");
+            continue;
+        }
         xSemaphoreGive(s_frame_ready);
+        n_frames++;
+        if (n_frames <= 3 || (n_frames % 30) == 0) {
+            ESP_LOGI(TAG, "frame %" PRIu32, n_frames);
+        }
     }
     vTaskDelete(NULL);
 }
@@ -168,16 +207,16 @@ esp_err_t camera_preview_start(uint32_t preview_w, uint32_t preview_h) {
         goto fail;
     }
 
-    s_render_ready  = xSemaphoreCreateBinary();
     s_transfer_done = xSemaphoreCreateBinary();
     s_srm_done      = xSemaphoreCreateBinary();
     s_frame_ready   = xSemaphoreCreateBinary();
-    if (!s_render_ready || !s_transfer_done || !s_srm_done || !s_frame_ready) {
+    s_render_ready  = xSemaphoreCreateBinary();
+    if (!s_transfer_done || !s_srm_done || !s_frame_ready || !s_render_ready) {
         ESP_LOGE(TAG, "semaphore alloc failed");
         goto fail;
     }
-    // Prime the pipeline: allow the first CSI transaction without waiting on
-    // a blit that has not happened yet.
+    // Prime: the first PPA transform may run before the main loop has
+    // drawn anything.
     xSemaphoreGive(s_render_ready);
 
     esp_cam_ctlr_csi_config_t csi_cfg = {
@@ -277,10 +316,10 @@ void camera_preview_stop(void) {
         s_csi = NULL;
     }
 
-    if (s_render_ready)  { vSemaphoreDelete(s_render_ready);  s_render_ready  = NULL; }
     if (s_transfer_done) { vSemaphoreDelete(s_transfer_done); s_transfer_done = NULL; }
     if (s_srm_done)      { vSemaphoreDelete(s_srm_done);      s_srm_done      = NULL; }
     if (s_frame_ready)   { vSemaphoreDelete(s_frame_ready);   s_frame_ready   = NULL; }
+    if (s_render_ready)  { vSemaphoreDelete(s_render_ready);  s_render_ready  = NULL; }
 
     if (s_camera_buffer)  { free(s_camera_buffer);  s_camera_buffer  = NULL; s_camera_buffer_sz  = 0; }
     if (s_preview_buffer) { free(s_preview_buffer); s_preview_buffer = NULL; s_preview_buffer_sz = 0; }
@@ -290,7 +329,9 @@ void camera_preview_stop(void) {
 }
 
 void camera_preview_give_render_ready(void) {
-    if (s_render_ready) xSemaphoreGive(s_render_ready);
+    if (s_render_ready) {
+        xSemaphoreGive(s_render_ready);
+    }
 }
 
 esp_err_t camera_preview_wait_frame(uint32_t timeout_ms) {

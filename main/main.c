@@ -202,21 +202,34 @@ void app_main(void) {
         wait_for_esc();
         return;
     }
-    if (camera_sensor_stream(&sensor, true) != ESP_OK) {
-        splash(RED, WHITE, "Camera error", "Stream start failed");
+    // NOTE: set_format leaves the sensor stream OFF. We bring up the CSI
+    // pipeline FIRST so the CSI PHY is listening before the sensor starts
+    // transmitting frames — starting the sensor while nothing is listening
+    // was making the CSI PHY fail to lock on subsequent frames.
+
+    // Preview size: fit the 5:4 (800x640) camera frame into the rotated
+    // display's LOGICAL coordinate space (after any PAX rotation), keeping
+    // aspect ratio. Using pax_buf_get_width/height here — display_h_res and
+    // display_v_res are the raw unrotated panel dimensions and are only
+    // useful for the final bsp_display_blit() call.
+    uint32_t logical_w = pax_buf_get_width(&fb);
+    uint32_t logical_h = pax_buf_get_height(&fb);
+    uint32_t preview_w = logical_w;
+    uint32_t preview_h = (preview_w * 640u) / 800u;
+    if (preview_h > logical_h) {
+        preview_h = logical_h;
+        preview_w = (preview_h * 800u) / 640u;
+    }
+    if (camera_preview_start(preview_w, preview_h) != ESP_OK) {
+        splash(RED, WHITE, "Camera error", "Pipeline start failed");
         wait_for_esc();
         return;
     }
 
-    // Preview size: fill the display while keeping 800:640 (5:4) aspect.
-    uint32_t preview_h = display_v_res;
-    uint32_t preview_w = (preview_h * 800u) / 640u;
-    if (preview_w > display_h_res) {
-        preview_w = display_h_res;
-        preview_h = (preview_w * 640u) / 800u;
-    }
-    if (camera_preview_start(preview_w, preview_h) != ESP_OK) {
-        splash(RED, WHITE, "Camera error", "Pipeline start failed");
+    // Now that the CSI PHY, ISP and DMA are all primed and waiting,
+    // actually tell the sensor to start streaming.
+    if (camera_sensor_stream(&sensor, true) != ESP_OK) {
+        splash(RED, WHITE, "Camera error", "Stream start failed");
         wait_for_esc();
         return;
     }
@@ -229,8 +242,8 @@ void app_main(void) {
                  camera_preview_get_width(), camera_preview_get_height(),
                  PAX_BUF_16_565RGB);
 
-    int preview_x = ((int)display_h_res - (int)camera_preview_get_width())  / 2;
-    int preview_y = ((int)display_v_res - (int)camera_preview_get_height()) / 2;
+    int preview_x = ((int)logical_w - (int)camera_preview_get_width())  / 2;
+    int preview_y = ((int)logical_h - (int)camera_preview_get_height()) / 2;
 
     while (1) {
         if (camera_preview_wait_frame(100) == ESP_OK) {
