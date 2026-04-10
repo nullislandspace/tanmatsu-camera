@@ -303,11 +303,32 @@ fail:
 void camera_preview_stop(void) {
     s_running = false;
 
+    // Stop CSI first so the hardware stops firing callbacks. The driver's
+    // own per-ctlr state is still intact at this point — we're just
+    // pausing the DMA / bridge.
     if (s_csi) {
         esp_cam_ctlr_stop(s_csi);
     }
-    // Give the tasks a chance to notice s_running=false and exit on their own.
-    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // The receive_task is blocked inside esp_cam_ctlr_receive() on an
+    // internal CSI queue with ESP_CAM_CTLR_MAX_DELAY and will never
+    // notice s_running=false on its own. The render_task might be
+    // waiting on s_transfer_done or s_render_ready with timeouts up to
+    // 1s. Force both to exit before we start deleting the CSI/PPA/ISP
+    // whose objects they still reference — deleting a CSI controller
+    // while a task is still blocked inside it double-acquires an
+    // internal spinlock and panics.
+    if (s_receive_task) {
+        vTaskDelete(s_receive_task);
+        s_receive_task = NULL;
+    }
+    if (s_render_task) {
+        vTaskDelete(s_render_task);
+        s_render_task = NULL;
+    }
+    // Let FreeRTOS run the idle task so the deleted tasks' TCBs are
+    // actually reclaimed before we free anything else.
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     if (s_ppa) {
         ppa_unregister_client(s_ppa);
@@ -331,9 +352,6 @@ void camera_preview_stop(void) {
 
     if (s_camera_buffer)  { free(s_camera_buffer);  s_camera_buffer  = NULL; s_camera_buffer_sz  = 0; }
     if (s_preview_buffer) { free(s_preview_buffer); s_preview_buffer = NULL; s_preview_buffer_sz = 0; }
-
-    s_receive_task = NULL;
-    s_render_task  = NULL;
 }
 
 void camera_preview_give_render_ready(void) {

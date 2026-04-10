@@ -6,6 +6,7 @@ idf_component_register(
 		"camera_sensor.c"
 		"camera_pipeline.c"
 		"bmp_writer.c"
+		"photo.c"
 		"usb_device.c"
 	PRIV_REQUIRES
 		esp_lcd
@@ -16,6 +17,7 @@ idf_component_register(
 		esp_driver_cam
 		esp_driver_isp
 		esp_driver_ppa
+		esp_driver_jpeg
 		esp_mm
 		vfs
 		badge-bsp

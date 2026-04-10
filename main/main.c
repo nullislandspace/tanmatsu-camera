@@ -21,6 +21,7 @@
 #include "bmp_writer.h"
 #include "camera_pipeline.h"
 #include "camera_sensor.h"
+#include "photo.h"
 #include "sdcard.h"
 #include "usb_device.h"
 
@@ -321,7 +322,7 @@ void app_main(void) {
         // Context-specific bottom bar.
         const char *bottom_hint = "";
         switch (mode) {
-            case MODE_PHOTO: bottom_hint = "SPACE = snapshot (BMP debug dump)"; break;
+            case MODE_PHOTO: bottom_hint = "SPACE = take photo"; break;
             case MODE_VIDEO: bottom_hint = "SPACE = start/stop record  (not implemented)"; break;
             case MODE_VIEW:  bottom_hint = "<- / -> navigate  (not implemented)"; break;
         }
@@ -339,40 +340,30 @@ void app_main(void) {
 
         blit();
 
-        // The UI is done with s_preview_buffer. Release the back-pressure
-        // gate so the render task can start the next PPA transform.
-        camera_preview_give_render_ready();
-
-        // Act on space AFTER the blit so the banner can show on the next
-        // frame. snapshot_dbg uses the same s_preview_buffer we just drew,
-        // plus a racy best-effort dump of s_camera_buffer (pre-PPA).
+        // Photo capture runs BEFORE we release render_ready: the
+        // render task is gated so s_preview_buffer is stable, which is
+        // exactly what the JPEG encoder needs to read. The UI is
+        // briefly frozen on the last blitted frame during the encode
+        // (~150-250 ms) because we haven't released the gate yet.
         if (space_pending) {
             space_pending = false;
             if (mode == MODE_PHOTO) {
-                time_t    now     = time(NULL);
-                struct tm tmv;
-                localtime_r(&now, &tmv);
-                char ts[32];
-                strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tmv);
-
-                char path[128];
-                snprintf(path, sizeof(path), "%s/dbg_prev_%s.bmp", DCIM_PATH, ts);
-                esp_err_t e1 = bmp_writer_save_rgb565(path,
-                    (const uint16_t *)camera_preview_get_pixels(),
-                    camera_preview_get_width(), camera_preview_get_height());
-
-                snprintf(path, sizeof(path), "%s/dbg_full_%s.bmp", DCIM_PATH, ts);
-                esp_err_t e2 = bmp_writer_save_rgb565(path,
-                    (const uint16_t *)camera_preview_get_raw_pixels(),
-                    camera_preview_get_raw_width(), camera_preview_get_raw_height());
-
-                if (e1 == ESP_OK && e2 == ESP_OK) {
-                    snprintf(banner_text, sizeof(banner_text), "Saved dbg_prev/full_%s.bmp", ts);
+                char saved_path[128] = {0};
+                esp_err_t err = photo_capture(DCIM_PATH,
+                                              saved_path, sizeof(saved_path));
+                if (err == ESP_OK && saved_path[0]) {
+                    const char *basename = strrchr(saved_path, '/');
+                    basename = basename ? basename + 1 : saved_path;
+                    snprintf(banner_text, sizeof(banner_text), "Saved %.48s", basename);
                 } else {
-                    snprintf(banner_text, sizeof(banner_text), "Save failed (%d / %d)", e1, e2);
+                    snprintf(banner_text, sizeof(banner_text), "Capture failed (%d)", err);
                 }
                 banner_until = xTaskGetTickCount() + pdMS_TO_TICKS(2500);
             }
         }
+
+        // The UI is done with s_preview_buffer. Release the back-pressure
+        // gate so the render task can start the next PPA transform.
+        camera_preview_give_render_ready();
     }
 }
