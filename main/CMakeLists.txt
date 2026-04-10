@@ -3,12 +3,19 @@ idf_component_register(
 		"main.c"
 		"sdcard.c"
 		"fastopen.c"
+		"camera_sensor.c"
+		"camera_pipeline.c"
+		"usb_device.c"
 	PRIV_REQUIRES
 		esp_lcd
 		nvs_flash
 		fatfs
 		sdmmc
 		esp_driver_sdmmc
+		esp_driver_cam
+		esp_driver_isp
+		esp_driver_ppa
+		esp_mm
 		vfs
 		badge-bsp
 	INCLUDE_DIRS

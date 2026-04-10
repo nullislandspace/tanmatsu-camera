@@ -17,7 +17,11 @@
 #include "pax_fonts.h"
 #include "pax_gfx.h"
 #include "pax_text.h"
+#include "pax_shapes.h"
+#include "camera_pipeline.h"
+#include "camera_sensor.h"
 #include "sdcard.h"
+#include "usb_device.h"
 
 #define DCIM_PATH "/sd/DCIM"
 
@@ -60,6 +64,18 @@ static void wait_for_esc(void) {
 }
 
 void app_main(void) {
+    // Switch the USB PHY out of badgelink mode back into flash/monitor mode.
+    // Must run before bsp_device_initialize(). See videoplayer usb_device.c.
+    usb_initialize();
+
+    // ===== FOR DEVELOPMENT ONLY =====
+    // Give the host-side serial monitor time to reconnect after the USB PHY
+    // flip above — the Tanmatsu's monitor mode can take several seconds to
+    // re-enumerate, and without this pause the first chunk of startup logs
+    // is lost. Remove (or shorten) this for release builds.
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    // ===== END FOR DEVELOPMENT ONLY =====
+
     // Start the GPIO interrupt service
     gpio_install_isr_service(0);
 
@@ -173,9 +189,64 @@ void app_main(void) {
     }
     ESP_LOGI(TAG, "%s ready", DCIM_PATH);
 
-    splash(WHITE, BLACK, "Camera", "Ready");
+    // Detect the OV5647 and configure it for the preview format.
+    splash(WHITE, BLACK, "Camera", "Detecting sensor...");
+    camera_sensor_t sensor = {0};
+    if (camera_sensor_detect(&sensor) != ESP_OK) {
+        splash(RED, WHITE, "Camera error", "No sensor detected");
+        wait_for_esc();
+        return;
+    }
+    if (camera_sensor_set_format_preview(&sensor, NULL) != ESP_OK) {
+        splash(RED, WHITE, "Camera error", "Format not supported");
+        wait_for_esc();
+        return;
+    }
+    if (camera_sensor_stream(&sensor, true) != ESP_OK) {
+        splash(RED, WHITE, "Camera error", "Stream start failed");
+        wait_for_esc();
+        return;
+    }
 
-    // Main event loop — still a stub, only Esc → launcher until Step 3 brings
-    // up the preview pipeline.
-    wait_for_esc();
+    // Preview size: fill the display while keeping 800:640 (5:4) aspect.
+    uint32_t preview_h = display_v_res;
+    uint32_t preview_w = (preview_h * 800u) / 640u;
+    if (preview_w > display_h_res) {
+        preview_w = display_h_res;
+        preview_h = (preview_w * 640u) / 800u;
+    }
+    if (camera_preview_start(preview_w, preview_h) != ESP_OK) {
+        splash(RED, WHITE, "Camera error", "Pipeline start failed");
+        wait_for_esc();
+        return;
+    }
+
+    // A PAX buffer that aliases the preview pipeline's RGB565 output — no
+    // copy, just a different view over the same pixels. pax_draw_image()
+    // handles the RGB565 → framebuffer format conversion.
+    pax_buf_t preview_pax = {0};
+    pax_buf_init(&preview_pax, (void *)camera_preview_get_pixels(),
+                 camera_preview_get_width(), camera_preview_get_height(),
+                 PAX_BUF_16_565RGB);
+
+    int preview_x = ((int)display_h_res - (int)camera_preview_get_width())  / 2;
+    int preview_y = ((int)display_v_res - (int)camera_preview_get_height()) / 2;
+
+    while (1) {
+        if (camera_preview_wait_frame(100) == ESP_OK) {
+            pax_background(&fb, BLACK);
+            pax_draw_image(&fb, &preview_pax, preview_x, preview_y);
+            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 8, 8, "PHOTO  F1 view  F2 photo  F3 video  ESC exit");
+            blit();
+            camera_preview_give_render_ready();
+        }
+
+        bsp_input_event_t event;
+        while (xQueueReceive(input_event_queue, &event, 0) == pdTRUE) {
+            if (event.type == INPUT_EVENT_TYPE_NAVIGATION && event.args_navigation.state &&
+                event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_ESC) {
+                bsp_device_restart_to_launcher();
+            }
+        }
+    }
 }

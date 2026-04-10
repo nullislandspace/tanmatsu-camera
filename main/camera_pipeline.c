@@ -1,0 +1,306 @@
+#include "camera_pipeline.h"
+
+#include <inttypes.h>
+#include <math.h>
+#include <string.h>
+
+#include "driver/isp.h"
+#include "driver/ppa.h"
+#include "esp_attr.h"
+#include "esp_cache.h"
+#include "esp_cam_ctlr.h"
+#include "esp_cam_ctlr_csi.h"
+#include "esp_cam_ctlr_types.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "hal/cache_hal.h"
+#include "hal/cache_ll.h"
+#include "hal/ppa_types.h"
+
+static const char *TAG = "camera_pipeline";
+
+// Fixed preview sensor format (camera.md §8).
+#define PREVIEW_WIDTH       800
+#define PREVIEW_HEIGHT      640
+#define PREVIEW_LANE_COUNT  2
+#define PREVIEW_LANE_RATE   200   // Mbps per lane
+
+#define BYTES_PER_PIXEL     2     // RGB565
+
+static esp_cam_ctlr_handle_t s_csi      = NULL;
+static isp_proc_handle_t     s_isp      = NULL;
+static ppa_client_handle_t   s_ppa      = NULL;
+
+static uint8_t *s_camera_buffer   = NULL;  // Full 800x640 RGB565 CSI output
+static size_t   s_camera_buffer_sz = 0;
+
+static uint8_t *s_preview_buffer  = NULL;  // Scaled preview (display-size) RGB565
+static size_t   s_preview_buffer_sz = 0;
+static uint32_t s_preview_w       = 0;
+static uint32_t s_preview_h       = 0;
+
+static SemaphoreHandle_t s_render_ready = NULL;  // given by the main loop after a blit
+static SemaphoreHandle_t s_transfer_done = NULL; // given from CSI trans_finished ISR
+static SemaphoreHandle_t s_srm_done     = NULL;  // given from PPA srm_done ISR
+static SemaphoreHandle_t s_frame_ready  = NULL;  // given to the main loop after PPA
+
+static esp_cam_ctlr_trans_t s_trans;
+
+static TaskHandle_t s_receive_task = NULL;
+static TaskHandle_t s_render_task  = NULL;
+static volatile bool s_running     = false;
+
+// CSI and PPA ISR callbacks must live in IRAM when the CAM CSI ISR is
+// configured cache-safe (CONFIG_CAM_CTLR_MIPI_CSI_ISR_CACHE_SAFE=y), because
+// they may run while the flash cache is disabled.
+static bool IRAM_ATTR on_get_new_trans(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data) {
+    BaseType_t hpw = pdFALSE;
+    if (xSemaphoreTakeFromISR(s_render_ready, &hpw) == pdTRUE) {
+        trans->buffer = s_trans.buffer;
+        trans->buflen = s_trans.buflen;
+        return hpw == pdTRUE;
+    }
+    return false;
+}
+
+static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data) {
+    BaseType_t hpw = pdFALSE;
+    xSemaphoreGiveFromISR(s_transfer_done, &hpw);
+    return hpw == pdTRUE;
+}
+
+static bool IRAM_ATTR on_srm_done(ppa_client_handle_t ppa_handle, ppa_event_data_t *event, void *user_data) {
+    BaseType_t hpw = pdFALSE;
+    xSemaphoreGiveFromISR(s_srm_done, &hpw);
+    return hpw == pdTRUE;
+}
+
+static void receive_task(void *arg) {
+    while (s_running) {
+        esp_cam_ctlr_receive(s_csi, &s_trans, ESP_CAM_CTLR_MAX_DELAY);
+    }
+    vTaskDelete(NULL);
+}
+
+static void render_task(void *arg) {
+    while (s_running) {
+        if (xSemaphoreTake(s_transfer_done, pdMS_TO_TICKS(200)) != pdTRUE) {
+            continue;
+        }
+        if (!s_running) break;
+
+        float scale_x = (float)s_preview_w / (float)PREVIEW_WIDTH;
+        float scale_y = (float)s_preview_h / (float)PREVIEW_HEIGHT;
+
+        ppa_srm_oper_config_t srm = {
+            .in = {
+                .buffer         = s_camera_buffer,
+                .pic_w          = PREVIEW_WIDTH,
+                .pic_h          = PREVIEW_HEIGHT,
+                .block_w        = PREVIEW_WIDTH,
+                .block_h        = PREVIEW_HEIGHT,
+                .block_offset_x = 0,
+                .block_offset_y = 0,
+                .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+            },
+            .out = {
+                .buffer         = s_preview_buffer,
+                .buffer_size    = s_preview_buffer_sz,
+                .pic_w          = s_preview_w,
+                .pic_h          = s_preview_h,
+                .block_offset_x = 0,
+                .block_offset_y = 0,
+                .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+            },
+            .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+            .scale_x        = scale_x,
+            .scale_y        = scale_y,
+            .mirror_x       = false,
+            .mirror_y       = true,  // sensor delivers vertically flipped; undo at no CPU cost
+            .rgb_swap       = false,
+            .byte_swap      = false,
+            .mode           = PPA_TRANS_MODE_NON_BLOCKING,
+        };
+
+        if (ppa_do_scale_rotate_mirror(s_ppa, &srm) != ESP_OK) {
+            continue;
+        }
+
+        xSemaphoreTake(s_srm_done, portMAX_DELAY);
+        xSemaphoreGive(s_frame_ready);
+    }
+    vTaskDelete(NULL);
+}
+
+esp_err_t camera_preview_start(uint32_t preview_w, uint32_t preview_h) {
+    if (s_running) return ESP_ERR_INVALID_STATE;
+
+    // Round preview dimensions down to a multiple of 16 — PPA and the camera
+    // block both want aligned widths, and the old code used 64 for cache
+    // geometry.
+    preview_w &= ~15u;
+    preview_h &= ~15u;
+    if (preview_w == 0 || preview_h == 0) return ESP_ERR_INVALID_ARG;
+
+    s_preview_w = preview_w;
+    s_preview_h = preview_h;
+
+    uint32_t cache_line = cache_hal_get_cache_line_size(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_DATA);
+    ESP_LOGI(TAG, "preview=%" PRIu32 "x%" PRIu32 " cache_line=%" PRIu32,
+             preview_w, preview_h, cache_line);
+
+    s_camera_buffer_sz = PREVIEW_WIDTH * PREVIEW_HEIGHT * BYTES_PER_PIXEL;
+    s_camera_buffer    = heap_caps_aligned_calloc(cache_line, 1, s_camera_buffer_sz,
+                                                  MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+    if (!s_camera_buffer) {
+        ESP_LOGE(TAG, "camera_buffer alloc failed");
+        goto fail;
+    }
+
+    s_preview_buffer_sz = (size_t)preview_w * preview_h * BYTES_PER_PIXEL;
+    s_preview_buffer    = heap_caps_aligned_calloc(cache_line, 1, s_preview_buffer_sz,
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (!s_preview_buffer) {
+        ESP_LOGE(TAG, "preview_buffer alloc failed");
+        goto fail;
+    }
+
+    s_render_ready  = xSemaphoreCreateBinary();
+    s_transfer_done = xSemaphoreCreateBinary();
+    s_srm_done      = xSemaphoreCreateBinary();
+    s_frame_ready   = xSemaphoreCreateBinary();
+    if (!s_render_ready || !s_transfer_done || !s_srm_done || !s_frame_ready) {
+        ESP_LOGE(TAG, "semaphore alloc failed");
+        goto fail;
+    }
+    // Prime the pipeline: allow the first CSI transaction without waiting on
+    // a blit that has not happened yet.
+    xSemaphoreGive(s_render_ready);
+
+    esp_cam_ctlr_csi_config_t csi_cfg = {
+        .ctlr_id                = 0,
+        .h_res                  = PREVIEW_WIDTH,
+        .v_res                  = PREVIEW_HEIGHT,
+        .data_lane_num          = PREVIEW_LANE_COUNT,
+        .lane_bit_rate_mbps     = PREVIEW_LANE_RATE,
+        .input_data_color_type  = CAM_CTLR_COLOR_RAW8,
+        .output_data_color_type = CAM_CTLR_COLOR_RGB565,
+        .queue_items            = 1,
+        .byte_swap_en           = false,
+        .bk_buffer_dis          = false,
+    };
+    esp_err_t err = esp_cam_new_csi_ctlr(&csi_cfg, &s_csi);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_cam_new_csi_ctlr: %d", err);
+        goto fail;
+    }
+
+    esp_cam_ctlr_evt_cbs_t cbs = {
+        .on_get_new_trans  = on_get_new_trans,
+        .on_trans_finished = on_trans_finished,
+    };
+    ESP_ERROR_CHECK(esp_cam_ctlr_register_event_callbacks(s_csi, &cbs, NULL));
+    ESP_ERROR_CHECK(esp_cam_ctlr_enable(s_csi));
+
+    esp_isp_processor_cfg_t isp_cfg = {
+        .clk_hz                 = 80 * 1000 * 1000,
+        .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
+        .input_data_color_type  = ISP_COLOR_RAW8,
+        .output_data_color_type = ISP_COLOR_RGB565,
+        .has_line_start_packet  = false,
+        .has_line_end_packet    = false,
+        .h_res                  = PREVIEW_WIDTH,
+        .v_res                  = PREVIEW_HEIGHT,
+    };
+    err = esp_isp_new_processor(&isp_cfg, &s_isp);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_isp_new_processor: %d", err);
+        goto fail;
+    }
+    ESP_ERROR_CHECK(esp_isp_enable(s_isp));
+
+    ppa_client_config_t ppa_cfg = {
+        .oper_type             = PPA_OPERATION_SRM,
+        .max_pending_trans_num = 1,
+        .data_burst_length     = PPA_DATA_BURST_LENGTH_128,
+    };
+    err = ppa_register_client(&ppa_cfg, &s_ppa);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ppa_register_client: %d", err);
+        goto fail;
+    }
+    ppa_event_callbacks_t ppa_cbs = {
+        .on_trans_done = on_srm_done,
+    };
+    ESP_ERROR_CHECK(ppa_client_register_event_callbacks(s_ppa, &ppa_cbs));
+
+    s_trans.buffer = s_camera_buffer;
+    s_trans.buflen = s_camera_buffer_sz;
+
+    s_running = true;
+    xTaskCreate(render_task,  "cam_render",  4096, NULL, 5, &s_render_task);
+    xTaskCreate(receive_task, "cam_receive", 4096, NULL, 6, &s_receive_task);
+
+    ESP_ERROR_CHECK(esp_cam_ctlr_start(s_csi));
+    ESP_LOGI(TAG, "preview pipeline started");
+    return ESP_OK;
+
+fail:
+    camera_preview_stop();
+    return ESP_FAIL;
+}
+
+void camera_preview_stop(void) {
+    s_running = false;
+
+    if (s_csi) {
+        esp_cam_ctlr_stop(s_csi);
+    }
+    // Give the tasks a chance to notice s_running=false and exit on their own.
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    if (s_ppa) {
+        ppa_unregister_client(s_ppa);
+        s_ppa = NULL;
+    }
+    if (s_isp) {
+        esp_isp_disable(s_isp);
+        esp_isp_del_processor(s_isp);
+        s_isp = NULL;
+    }
+    if (s_csi) {
+        esp_cam_ctlr_disable(s_csi);
+        esp_cam_ctlr_del(s_csi);
+        s_csi = NULL;
+    }
+
+    if (s_render_ready)  { vSemaphoreDelete(s_render_ready);  s_render_ready  = NULL; }
+    if (s_transfer_done) { vSemaphoreDelete(s_transfer_done); s_transfer_done = NULL; }
+    if (s_srm_done)      { vSemaphoreDelete(s_srm_done);      s_srm_done      = NULL; }
+    if (s_frame_ready)   { vSemaphoreDelete(s_frame_ready);   s_frame_ready   = NULL; }
+
+    if (s_camera_buffer)  { free(s_camera_buffer);  s_camera_buffer  = NULL; s_camera_buffer_sz  = 0; }
+    if (s_preview_buffer) { free(s_preview_buffer); s_preview_buffer = NULL; s_preview_buffer_sz = 0; }
+
+    s_receive_task = NULL;
+    s_render_task  = NULL;
+}
+
+void camera_preview_give_render_ready(void) {
+    if (s_render_ready) xSemaphoreGive(s_render_ready);
+}
+
+esp_err_t camera_preview_wait_frame(uint32_t timeout_ms) {
+    if (!s_frame_ready) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_frame_ready, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+const uint8_t *camera_preview_get_pixels(void) { return s_preview_buffer; }
+uint32_t       camera_preview_get_width(void)  { return s_preview_w; }
+uint32_t       camera_preview_get_height(void) { return s_preview_h; }

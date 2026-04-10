@@ -1,0 +1,37 @@
+#pragma once
+
+#include <stdbool.h>
+#include "esp_cam_sensor.h"
+#include "esp_err.h"
+#include "esp_sccb_intf.h"
+
+// A single detected camera sensor plus the SCCB handle it was opened with.
+// Kept in one struct so the owning module can release both on teardown.
+typedef struct {
+    esp_cam_sensor_device_t *device;
+    esp_sccb_io_handle_t     sccb;
+} camera_sensor_t;
+
+// Detect a camera sensor on the BSP's primary I2C bus. Iterates every
+// registered esp_cam_sensor detect function; the first one that responds
+// wins. Wraps bus access in the BSP's I2C claim/release semaphore.
+esp_err_t camera_sensor_detect(camera_sensor_t *out);
+
+// Release the SCCB handle for a previously-detected sensor.
+void camera_sensor_release(camera_sensor_t *sensor);
+
+// Select the sensor format matching exact_name. On success, camera_width /
+// camera_height / lane count are reported through out_fmt (may be NULL to
+// discard). SCCB access is serialised.
+esp_err_t camera_sensor_set_format_by_name(camera_sensor_t *sensor, const char *exact_name,
+                                           esp_cam_sensor_format_t *out_fmt);
+
+// Convenience wrappers that pick the preview (800x640 RAW8) and photo
+// (1920x1080 RAW10) formats on the OV5647. Both walk the sensor's exposed
+// format list so behaviour is driver-version tolerant — the format chosen
+// is written back to out_fmt when provided.
+esp_err_t camera_sensor_set_format_preview(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt);
+esp_err_t camera_sensor_set_format_photo(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt);
+
+// Start or stop the sensor output stream via S_STREAM ioctl.
+esp_err_t camera_sensor_stream(camera_sensor_t *sensor, bool enable);
