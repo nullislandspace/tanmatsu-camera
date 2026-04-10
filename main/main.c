@@ -373,16 +373,17 @@ void app_main(void) {
 
         blit();
 
-        // Photo capture runs BEFORE we release render_ready: the
-        // render task is gated so s_preview_buffer is stable, which is
-        // exactly what the JPEG encoder needs to read. The UI is
-        // briefly frozen on the last blitted frame during the encode
-        // (~150-250 ms) because we haven't released the gate yet.
+        // Photo capture: the preview pipeline is torn down and rebuilt
+        // at 1920x1080 inside photo_capture(), so the UI is frozen on
+        // the last blitted frame for most of a second. That's fine —
+        // we haven't released render_ready yet, so the preview buffer
+        // is stable, and photo_capture() owns the pipeline lifecycle.
         if (space_pending) {
             space_pending = false;
             if (mode == MODE_PHOTO) {
                 char saved_path[128] = {0};
-                esp_err_t err = photo_capture(DCIM_PATH,
+                esp_err_t err = photo_capture(&sensor, preview_w, preview_h,
+                                              DCIM_PATH,
                                               saved_path, sizeof(saved_path));
                 if (err == ESP_OK && saved_path[0]) {
                     const char *basename = strrchr(saved_path, '/');

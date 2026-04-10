@@ -188,3 +188,29 @@ esp_err_t camera_sensor_stream(camera_sensor_t *sensor, bool enable) {
     }
     return err;
 }
+
+esp_err_t camera_sensor_read_reg(camera_sensor_t *sensor, uint16_t regaddr, uint8_t *out_val) {
+    if (sensor == NULL || sensor->device == NULL || out_val == NULL) return ESP_ERR_INVALID_ARG;
+    esp_cam_sensor_reg_val_t rv = { .regaddr = regaddr, .value = 0 };
+    bsp_i2c_primary_bus_claim();
+    esp_err_t err = esp_cam_sensor_ioctl(sensor->device, ESP_CAM_SENSOR_IOC_G_REG, &rv);
+    bsp_i2c_primary_bus_release();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "G_REG 0x%04x: %d", regaddr, err);
+        return err;
+    }
+    *out_val = (uint8_t)(rv.value & 0xFF);
+    return ESP_OK;
+}
+
+esp_err_t camera_sensor_write_reg(camera_sensor_t *sensor, uint16_t regaddr, uint8_t value) {
+    if (sensor == NULL || sensor->device == NULL) return ESP_ERR_INVALID_ARG;
+    esp_cam_sensor_reg_val_t rv = { .regaddr = regaddr, .value = value };
+    bsp_i2c_primary_bus_claim();
+    esp_err_t err = esp_cam_sensor_ioctl(sensor->device, ESP_CAM_SENSOR_IOC_S_REG, &rv);
+    bsp_i2c_primary_bus_release();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "S_REG 0x%04x=0x%02x: %d", regaddr, value, err);
+    }
+    return err;
+}

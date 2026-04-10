@@ -391,3 +391,338 @@ uint32_t       camera_preview_get_height(void) { return s_preview_h; }
 const uint8_t *camera_preview_get_raw_pixels(void) { return s_camera_buffer; }
 uint32_t       camera_preview_get_raw_width(void)  { return PREVIEW_WIDTH; }
 uint32_t       camera_preview_get_raw_height(void) { return PREVIEW_HEIGHT; }
+
+// =====================================================================
+// Full-resolution photo capture (1920x1080 RAW10)
+// =====================================================================
+//
+// Uses an entirely separate set of local handles/buffers/semaphores so
+// the preview-mode globals (s_csi, s_isp, s_ppa, s_camera_buffer, ...)
+// stay untouched — the preview must be stopped BEFORE this function is
+// called and the caller is responsible for restarting it afterwards.
+//
+// Sensor must already be switched to the 1920x1080 RAW10 format via
+// camera_sensor_set_format_photo() before entry. This function brings
+// up the CSI/ISP/PPA chain, starts the sensor stream, runs the receive
+// task, drops the first `discard_frames` frames so AE/AWB has a chance
+// to settle, captures the next frame, PPA-mirrors it (same x+y flip as
+// the preview), then tears everything back down. On success the
+// mirrored RGB565 buffer is handed off to the caller who owns it and
+// must heap_caps_free() it.
+
+#include "camera_sensor.h"
+
+#define PHOTO_WIDTH       1920
+#define PHOTO_HEIGHT      1080
+#define PHOTO_LANE_COUNT  2
+// Raw pixel rate for 1920x1080 RAW10 @30fps is 1920*1080*30*10 ≈ 622 Mbps
+// total, or ~311 Mbps per lane before MIPI overhead. 500 gives comfortable
+// headroom and is still inside the ESP32-P4 DPHY envelope.
+#define PHOTO_LANE_RATE   500
+
+static esp_cam_ctlr_handle_t s_p_csi      = NULL;
+static isp_proc_handle_t     s_p_isp      = NULL;
+static ppa_client_handle_t   s_p_ppa      = NULL;
+
+static uint8_t *s_p_cam_buf   = NULL;      // CSI target: RAW → ISP → RGB565
+static size_t   s_p_cam_buf_sz = 0;
+static uint8_t *s_p_out_buf   = NULL;      // PPA-mirrored final frame
+static size_t   s_p_out_buf_sz = 0;
+
+static SemaphoreHandle_t s_p_trans_done = NULL;
+static SemaphoreHandle_t s_p_ppa_done   = NULL;
+
+static esp_cam_ctlr_trans_t s_p_trans;
+static TaskHandle_t         s_p_recv_task = NULL;
+static volatile bool        s_p_running   = false;
+
+static DRAM_ATTR volatile uint32_t s_p_cnt_get = 0;
+static DRAM_ATTR volatile uint32_t s_p_cnt_fin = 0;
+static DRAM_ATTR volatile uint32_t s_p_cnt_ppa = 0;
+
+static bool IRAM_ATTR photo_on_get_new_trans(esp_cam_ctlr_handle_t h,
+                                             esp_cam_ctlr_trans_t *trans,
+                                             void *user_data) {
+    s_p_cnt_get++;
+    trans->buffer = s_p_trans.buffer;
+    trans->buflen = s_p_trans.buflen;
+    return false;
+}
+
+static bool IRAM_ATTR photo_on_trans_finished(esp_cam_ctlr_handle_t h,
+                                              esp_cam_ctlr_trans_t *trans,
+                                              void *user_data) {
+    s_p_cnt_fin++;
+    BaseType_t hpw = pdFALSE;
+    xSemaphoreGiveFromISR(s_p_trans_done, &hpw);
+    return hpw == pdTRUE;
+}
+
+static bool IRAM_ATTR photo_on_srm_done(ppa_client_handle_t h,
+                                        ppa_event_data_t *event,
+                                        void *user_data) {
+    s_p_cnt_ppa++;
+    BaseType_t hpw = pdFALSE;
+    xSemaphoreGiveFromISR(s_p_ppa_done, &hpw);
+    return hpw == pdTRUE;
+}
+
+static void photo_recv_task(void *arg) {
+    while (s_p_running) {
+        esp_cam_ctlr_receive(s_p_csi, &s_p_trans, ESP_CAM_CTLR_MAX_DELAY);
+    }
+    vTaskDelete(NULL);
+}
+
+static void photo_teardown(void) {
+    s_p_running = false;
+
+    if (s_p_csi) {
+        esp_cam_ctlr_stop(s_p_csi);
+    }
+    if (s_p_recv_task) {
+        vTaskDelete(s_p_recv_task);
+        s_p_recv_task = NULL;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    if (s_p_ppa) {
+        ppa_unregister_client(s_p_ppa);
+        s_p_ppa = NULL;
+    }
+    if (s_p_isp) {
+        esp_isp_disable(s_p_isp);
+        esp_isp_del_processor(s_p_isp);
+        s_p_isp = NULL;
+    }
+    if (s_p_csi) {
+        esp_cam_ctlr_disable(s_p_csi);
+        esp_cam_ctlr_del(s_p_csi);
+        s_p_csi = NULL;
+    }
+
+    if (s_p_trans_done) { vSemaphoreDelete(s_p_trans_done); s_p_trans_done = NULL; }
+    if (s_p_ppa_done)   { vSemaphoreDelete(s_p_ppa_done);   s_p_ppa_done   = NULL; }
+
+    if (s_p_cam_buf) { free(s_p_cam_buf); s_p_cam_buf = NULL; s_p_cam_buf_sz = 0; }
+    // s_p_out_buf is handed off to the caller; do NOT free it here.
+}
+
+esp_err_t camera_photo_capture(camera_sensor_t *sensor,
+                               int discard_frames,
+                               uint8_t **out_buf,
+                               uint32_t *out_w,
+                               uint32_t *out_h) {
+    if (sensor == NULL || out_buf == NULL) return ESP_ERR_INVALID_ARG;
+    if (s_running)       return ESP_ERR_INVALID_STATE;  // preview still up
+    if (s_p_running)     return ESP_ERR_INVALID_STATE;  // already capturing
+
+    *out_buf = NULL;
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+
+    s_p_cnt_get = s_p_cnt_fin = s_p_cnt_ppa = 0;
+
+    uint32_t cache_line = cache_hal_get_cache_line_size(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_DATA);
+
+    // ISP output is RGB565, 2 bytes/px. Both buffers live in PSRAM.
+    s_p_cam_buf_sz = PHOTO_WIDTH * PHOTO_HEIGHT * BYTES_PER_PIXEL;
+    s_p_cam_buf_sz = (s_p_cam_buf_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
+    s_p_cam_buf    = heap_caps_aligned_calloc(cache_line, 1, s_p_cam_buf_sz,
+                                              MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+    if (!s_p_cam_buf) {
+        ESP_LOGE(TAG, "photo: cam_buf alloc failed (%zu bytes)", s_p_cam_buf_sz);
+        goto fail;
+    }
+
+    s_p_out_buf_sz = PHOTO_WIDTH * PHOTO_HEIGHT * BYTES_PER_PIXEL;
+    s_p_out_buf_sz = (s_p_out_buf_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
+    s_p_out_buf    = heap_caps_aligned_calloc(cache_line, 1, s_p_out_buf_sz,
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (!s_p_out_buf) {
+        ESP_LOGE(TAG, "photo: out_buf alloc failed (%zu bytes)", s_p_out_buf_sz);
+        goto fail;
+    }
+
+    s_p_trans_done = xSemaphoreCreateBinary();
+    s_p_ppa_done   = xSemaphoreCreateBinary();
+    if (!s_p_trans_done || !s_p_ppa_done) {
+        ESP_LOGE(TAG, "photo: semaphore alloc failed");
+        goto fail;
+    }
+
+    esp_cam_ctlr_csi_config_t csi_cfg = {
+        .ctlr_id                = 0,
+        .h_res                  = PHOTO_WIDTH,
+        .v_res                  = PHOTO_HEIGHT,
+        .data_lane_num          = PHOTO_LANE_COUNT,
+        .lane_bit_rate_mbps     = PHOTO_LANE_RATE,
+        .input_data_color_type  = CAM_CTLR_COLOR_RAW10,
+        .output_data_color_type = CAM_CTLR_COLOR_RGB565,
+        .queue_items            = 1,
+        .byte_swap_en           = false,
+        .bk_buffer_dis          = false,
+    };
+    esp_err_t err = esp_cam_new_csi_ctlr(&csi_cfg, &s_p_csi);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "photo: esp_cam_new_csi_ctlr: %d", err);
+        goto fail;
+    }
+
+    esp_cam_ctlr_evt_cbs_t cbs = {
+        .on_get_new_trans  = photo_on_get_new_trans,
+        .on_trans_finished = photo_on_trans_finished,
+    };
+    err = esp_cam_ctlr_register_event_callbacks(s_p_csi, &cbs, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "photo: register_event_callbacks: %d", err);
+        goto fail;
+    }
+    err = esp_cam_ctlr_enable(s_p_csi);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "photo: csi enable: %d", err);
+        goto fail;
+    }
+
+    esp_isp_processor_cfg_t isp_cfg = {
+        .clk_hz                 = 80 * 1000 * 1000,
+        .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
+        .input_data_color_type  = ISP_COLOR_RAW10,
+        .output_data_color_type = ISP_COLOR_RGB565,
+        .has_line_start_packet  = false,
+        .has_line_end_packet    = false,
+        .h_res                  = PHOTO_WIDTH,
+        .v_res                  = PHOTO_HEIGHT,
+        .bayer_order            = COLOR_RAW_ELEMENT_ORDER_GBRG,
+    };
+    err = esp_isp_new_processor(&isp_cfg, &s_p_isp);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "photo: esp_isp_new_processor: %d", err);
+        goto fail;
+    }
+    err = esp_isp_enable(s_p_isp);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "photo: isp enable: %d", err);
+        goto fail;
+    }
+
+    ppa_client_config_t ppa_cfg = {
+        .oper_type             = PPA_OPERATION_SRM,
+        .max_pending_trans_num = 1,
+        .data_burst_length     = PPA_DATA_BURST_LENGTH_128,
+    };
+    err = ppa_register_client(&ppa_cfg, &s_p_ppa);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "photo: ppa_register_client: %d", err);
+        goto fail;
+    }
+    ppa_event_callbacks_t ppa_cbs = { .on_trans_done = photo_on_srm_done };
+    err = ppa_client_register_event_callbacks(s_p_ppa, &ppa_cbs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "photo: ppa register cbs: %d", err);
+        goto fail;
+    }
+
+    s_p_trans.buffer = s_p_cam_buf;
+    s_p_trans.buflen = s_p_cam_buf_sz;
+
+    s_p_running = true;
+    BaseType_t rc = xTaskCreate(photo_recv_task, "photo_recv", 4096, NULL, 6, &s_p_recv_task);
+    if (rc != pdPASS) {
+        ESP_LOGE(TAG, "photo: task create failed");
+        goto fail;
+    }
+
+    err = esp_cam_ctlr_start(s_p_csi);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "photo: csi start: %d", err);
+        goto fail;
+    }
+
+    // Now the CSI PHY is listening — safe to turn the sensor on.
+    err = camera_sensor_stream(sensor, true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "photo: sensor stream on: %d", err);
+        goto fail;
+    }
+
+    // Discard warm-up frames so AE/AWB has a chance to settle after the
+    // format switch.
+    int total_frames = discard_frames + 1;
+    for (int i = 0; i < total_frames; ++i) {
+        if (xSemaphoreTake(s_p_trans_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            ESP_LOGE(TAG, "photo: frame %d timeout (get=%" PRIu32 " fin=%" PRIu32 ")",
+                     i, s_p_cnt_get, s_p_cnt_fin);
+            camera_sensor_stream(sensor, false);
+            goto fail;
+        }
+    }
+
+    // We have the captured frame in s_p_cam_buf. Stop the sensor so no
+    // further frames land while we drive the PPA mirror pass.
+    camera_sensor_stream(sensor, false);
+
+    // PPA: scale 1.0, mirror x+y (same flip the preview applies).
+    ppa_srm_oper_config_t srm = {
+        .in = {
+            .buffer         = s_p_cam_buf,
+            .pic_w          = PHOTO_WIDTH,
+            .pic_h          = PHOTO_HEIGHT,
+            .block_w        = PHOTO_WIDTH,
+            .block_h        = PHOTO_HEIGHT,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer         = s_p_out_buf,
+            .buffer_size    = s_p_out_buf_sz,
+            .pic_w          = PHOTO_WIDTH,
+            .pic_h          = PHOTO_HEIGHT,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x        = 1.0f,
+        .scale_y        = 1.0f,
+        .mirror_x       = true,
+        .mirror_y       = true,
+        .rgb_swap       = false,
+        .byte_swap      = false,
+        .mode           = PPA_TRANS_MODE_NON_BLOCKING,
+    };
+    err = ppa_do_scale_rotate_mirror(s_p_ppa, &srm);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "photo: ppa srm: %d", err);
+        goto fail;
+    }
+    if (xSemaphoreTake(s_p_ppa_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGE(TAG, "photo: ppa srm timeout");
+        goto fail;
+    }
+
+    ESP_LOGI(TAG, "photo: captured %dx%d after %d discards (get=%" PRIu32
+                  " fin=%" PRIu32 " ppa=%" PRIu32 ")",
+             PHOTO_WIDTH, PHOTO_HEIGHT, discard_frames,
+             s_p_cnt_get, s_p_cnt_fin, s_p_cnt_ppa);
+
+    // Hand the mirrored buffer to the caller, then tear down the rest.
+    *out_buf = s_p_out_buf;
+    if (out_w) *out_w = PHOTO_WIDTH;
+    if (out_h) *out_h = PHOTO_HEIGHT;
+    s_p_out_buf    = NULL;   // ownership transferred
+    s_p_out_buf_sz = 0;
+
+    photo_teardown();
+    return ESP_OK;
+
+fail:
+    if (s_p_out_buf) {
+        free(s_p_out_buf);
+        s_p_out_buf    = NULL;
+        s_p_out_buf_sz = 0;
+    }
+    photo_teardown();
+    return ESP_FAIL;
+}

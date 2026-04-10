@@ -6,6 +6,8 @@
 
 #include "esp_err.h"
 
+#include "camera_sensor.h"
+
 // Live preview pipeline based on the OV5647 + CSI + ISP + PPA reference
 // in camera.md §8 / camera_old/camera.c. Fixed to the 800x640 RAW8 sensor
 // format, RGB565 inline via the ISP, and PPA SRM scaling into a preview
@@ -41,6 +43,28 @@ esp_err_t camera_preview_wait_frame(uint32_t timeout_ms);
 const uint8_t *camera_preview_get_pixels(void);
 uint32_t       camera_preview_get_width(void);
 uint32_t       camera_preview_get_height(void);
+
+// Capture a single full-resolution (1920x1080) frame from the camera.
+//
+// Preconditions: the preview pipeline must already be stopped
+// (camera_preview_stop()) and the sensor must already be switched to
+// the 1920x1080 RAW10 format via camera_sensor_set_format_photo(). This
+// call will stream the sensor, discard `discard_frames` warm-up frames
+// so AE/AWB can settle, capture the next one, PPA-mirror it to match the
+// preview orientation, then stop the sensor and tear down the CSI/ISP/PPA
+// chain it built internally.
+//
+// On success, *out_buf points to a newly allocated cache-line aligned
+// RGB565 buffer in PSRAM containing the final mirrored frame. The caller
+// owns the buffer and MUST free it with heap_caps_free(). *out_w and
+// *out_h receive the image dimensions (1920x1080). After this returns
+// the caller is responsible for switching the sensor back to the preview
+// format and restarting camera_preview_start().
+esp_err_t camera_photo_capture(camera_sensor_t *sensor,
+                               int discard_frames,
+                               uint8_t **out_buf,
+                               uint32_t *out_w,
+                               uint32_t *out_h);
 
 // Pointer to the full-size 800x640 RGB565 frame that the ISP writes into
 // (pre-PPA, no scale/mirror applied). CSI DMA is continuously overwriting

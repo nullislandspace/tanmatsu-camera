@@ -35,3 +35,11 @@ esp_err_t camera_sensor_set_format_photo(camera_sensor_t *sensor, esp_cam_sensor
 
 // Start or stop the sensor output stream via S_STREAM ioctl.
 esp_err_t camera_sensor_stream(camera_sensor_t *sensor, bool enable);
+
+// Read a single 8-bit sensor register over SCCB via ESP_CAM_SENSOR_IOC_G_REG.
+// regaddr is the sensor-side 16-bit register address. SCCB access is serialised.
+esp_err_t camera_sensor_read_reg(camera_sensor_t *sensor, uint16_t regaddr, uint8_t *out_val);
+
+// Write a single 8-bit sensor register over SCCB via ESP_CAM_SENSOR_IOC_S_REG.
+// regaddr is the sensor-side 16-bit register address. SCCB access is serialised.
+esp_err_t camera_sensor_write_reg(camera_sensor_t *sensor, uint16_t regaddr, uint8_t value);
