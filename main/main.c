@@ -270,18 +270,23 @@ void app_main(void) {
     //
     //   +---------------------------------+------------+
     //   |                                 |            |
-    //   |                                 |    HUD     |
-    //   |      preview (0,0)-(599,479)    |  (600,0)-  |
-    //   |                                 |  (799,479) |
-    //   |                                 |            |
+    //   |            BLACK BAR            |            |
+    //   |  +---------------------------+  |    HUD     |
+    //   |  |                           |  |  (600,0)-  |
+    //   |  |     16:9 camera feed      |  |  (799,479) |
+    //   |  |      (600 x 337)          |  |            |
+    //   |  +---------------------------+  |            |
+    //   |            BLACK BAR            |            |
     //   +---------------------------------+------------+
     //
-    // 600 user-pixels wide × 480 user-pixels tall for the live camera
-    // feed (matching the 5:4 800x640 sensor aspect, the max the 1/16
-    // PPA scale snap can produce for that box is 12/16 = 0.75 which
-    // yields exactly 600x480), with the rightmost 200 user-pixels
-    // reserved for the HUD strip. Preview is always flush against the
-    // user's top-left; no centring logic needed.
+    // Sensor is 1920 x 1080 (16:9). Preview area is 600 x 480 (5:4),
+    // so we letterbox: pick the largest PPA 1/16 scale that fits
+    // 1920 x 1080 inside 600 x 480. That's 5/16 (= 0.3125 exact),
+    // which gives 600 x 337.5 → 600 x 337 content in user view, with
+    // (480-337)/2 = 71 pixels of black bar above and below.
+    //
+    // The HUD strip on the right stays the same: 200 px wide, full
+    // height.
     const uint32_t logical_w       = fb.user_w;                  // 800
     const uint32_t logical_h       = fb.user_h;                  // 480
     const uint32_t preview_area_w  = 600;
@@ -421,14 +426,35 @@ void app_main(void) {
                                 (const uint16_t *)viewer_get_pixels(),
                                 viewer_get_width(), viewer_get_height());
         } else if (mode != MODE_VIEW) {
-            // camera_pipeline's PPA already produced the preview in
-            // panel-native layout (rotated, scaled, mirrored). Drop it
-            // into panel memory at the top-left — that's user (0, 0)
-            // after the CW rotation transform.
-            fbdraw_blit_panel(&fb, 0, 0,
+            // camera_pipeline's PPA produced a 16:9 preview letterboxed
+            // into the 5:4 (600x480) preview area. The PPA output is
+            // stored panel-native: pw columns × ph rows, where pw is
+            // the narrower dimension (337 at 5/16 scale) and ph covers
+            // the full preview-area width in user space (600). Center
+            // it horizontally in the 480-wide panel range, which
+            // corresponds to vertical centring in the user's view.
+            uint32_t pw = camera_preview_get_width();
+            uint32_t ph = camera_preview_get_height();
+            int panel_x_off = ((int)fb.panel_w - (int)pw) / 2;
+            if (panel_x_off < 0) panel_x_off = 0;
+
+            // Clear the top and bottom letterbox bars so stale content
+            // from a previous frame or from view mode doesn't show.
+            int top_bar_h = (int)fb.user_h - (panel_x_off + (int)pw);
+            int bot_bar_y = (int)fb.user_h - panel_x_off;
+            int bot_bar_h = panel_x_off;
+            if (top_bar_h > 0) {
+                fbdraw_fill_rect(&fb, 0, 0,
+                                 (int)preview_area_w, top_bar_h, BLACK);
+            }
+            if (bot_bar_h > 0) {
+                fbdraw_fill_rect(&fb, 0, bot_bar_y,
+                                 (int)preview_area_w, bot_bar_h, BLACK);
+            }
+
+            fbdraw_blit_panel(&fb, panel_x_off, 0,
                               (const uint16_t *)camera_preview_get_pixels(),
-                              camera_preview_get_width(),
-                              camera_preview_get_height());
+                              pw, ph);
         }
         int64_t t_after_image = esp_timer_get_time();
 

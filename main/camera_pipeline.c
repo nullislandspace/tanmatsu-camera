@@ -22,13 +22,18 @@
 
 static const char *TAG = "camera_pipeline";
 
-// Fixed preview sensor format (camera.md §8).
-#define PREVIEW_WIDTH       800
-#define PREVIEW_HEIGHT      640
+// Fixed preview sensor format: the OV5647 highest-res MIPI mode. We
+// use this for both preview and photo capture so WYSIWYG is automatic
+// and no format switch is ever required.
+#define PREVIEW_WIDTH       1920
+#define PREVIEW_HEIGHT      1080
 #define PREVIEW_LANE_COUNT  2
-#define PREVIEW_LANE_RATE   200   // Mbps per lane
+// 1920x1080 RAW10 @30 fps needs ~622 Mbps total, or ~311 Mbps/lane
+// before MIPI overhead. 500 gives comfortable headroom and is inside
+// the ESP32-P4 DPHY envelope.
+#define PREVIEW_LANE_RATE   500
 
-#define BYTES_PER_PIXEL     2     // RGB565
+#define BYTES_PER_PIXEL     2     // RGB565 (ISP output, not the RAW10 CSI input)
 
 // The preview pipeline bakes the display's 90° rotation into the PPA
 // output so the main UI can skip per-pixel rotation in software. The
@@ -48,8 +53,18 @@ static esp_cam_ctlr_handle_t s_csi      = NULL;
 static isp_proc_handle_t     s_isp      = NULL;
 static ppa_client_handle_t   s_ppa      = NULL;
 
-static uint8_t *s_camera_buffer   = NULL;  // Full 800x640 RGB565 CSI output
-static size_t   s_camera_buffer_sz = 0;
+// DOUBLE-BUFFERED CSI TARGETS. The ESP-IDF CSI driver only lets us
+// queue one trans at a time (queue_items=1) and the on_get_new_trans
+// callback has to return a buffer every time it fires, so we flip
+// between two buffers: the ISR always hands the "inactive" one to the
+// next CSI frame, and the "active" one — which just finished writing —
+// becomes the new stable read target for the render task and the
+// photo snapshot path. No pause, no tearing.
+static uint8_t *s_cam_buf[2]    = {NULL, NULL};
+static size_t   s_cam_buf_sz    = 0;
+static volatile int s_cam_active_idx = 0;              // ISR: next to fill
+static volatile uint8_t *s_cam_stable = NULL;          // task-side: most-recently-completed
+static volatile bool s_photo_lock     = false;         // when set, ISR stops toggling stable/active
 
 static uint8_t *s_preview_buffer  = NULL;  // Scaled + rotated preview RGB565 (panel-native)
 static size_t   s_preview_buffer_sz = 0;
@@ -64,8 +79,10 @@ static SemaphoreHandle_t s_render_ready = NULL;  // given by the main loop after
                                                   // finished drawing; gates the next PPA
                                                   // transform so it doesn't overwrite the
                                                   // preview buffer mid-draw.
-
-static esp_cam_ctlr_trans_t s_trans;
+static SemaphoreHandle_t s_ppa_mutex    = NULL;  // serialises s_ppa access between the
+                                                  // render task and photo snapshot path
+                                                  // (only one SRM op can be pending on a
+                                                  // single PPA client at a time).
 
 static TaskHandle_t s_receive_task = NULL;
 static TaskHandle_t s_render_task  = NULL;
@@ -81,13 +98,22 @@ static DRAM_ATTR volatile uint32_t s_cnt_srm_done       = 0;
 // configured cache-safe (CONFIG_CAM_CTLR_MIPI_CSI_ISR_CACHE_SAFE=y), because
 // they may run while the flash cache is disabled.
 //
-// Matches the ESP-IDF mipi_isp_dsi example: unconditionally provide the
-// buffer. Back-pressure with the UI is handled task-side via a binary
-// frame_ready semaphore, not in the ISR.
+// on_get_new_trans fires AFTER on_trans_finished — the buffer the
+// trans we just finished was writing is at s_cam_active_idx. Promote
+// it to the stable read target and flip active to the other buffer,
+// then hand THAT to the CSI HW as the next fill target. If a photo
+// capture is in progress (s_photo_lock), skip the toggle entirely
+// so the stable pointer stays put while the PPA mirror pass is
+// reading it — CSI keeps overwriting the active buffer, we just
+// don't advance the pointers.
 static bool IRAM_ATTR on_get_new_trans(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data) {
     s_cnt_get_new_trans++;
-    trans->buffer = s_trans.buffer;
-    trans->buflen = s_trans.buflen;
+    if (!s_photo_lock) {
+        s_cam_stable     = s_cam_buf[s_cam_active_idx];
+        s_cam_active_idx ^= 1;
+    }
+    trans->buffer = s_cam_buf[s_cam_active_idx];
+    trans->buflen = s_cam_buf_sz;
     return false;
 }
 
@@ -105,12 +131,14 @@ static bool IRAM_ATTR on_srm_done(ppa_client_handle_t ppa_handle, ppa_event_data
     return hpw == pdTRUE;
 }
 
-static void receive_task(void *arg) {
-    while (s_running) {
-        esp_cam_ctlr_receive(s_csi, &s_trans, ESP_CAM_CTLR_MAX_DELAY);
-    }
-    vTaskDelete(NULL);
-}
+// receive_task is GONE. The original pattern was a tight loop calling
+// esp_cam_ctlr_receive() to keep the CSI trans queue populated, but
+// that prevents on_get_new_trans from ever being called — the queue
+// always has a pending trans waiting to be dequeued, so the HW never
+// needs to ask for a new one. That broke the double-buffer toggle
+// which lives in on_get_new_trans. Instead we prime the queue once
+// from camera_preview_start() and let on_get_new_trans handle every
+// subsequent frame's buffer selection.
 
 static void render_task(void *arg) {
     uint32_t n_frames = 0;
@@ -130,16 +158,40 @@ static void render_task(void *arg) {
 
         // Wait until the UI has finished drawing the previous preview frame
         // before we overwrite the preview buffer with a new PPA transform.
-        // If the UI never consumes, we just drop CSI frames (the CSI DMA
-        // keeps running into s_camera_buffer but we don't PPA-convert them).
+        // If the UI never consumes, we just drop CSI frames — the CSI
+        // keeps running into its double-buffered targets, we just don't
+        // PPA-convert them.
         if (xSemaphoreTake(s_render_ready, pdMS_TO_TICKS(500)) != pdTRUE) {
             continue;
         }
         if (!s_running) break;
 
+        // Read the current stable camera buffer pointer. The CSI ISR
+        // promotes buf[active_idx] to stable inside on_get_new_trans,
+        // AFTER the frame was fully written but BEFORE the HW starts
+        // writing the next one into the other buffer. So this pointer
+        // is guaranteed not to be overwritten for the full duration
+        // of the next frame period, i.e. ~66 ms at 15 fps — plenty
+        // of time for a PPA pass that takes a couple of ms.
+        const uint8_t *src = (const uint8_t *)s_cam_stable;
+        if (src == NULL) {
+            // CSI hasn't completed a frame yet — hand render_ready
+            // back so the main loop doesn't deadlock.
+            xSemaphoreGive(s_render_ready);
+            continue;
+        }
+
+        // Serialise PPA client access against the photo snapshot path.
+        // ppa_do_scale_rotate_mirror + srm_done wait must happen
+        // atomically from the PPA's point of view — max_pending_trans_num
+        // is 1 on this client.
+        xSemaphoreTake(s_ppa_mutex, portMAX_DELAY);
+        // Drain any stale srm_done left behind by a previous op.
+        xSemaphoreTake(s_srm_done, 0);
+
         ppa_srm_oper_config_t srm = {
             .in = {
-                .buffer         = s_camera_buffer,
+                .buffer         = (void *)src,
                 .pic_w          = PREVIEW_WIDTH,
                 .pic_h          = PREVIEW_HEIGHT,
                 .block_w        = PREVIEW_WIDTH,
@@ -179,13 +231,16 @@ static void render_task(void *arg) {
         esp_err_t rerr = ppa_do_scale_rotate_mirror(s_ppa, &srm);
         if (rerr != ESP_OK) {
             ESP_LOGW(TAG, "ppa_do_scale_rotate_mirror: %d", rerr);
+            xSemaphoreGive(s_ppa_mutex);
             continue;
         }
 
         if (xSemaphoreTake(s_srm_done, pdMS_TO_TICKS(500)) != pdTRUE) {
             ESP_LOGW(TAG, "srm_done timeout");
+            xSemaphoreGive(s_ppa_mutex);
             continue;
         }
+        xSemaphoreGive(s_ppa_mutex);
         xSemaphoreGive(s_frame_ready);
         n_frames++;
         if (n_frames <= 3 || (n_frames % 30) == 0) {
@@ -242,13 +297,24 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
     ESP_LOGI(TAG, "preview buf %" PRIu32 "x%" PRIu32 " (panel-native, scale %" PRIu32 "/16) cache_line=%" PRIu32,
              s_preview_w, s_preview_h, frag, cache_line);
 
-    s_camera_buffer_sz = PREVIEW_WIDTH * PREVIEW_HEIGHT * BYTES_PER_PIXEL;
-    s_camera_buffer    = heap_caps_aligned_calloc(cache_line, 1, s_camera_buffer_sz,
-                                                  MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
-    if (!s_camera_buffer) {
-        ESP_LOGE(TAG, "camera_buffer alloc failed");
-        goto fail;
+    // Allocate TWO camera buffers (double-buffering). The ISP writes
+    // RGB565 into whichever is "active"; the other holds the
+    // most-recently-completed frame and is the stable read target
+    // for the render task and photo snapshots. 1920x1080 @2 B/px =
+    // ~4.15 MB each, ~8.3 MB total. Comfortable in 32 MB PSRAM.
+    s_cam_buf_sz = (size_t)PREVIEW_WIDTH * PREVIEW_HEIGHT * BYTES_PER_PIXEL;
+    s_cam_buf_sz = (s_cam_buf_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
+    for (int i = 0; i < 2; i++) {
+        s_cam_buf[i] = heap_caps_aligned_calloc(cache_line, 1, s_cam_buf_sz,
+                                                MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+        if (!s_cam_buf[i]) {
+            ESP_LOGE(TAG, "cam_buf[%d] alloc failed (%zu bytes)", i, s_cam_buf_sz);
+            goto fail;
+        }
     }
+    s_cam_active_idx = 0;
+    s_cam_stable     = NULL;  // nothing stable yet; render_task bails until first frame
+    s_photo_lock     = false;
 
     // buffer_size must be a multiple of the cache line size per
     // ppa_do_scale_rotate_mirror()'s alignment check; pad the allocation
@@ -267,7 +333,8 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
     s_srm_done      = xSemaphoreCreateBinary();
     s_frame_ready   = xSemaphoreCreateBinary();
     s_render_ready  = xSemaphoreCreateBinary();
-    if (!s_transfer_done || !s_srm_done || !s_frame_ready || !s_render_ready) {
+    s_ppa_mutex     = xSemaphoreCreateMutex();
+    if (!s_transfer_done || !s_srm_done || !s_frame_ready || !s_render_ready || !s_ppa_mutex) {
         ESP_LOGE(TAG, "semaphore alloc failed");
         goto fail;
     }
@@ -281,7 +348,7 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
         .v_res                  = PREVIEW_HEIGHT,
         .data_lane_num          = PREVIEW_LANE_COUNT,
         .lane_bit_rate_mbps     = PREVIEW_LANE_RATE,
-        .input_data_color_type  = CAM_CTLR_COLOR_RAW8,
+        .input_data_color_type  = CAM_CTLR_COLOR_RAW10,
         .output_data_color_type = CAM_CTLR_COLOR_RGB565,
         .queue_items            = 1,
         .byte_swap_en           = false,
@@ -307,7 +374,7 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_hz                 = 80 * 1000 * 1000,
         .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
-        .input_data_color_type  = ISP_COLOR_RAW8,
+        .input_data_color_type  = ISP_COLOR_RAW10,
         .output_data_color_type = ISP_COLOR_RGB565,
         .has_line_start_packet  = false,
         .has_line_end_packet    = false,
@@ -337,14 +404,27 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
     };
     ESP_ERROR_CHECK(ppa_client_register_event_callbacks(s_ppa, &ppa_cbs));
 
-    s_trans.buffer = s_camera_buffer;
-    s_trans.buflen = s_camera_buffer_sz;
-
     s_running = true;
     xTaskCreate(render_task,  "cam_render",  4096, NULL, 5, &s_render_task);
-    xTaskCreate(receive_task, "cam_receive", 4096, NULL, 6, &s_receive_task);
 
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_csi));
+
+    // Prime the CSI trans queue exactly once. From here on,
+    // on_get_new_trans is called from ISR context every time the HW
+    // finishes a frame and needs a new buffer, and that's where the
+    // double-buffer toggle happens. No receive_task required.
+    {
+        esp_cam_ctlr_trans_t trans = {
+            .buffer = s_cam_buf[s_cam_active_idx],
+            .buflen = s_cam_buf_sz,
+        };
+        err = esp_cam_ctlr_receive(s_csi, &trans, 1000);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "initial esp_cam_ctlr_receive: %d", err);
+            goto fail;
+        }
+    }
+
     ESP_LOGI(TAG, "preview pipeline started");
     return ESP_OK;
 
@@ -402,8 +482,16 @@ void camera_preview_stop(void) {
     if (s_srm_done)      { vSemaphoreDelete(s_srm_done);      s_srm_done      = NULL; }
     if (s_frame_ready)   { vSemaphoreDelete(s_frame_ready);   s_frame_ready   = NULL; }
     if (s_render_ready)  { vSemaphoreDelete(s_render_ready);  s_render_ready  = NULL; }
+    if (s_ppa_mutex)     { vSemaphoreDelete(s_ppa_mutex);     s_ppa_mutex     = NULL; }
 
-    if (s_camera_buffer)  { free(s_camera_buffer);  s_camera_buffer  = NULL; s_camera_buffer_sz  = 0; }
+    // Free both double-buffer slots. Clear the volatile pointers
+    // first so any late ISR sees NULL rather than a dangling buffer.
+    s_cam_stable     = NULL;
+    s_cam_active_idx = 0;
+    for (int i = 0; i < 2; i++) {
+        if (s_cam_buf[i]) { free(s_cam_buf[i]); s_cam_buf[i] = NULL; }
+    }
+    s_cam_buf_sz = 0;
     if (s_preview_buffer) { free(s_preview_buffer); s_preview_buffer = NULL; s_preview_buffer_sz = 0; }
 }
 
@@ -425,341 +513,127 @@ const uint8_t *camera_preview_get_pixels(void) { return s_preview_buffer; }
 uint32_t       camera_preview_get_width(void)  { return s_preview_w; }
 uint32_t       camera_preview_get_height(void) { return s_preview_h; }
 
-const uint8_t *camera_preview_get_raw_pixels(void) { return s_camera_buffer; }
+// Returns the current stable camera buffer — i.e. the one the CSI
+// ISR has most recently promoted as "finished". May be NULL during
+// the very first ISR cycle before any frame has completed.
+const uint8_t *camera_preview_get_raw_pixels(void) { return (const uint8_t *)s_cam_stable; }
 uint32_t       camera_preview_get_raw_width(void)  { return PREVIEW_WIDTH; }
 uint32_t       camera_preview_get_raw_height(void) { return PREVIEW_HEIGHT; }
 
-// =====================================================================
-// Full-resolution photo capture (1920x1080 RAW10)
-// =====================================================================
+// Photo snapshot: take the current stable double-buffered CSI frame
+// and run it through a PPA mirror-only pass (scale 1.0, rotation 0,
+// mirror_x + mirror_y matching the preview) into a fresh RGB565
+// buffer. Returns a standard 1920x1080 landscape image — no sensor
+// pause, no format switch, no stream toggle.
 //
-// Uses an entirely separate set of local handles/buffers/semaphores so
-// the preview-mode globals (s_csi, s_isp, s_ppa, s_camera_buffer, ...)
-// stay untouched — the preview must be stopped BEFORE this function is
-// called and the caller is responsible for restarting it afterwards.
+// How the race is avoided:
+//   1. Take s_ppa_mutex so the render task can't submit a concurrent
+//      PPA op on the same client.
+//   2. Set s_photo_lock = true so on_get_new_trans stops advancing
+//      s_cam_stable and s_cam_active_idx. This freezes the stable
+//      pointer for the duration of the PPA pass — the CSI keeps
+//      overwriting the same active buffer, but we don't care because
+//      we're reading the OTHER one.
+//   3. Snapshot s_cam_stable into a local pointer.
+//   4. Run the mirror PPA pass on that buffer.
+//   5. Clear s_photo_lock and release s_ppa_mutex.
 //
-// Sensor must already be switched to the 1920x1080 RAW10 format via
-// camera_sensor_set_format_photo() before entry. This function brings
-// up the CSI/ISP/PPA chain, starts the sensor stream, runs the receive
-// task, drops the first `discard_frames` frames so AE/AWB has a chance
-// to settle, captures the next frame, PPA-mirrors it (same x+y flip as
-// the preview), then tears everything back down. On success the
-// mirrored RGB565 buffer is handed off to the caller who owns it and
-// must heap_caps_free() it.
-
-#include "camera_sensor.h"
-
-#define PHOTO_WIDTH       1920
-#define PHOTO_HEIGHT      1080
-#define PHOTO_LANE_COUNT  2
-// Raw pixel rate for 1920x1080 RAW10 @30fps is 1920*1080*30*10 ≈ 622 Mbps
-// total, or ~311 Mbps per lane before MIPI overhead. 500 gives comfortable
-// headroom and is still inside the ESP32-P4 DPHY envelope.
-#define PHOTO_LANE_RATE   500
-
-static esp_cam_ctlr_handle_t s_p_csi      = NULL;
-static isp_proc_handle_t     s_p_isp      = NULL;
-static ppa_client_handle_t   s_p_ppa      = NULL;
-
-static uint8_t *s_p_cam_buf   = NULL;      // CSI target: RAW → ISP → RGB565
-static size_t   s_p_cam_buf_sz = 0;
-static uint8_t *s_p_out_buf   = NULL;      // PPA-mirrored final frame
-static size_t   s_p_out_buf_sz = 0;
-
-static SemaphoreHandle_t s_p_trans_done = NULL;
-static SemaphoreHandle_t s_p_ppa_done   = NULL;
-
-static esp_cam_ctlr_trans_t s_p_trans;
-static TaskHandle_t         s_p_recv_task = NULL;
-static volatile bool        s_p_running   = false;
-
-static DRAM_ATTR volatile uint32_t s_p_cnt_get = 0;
-static DRAM_ATTR volatile uint32_t s_p_cnt_fin = 0;
-static DRAM_ATTR volatile uint32_t s_p_cnt_ppa = 0;
-
-static bool IRAM_ATTR photo_on_get_new_trans(esp_cam_ctlr_handle_t h,
-                                             esp_cam_ctlr_trans_t *trans,
-                                             void *user_data) {
-    s_p_cnt_get++;
-    trans->buffer = s_p_trans.buffer;
-    trans->buflen = s_p_trans.buflen;
-    return false;
-}
-
-static bool IRAM_ATTR photo_on_trans_finished(esp_cam_ctlr_handle_t h,
-                                              esp_cam_ctlr_trans_t *trans,
-                                              void *user_data) {
-    s_p_cnt_fin++;
-    BaseType_t hpw = pdFALSE;
-    xSemaphoreGiveFromISR(s_p_trans_done, &hpw);
-    return hpw == pdTRUE;
-}
-
-static bool IRAM_ATTR photo_on_srm_done(ppa_client_handle_t h,
-                                        ppa_event_data_t *event,
-                                        void *user_data) {
-    s_p_cnt_ppa++;
-    BaseType_t hpw = pdFALSE;
-    xSemaphoreGiveFromISR(s_p_ppa_done, &hpw);
-    return hpw == pdTRUE;
-}
-
-static void photo_recv_task(void *arg) {
-    while (s_p_running) {
-        esp_cam_ctlr_receive(s_p_csi, &s_p_trans, ESP_CAM_CTLR_MAX_DELAY);
+// On success *out_buf points to a cache-line-aligned PSRAM buffer the
+// caller owns and must heap_caps_free(). *out_w / *out_h return
+// 1920 / 1080.
+esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w, uint32_t *out_h) {
+    if (out_buf == NULL) return ESP_ERR_INVALID_ARG;
+    if (!s_running || s_ppa == NULL) {
+        return ESP_ERR_INVALID_STATE;
     }
-    vTaskDelete(NULL);
-}
-
-static void photo_teardown(void) {
-    s_p_running = false;
-
-    if (s_p_csi) {
-        esp_cam_ctlr_stop(s_p_csi);
-    }
-    if (s_p_recv_task) {
-        vTaskDelete(s_p_recv_task);
-        s_p_recv_task = NULL;
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    if (s_p_ppa) {
-        ppa_unregister_client(s_p_ppa);
-        s_p_ppa = NULL;
-    }
-    if (s_p_isp) {
-        esp_isp_disable(s_p_isp);
-        esp_isp_del_processor(s_p_isp);
-        s_p_isp = NULL;
-    }
-    if (s_p_csi) {
-        esp_cam_ctlr_disable(s_p_csi);
-        esp_cam_ctlr_del(s_p_csi);
-        s_p_csi = NULL;
-    }
-
-    if (s_p_trans_done) { vSemaphoreDelete(s_p_trans_done); s_p_trans_done = NULL; }
-    if (s_p_ppa_done)   { vSemaphoreDelete(s_p_ppa_done);   s_p_ppa_done   = NULL; }
-
-    if (s_p_cam_buf) { free(s_p_cam_buf); s_p_cam_buf = NULL; s_p_cam_buf_sz = 0; }
-    // s_p_out_buf is handed off to the caller; do NOT free it here.
-}
-
-esp_err_t camera_photo_capture(camera_sensor_t *sensor,
-                               int discard_frames,
-                               uint8_t **out_buf,
-                               uint32_t *out_w,
-                               uint32_t *out_h) {
-    if (sensor == NULL || out_buf == NULL) return ESP_ERR_INVALID_ARG;
-    if (s_running)       return ESP_ERR_INVALID_STATE;  // preview still up
-    if (s_p_running)     return ESP_ERR_INVALID_STATE;  // already capturing
 
     *out_buf = NULL;
     if (out_w) *out_w = 0;
     if (out_h) *out_h = 0;
 
-    s_p_cnt_get = s_p_cnt_fin = s_p_cnt_ppa = 0;
-
     uint32_t cache_line = cache_hal_get_cache_line_size(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_DATA);
+    size_t   snap_sz    = (size_t)PREVIEW_WIDTH * PREVIEW_HEIGHT * BYTES_PER_PIXEL;
+    snap_sz = (snap_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
 
-    // ISP output is RGB565, 2 bytes/px. Both buffers live in PSRAM.
-    s_p_cam_buf_sz = PHOTO_WIDTH * PHOTO_HEIGHT * BYTES_PER_PIXEL;
-    s_p_cam_buf_sz = (s_p_cam_buf_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
-    s_p_cam_buf    = heap_caps_aligned_calloc(cache_line, 1, s_p_cam_buf_sz,
-                                              MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
-    if (!s_p_cam_buf) {
-        ESP_LOGE(TAG, "photo: cam_buf alloc failed (%zu bytes)", s_p_cam_buf_sz);
-        goto fail;
+    uint8_t *snap = heap_caps_aligned_calloc(cache_line, 1, snap_sz,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    if (snap == NULL) {
+        ESP_LOGE(TAG, "photo snapshot alloc failed (%zu bytes)", snap_sz);
+        return ESP_ERR_NO_MEM;
     }
 
-    s_p_out_buf_sz = PHOTO_WIDTH * PHOTO_HEIGHT * BYTES_PER_PIXEL;
-    s_p_out_buf_sz = (s_p_out_buf_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
-    s_p_out_buf    = heap_caps_aligned_calloc(cache_line, 1, s_p_out_buf_sz,
-                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
-    if (!s_p_out_buf) {
-        ESP_LOGE(TAG, "photo: out_buf alloc failed (%zu bytes)", s_p_out_buf_sz);
-        goto fail;
+    // Serialise against the render task's PPA ops on the same client.
+    xSemaphoreTake(s_ppa_mutex, portMAX_DELAY);
+    // Drain any stale srm_done left by a previous op.
+    xSemaphoreTake(s_srm_done, 0);
+
+    // Freeze the stable pointer for the duration of the PPA pass.
+    // From this point the ISR still fires on CSI frame completion
+    // but on_get_new_trans keeps s_cam_stable / s_cam_active_idx
+    // where they are.
+    s_photo_lock = true;
+
+    const uint8_t *src = (const uint8_t *)s_cam_stable;
+    if (src == NULL) {
+        ESP_LOGE(TAG, "photo snapshot: no stable frame yet");
+        s_photo_lock = false;
+        xSemaphoreGive(s_ppa_mutex);
+        free(snap);
+        return ESP_ERR_INVALID_STATE;
     }
 
-    s_p_trans_done = xSemaphoreCreateBinary();
-    s_p_ppa_done   = xSemaphoreCreateBinary();
-    if (!s_p_trans_done || !s_p_ppa_done) {
-        ESP_LOGE(TAG, "photo: semaphore alloc failed");
-        goto fail;
-    }
-
-    esp_cam_ctlr_csi_config_t csi_cfg = {
-        .ctlr_id                = 0,
-        .h_res                  = PHOTO_WIDTH,
-        .v_res                  = PHOTO_HEIGHT,
-        .data_lane_num          = PHOTO_LANE_COUNT,
-        .lane_bit_rate_mbps     = PHOTO_LANE_RATE,
-        .input_data_color_type  = CAM_CTLR_COLOR_RAW10,
-        .output_data_color_type = CAM_CTLR_COLOR_RGB565,
-        .queue_items            = 1,
-        .byte_swap_en           = false,
-        .bk_buffer_dis          = false,
-    };
-    esp_err_t err = esp_cam_new_csi_ctlr(&csi_cfg, &s_p_csi);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "photo: esp_cam_new_csi_ctlr: %d", err);
-        goto fail;
-    }
-
-    esp_cam_ctlr_evt_cbs_t cbs = {
-        .on_get_new_trans  = photo_on_get_new_trans,
-        .on_trans_finished = photo_on_trans_finished,
-    };
-    err = esp_cam_ctlr_register_event_callbacks(s_p_csi, &cbs, NULL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "photo: register_event_callbacks: %d", err);
-        goto fail;
-    }
-    err = esp_cam_ctlr_enable(s_p_csi);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "photo: csi enable: %d", err);
-        goto fail;
-    }
-
-    esp_isp_processor_cfg_t isp_cfg = {
-        .clk_hz                 = 80 * 1000 * 1000,
-        .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
-        .input_data_color_type  = ISP_COLOR_RAW10,
-        .output_data_color_type = ISP_COLOR_RGB565,
-        .has_line_start_packet  = false,
-        .has_line_end_packet    = false,
-        .h_res                  = PHOTO_WIDTH,
-        .v_res                  = PHOTO_HEIGHT,
-        .bayer_order            = COLOR_RAW_ELEMENT_ORDER_GBRG,
-    };
-    err = esp_isp_new_processor(&isp_cfg, &s_p_isp);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "photo: esp_isp_new_processor: %d", err);
-        goto fail;
-    }
-    err = esp_isp_enable(s_p_isp);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "photo: isp enable: %d", err);
-        goto fail;
-    }
-
-    ppa_client_config_t ppa_cfg = {
-        .oper_type             = PPA_OPERATION_SRM,
-        .max_pending_trans_num = 1,
-        .data_burst_length     = PPA_DATA_BURST_LENGTH_128,
-    };
-    err = ppa_register_client(&ppa_cfg, &s_p_ppa);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "photo: ppa_register_client: %d", err);
-        goto fail;
-    }
-    ppa_event_callbacks_t ppa_cbs = { .on_trans_done = photo_on_srm_done };
-    err = ppa_client_register_event_callbacks(s_p_ppa, &ppa_cbs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "photo: ppa register cbs: %d", err);
-        goto fail;
-    }
-
-    s_p_trans.buffer = s_p_cam_buf;
-    s_p_trans.buflen = s_p_cam_buf_sz;
-
-    s_p_running = true;
-    BaseType_t rc = xTaskCreate(photo_recv_task, "photo_recv", 4096, NULL, 6, &s_p_recv_task);
-    if (rc != pdPASS) {
-        ESP_LOGE(TAG, "photo: task create failed");
-        goto fail;
-    }
-
-    err = esp_cam_ctlr_start(s_p_csi);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "photo: csi start: %d", err);
-        goto fail;
-    }
-
-    // Now the CSI PHY is listening — safe to turn the sensor on.
-    err = camera_sensor_stream(sensor, true);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "photo: sensor stream on: %d", err);
-        goto fail;
-    }
-
-    // Discard warm-up frames so AE/AWB has a chance to settle after the
-    // format switch.
-    int total_frames = discard_frames + 1;
-    for (int i = 0; i < total_frames; ++i) {
-        if (xSemaphoreTake(s_p_trans_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            ESP_LOGE(TAG, "photo: frame %d timeout (get=%" PRIu32 " fin=%" PRIu32 ")",
-                     i, s_p_cnt_get, s_p_cnt_fin);
-            camera_sensor_stream(sensor, false);
-            goto fail;
-        }
-    }
-
-    // We have the captured frame in s_p_cam_buf. Stop the sensor so no
-    // further frames land while we drive the PPA mirror pass.
-    camera_sensor_stream(sensor, false);
-
-    // PPA: scale 1.0, mirror x+y (same flip the preview applies).
     ppa_srm_oper_config_t srm = {
         .in = {
-            .buffer         = s_p_cam_buf,
-            .pic_w          = PHOTO_WIDTH,
-            .pic_h          = PHOTO_HEIGHT,
-            .block_w        = PHOTO_WIDTH,
-            .block_h        = PHOTO_HEIGHT,
+            .buffer         = (void *)src,
+            .pic_w          = PREVIEW_WIDTH,
+            .pic_h          = PREVIEW_HEIGHT,
+            .block_w        = PREVIEW_WIDTH,
+            .block_h        = PREVIEW_HEIGHT,
             .block_offset_x = 0,
             .block_offset_y = 0,
             .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
         },
         .out = {
-            .buffer         = s_p_out_buf,
-            .buffer_size    = s_p_out_buf_sz,
-            .pic_w          = PHOTO_WIDTH,
-            .pic_h          = PHOTO_HEIGHT,
+            .buffer         = snap,
+            .buffer_size    = snap_sz,
+            .pic_w          = PREVIEW_WIDTH,
+            .pic_h          = PREVIEW_HEIGHT,
             .block_offset_x = 0,
             .block_offset_y = 0,
             .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
         },
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x        = 1.0f,
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,   // landscape, don't rotate
+        .scale_x        = 1.0f,                       // 1:1
         .scale_y        = 1.0f,
-        .mirror_x       = true,
-        .mirror_y       = true,
+        .mirror_x       = PREVIEW_PPA_MIRROR_X,
+        .mirror_y       = PREVIEW_PPA_MIRROR_Y,
         .rgb_swap       = false,
         .byte_swap      = false,
         .mode           = PPA_TRANS_MODE_NON_BLOCKING,
     };
-    err = ppa_do_scale_rotate_mirror(s_p_ppa, &srm);
+    esp_err_t err = ppa_do_scale_rotate_mirror(s_ppa, &srm);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "photo: ppa srm: %d", err);
-        goto fail;
+        ESP_LOGE(TAG, "photo snapshot PPA: %d", err);
+        s_photo_lock = false;
+        xSemaphoreGive(s_ppa_mutex);
+        free(snap);
+        return err;
     }
-    if (xSemaphoreTake(s_p_ppa_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        ESP_LOGE(TAG, "photo: ppa srm timeout");
-        goto fail;
+    if (xSemaphoreTake(s_srm_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGE(TAG, "photo snapshot PPA timeout");
+        s_photo_lock = false;
+        xSemaphoreGive(s_ppa_mutex);
+        free(snap);
+        return ESP_ERR_TIMEOUT;
     }
 
-    ESP_LOGI(TAG, "photo: captured %dx%d after %d discards (get=%" PRIu32
-                  " fin=%" PRIu32 " ppa=%" PRIu32 ")",
-             PHOTO_WIDTH, PHOTO_HEIGHT, discard_frames,
-             s_p_cnt_get, s_p_cnt_fin, s_p_cnt_ppa);
+    // Release the ISR toggle lock and the PPA mutex. The next CSI
+    // completion will advance s_cam_stable / s_cam_active_idx normally.
+    s_photo_lock = false;
+    xSemaphoreGive(s_ppa_mutex);
 
-    // Hand the mirrored buffer to the caller, then tear down the rest.
-    *out_buf = s_p_out_buf;
-    if (out_w) *out_w = PHOTO_WIDTH;
-    if (out_h) *out_h = PHOTO_HEIGHT;
-    s_p_out_buf    = NULL;   // ownership transferred
-    s_p_out_buf_sz = 0;
-
-    photo_teardown();
+    *out_buf = snap;
+    if (out_w) *out_w = PREVIEW_WIDTH;
+    if (out_h) *out_h = PREVIEW_HEIGHT;
     return ESP_OK;
-
-fail:
-    if (s_p_out_buf) {
-        free(s_p_out_buf);
-        s_p_out_buf    = NULL;
-        s_p_out_buf_sz = 0;
-    }
-    photo_teardown();
-    return ESP_FAIL;
 }

@@ -13,7 +13,14 @@
 static const char *TAG = "camera_sensor";
 
 #define SCCB_FREQ_HZ            100000
-#define PREVIEW_FORMAT_NAME     "MIPI_2lane_24Minput_RAW8_800x640_50fps"
+// Unified format: preview and photo capture both run on the sensor's
+// highest-resolution MIPI mode. The preview pipeline PPA-scales this
+// into a letterboxed 16:9 display image, and photo capture is a
+// "stop sensor, grab current frame, start sensor" snapshot of the same
+// buffer — so the preview is always a true WYSIWYG preview of what
+// the shutter will save, with zero format-switch latency and no need
+// for AE/AWB snapshot/restore dance.
+#define PREVIEW_FORMAT_NAME     "MIPI_2lane_24Minput_RAW10_1920x1080_30fps"
 
 // OmniVision Timing Group VTS (vertical total size / frame length in
 // lines) register pair. Identical on OV5640, OV5645 and OV5647 — it is
@@ -25,24 +32,14 @@ static const char *TAG = "camera_sensor";
 #define OV_REG_TIMING_VTS_H     0x380E
 #define OV_REG_TIMING_VTS_L     0x380F
 
-// Base VTS and EFFECTIVE frame rate of the preview format programmed
-// by camera_sensor_set_format_preview(). VTS=984 comes from
-// managed_components/espressif__esp_cam_sensor/sensors/ov5647/private_include/ov5647_settings.h:81-82.
-//
-// The format NAME claims 50 fps but empirical measurement on the
-// Tanmatsu's OV5647 board shows the actual PCLK × HTS × VTS timing
-// produces ~36 fps at VTS=984 — the "50" in the format name is a
-// marketing nominal that doesn't match the register table as shipped.
-// Derived by observation: at VTS=3280 the sensor was running at
-// ~10.7 fps (ISR fin counter / wall clock), which back-solves to
-// 10.7 × 3280 / 984 ≈ 35.7 fps at the base VTS. Rounding to 36
-// gives a clean 15 fps target via VTS=2362.
-//
-// OV5645's 800x640 preset uses the same VTS=984 base and may or may
-// not have the same marketing-vs-reality gap; OV5640 differs per
-// resolution mode.
-#define PREVIEW_BASE_VTS_LINES  984u
-#define PREVIEW_BASE_FPS        36u
+// Base VTS and nominal frame rate for the 1920x1080 RAW10 preset:
+// ov5647_settings.h:492-493 writes VTS=1199 with a nominal 30 fps.
+// The 800x640 preset was empirically ~28% slow vs its nominal, so
+// 30 fps here might actually be closer to 21-22 fps in practice —
+// recalibrate after measuring the fin counter with the target VTS
+// applied.
+#define PREVIEW_BASE_VTS_LINES  1199u
+#define PREVIEW_BASE_FPS        30u
 
 esp_err_t camera_sensor_detect(camera_sensor_t *out) {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
