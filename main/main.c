@@ -14,6 +14,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "hal/lcd_types.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "pax_gfx.h"
 #include "pax_shapes.h"
@@ -68,6 +69,33 @@ static void splash(pax_col_t bg, pax_col_t fg, const char *line1, const char *li
     blit();
 }
 
+// Load the POSIX TZ string the launcher saved to NVS (namespace "system",
+// key "tz") and apply it, so localtime_r() in photo.c produces wall-clock
+// timestamps matching the timezone the user picked in tanmatsu-launcher's
+// clock settings. Falls back to UTC if NVS has no entry.
+static void apply_saved_timezone(void) {
+    nvs_handle_t h;
+    esp_err_t    err = nvs_open("system", NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "no 'system' NVS namespace (%d), using UTC", err);
+        setenv("TZ", "UTC0", 1);
+        tzset();
+        return;
+    }
+    char   tz[64] = {0};
+    size_t tz_sz  = sizeof(tz);
+    err = nvs_get_str(h, "tz", tz, &tz_sz);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "no 'tz' key in NVS (%d), using UTC", err);
+        setenv("TZ", "UTC0", 1);
+    } else {
+        ESP_LOGI(TAG, "applying saved TZ=\"%s\"", tz);
+        setenv("TZ", tz, 1);
+    }
+    tzset();
+}
+
 static void wait_for_esc(void) {
     while (1) {
         bsp_input_event_t event;
@@ -110,6 +138,11 @@ void app_main(void) {
         ESP_LOGE(TAG, "Failed to initialize NVS flash: %d", res);
         return;
     }
+
+    // The launcher stores the user's chosen timezone as a POSIX TZ string
+    // in NVS. Apply it before any localtime_r() call so photo filenames
+    // match wall-clock time.
+    apply_saved_timezone();
 
     // Initialize the Board Support Package.
     // Display is configured as native RGB565 so the preview pipeline can

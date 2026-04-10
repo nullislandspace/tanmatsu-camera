@@ -177,22 +177,33 @@ static void render_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-esp_err_t camera_preview_start(uint32_t preview_w, uint32_t preview_h) {
+esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
     if (s_running) return ESP_ERR_INVALID_STATE;
+    if (req_w == 0 || req_h == 0) return ESP_ERR_INVALID_ARG;
 
-    // Round preview dimensions down to a multiple of 16 — PPA and the camera
-    // block both want aligned widths, and the old code used 64 for cache
-    // geometry.
-    preview_w &= ~15u;
-    preview_h &= ~15u;
-    if (preview_w == 0 || preview_h == 0) return ESP_ERR_INVALID_ARG;
+    // The ESP32-P4 PPA scale register (PPA_SR_SCAL_X_FRAG_V) has only 4
+    // fractional bits — scale factor resolution is 1/16. Asking for a scale
+    // that doesn't land exactly on an n/16 boundary causes the PPA to
+    // round it DOWN, producing an output image narrower/shorter than the
+    // configured out.pic_w/pic_h, which leaves a strip of unwritten memory
+    // (visible as noise) along the right/bottom edges of the preview buffer.
+    //
+    // Snap the scale factor to the largest n/16 that still fits inside the
+    // requested box. Input is the fixed 800x640 sensor frame, so output is
+    // always (n*50) x (n*40), with n in 1..16.
+    float scale_max_x = (float)req_w / (float)PREVIEW_WIDTH;
+    float scale_max_y = (float)req_h / (float)PREVIEW_HEIGHT;
+    float scale_max   = scale_max_x < scale_max_y ? scale_max_x : scale_max_y;
+    uint32_t frag = (uint32_t)(scale_max * 16.0f);
+    if (frag < 1)  frag = 1;
+    if (frag > 16) frag = 16;
 
-    s_preview_w = preview_w;
-    s_preview_h = preview_h;
+    s_preview_w = (PREVIEW_WIDTH  * frag) / 16u;
+    s_preview_h = (PREVIEW_HEIGHT * frag) / 16u;
 
     uint32_t cache_line = cache_hal_get_cache_line_size(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_DATA);
-    ESP_LOGI(TAG, "preview=%" PRIu32 "x%" PRIu32 " cache_line=%" PRIu32,
-             preview_w, preview_h, cache_line);
+    ESP_LOGI(TAG, "preview=%" PRIu32 "x%" PRIu32 " (scale %" PRIu32 "/16) cache_line=%" PRIu32,
+             s_preview_w, s_preview_h, frag, cache_line);
 
     s_camera_buffer_sz = PREVIEW_WIDTH * PREVIEW_HEIGHT * BYTES_PER_PIXEL;
     s_camera_buffer    = heap_caps_aligned_calloc(cache_line, 1, s_camera_buffer_sz,
@@ -202,7 +213,12 @@ esp_err_t camera_preview_start(uint32_t preview_w, uint32_t preview_h) {
         goto fail;
     }
 
-    s_preview_buffer_sz = (size_t)preview_w * preview_h * BYTES_PER_PIXEL;
+    // buffer_size must be a multiple of the cache line size per
+    // ppa_do_scale_rotate_mirror()'s alignment check; pad the allocation
+    // up to the next cache line. PPA only writes s_preview_w * s_preview_h
+    // pixels; the padding tail is never touched.
+    s_preview_buffer_sz = (size_t)s_preview_w * s_preview_h * BYTES_PER_PIXEL;
+    s_preview_buffer_sz = (s_preview_buffer_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
     s_preview_buffer    = heap_caps_aligned_calloc(cache_line, 1, s_preview_buffer_sz,
                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
     if (!s_preview_buffer) {

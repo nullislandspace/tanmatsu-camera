@@ -45,9 +45,13 @@ static esp_err_t encode_and_write(const uint8_t *rgb565, uint32_t width, uint32_
         goto done;
     }
 
+    // YUV444 MCU is 8x8, so width/height only need to be multiples of 8.
+    // The preview pipeline snaps to 1/16 PPA scale steps which give
+    // 50*k x 40*k dimensions — always multiples of 8 but not always of
+    // 16, so YUV420 (MCU 16x16) and YUV422 (MCU 16x8) would reject them.
     jpeg_encode_cfg_t enc_cfg = {
         .src_type      = JPEG_ENCODE_IN_FORMAT_RGB565,
-        .sub_sample    = JPEG_DOWN_SAMPLING_YUV420,
+        .sub_sample    = JPEG_DOWN_SAMPLING_YUV444,
         .image_quality = JPEG_QUALITY,
         .width         = width,
         .height        = height,

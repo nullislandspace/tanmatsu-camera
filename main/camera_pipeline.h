@@ -11,11 +11,16 @@
 // format, RGB565 inline via the ISP, and PPA SRM scaling into a preview
 // buffer that the main UI blits to the display.
 
-// Bring up the pipeline. preview_w/preview_h are the final on-screen size
-// (in display pixels). Allocates every buffer it needs, starts the receive
-// and render tasks, and begins CSI streaming. The sensor must already be
-// detected and configured to the 800x640 RAW8 format.
-esp_err_t camera_preview_start(uint32_t preview_w, uint32_t preview_h);
+// Bring up the pipeline. req_w/req_h are the MAX display-space dimensions
+// the preview should fit inside; the actual preview size is chosen so the
+// PPA scale factor lands exactly on an n/16 boundary (the PPA scale
+// register has only 4 fractional bits), keeping aspect ratio and avoiding
+// the unwritten-edge artefact caused by scale quantisation. Query the
+// final preview size via camera_preview_get_width()/get_height() after
+// start. Allocates every buffer it needs, starts the receive and render
+// tasks, and begins CSI streaming. The sensor must already be detected
+// and configured to the 800x640 RAW8 format.
+esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h);
 
 // Tear down the pipeline and free all buffers.
 void camera_preview_stop(void);
