@@ -29,13 +29,17 @@
 //
 // preview_req_w/preview_req_h are forwarded to camera_preview_start()
 // when the preview is brought back up, so the caller should pass the
-// same values it used the first time around.
+// same values it used the first time around. preview_fps is the
+// sensor-side frame rate (via camera_sensor_set_preview_fps) to
+// restore after the format switch — pass 0 to skip the override and
+// leave the sensor at its native preview rate.
 //
 // On success the full path is copied into out_path; on failure out_path
 // is set to an empty string.
 esp_err_t photo_capture(camera_sensor_t *sensor,
                         uint32_t         preview_req_w,
                         uint32_t         preview_req_h,
+                        uint32_t         preview_fps,
                         const char      *dcim_dir,
                         char            *out_path,
                         size_t           out_path_sz);

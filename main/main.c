@@ -10,6 +10,7 @@
 #include "bsp/power.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -28,6 +29,13 @@
 #include "viewer.h"
 
 #define DCIM_PATH "/sd/DCIM"
+
+// Cap the sensor at 15 fps. At the native 50 fps the CSI DMA alone
+// moves ~20 MB/s through PSRAM (10% of its total bandwidth) for frames
+// we'd mostly throw away, and Step 7's H.264 recording target is also
+// 15 fps — keeping the sensor locked to that rate means no frame
+// dropping, no phase beating, and no wasted DMA.
+#define PREVIEW_TARGET_FPS 15u
 
 typedef enum {
     MODE_PHOTO = 0,
@@ -258,6 +266,14 @@ void app_main(void) {
         wait_for_esc();
         return;
     }
+    // set_format wrote the 50 fps default VTS; override it to our
+    // target rate before starting the stream. This has to happen
+    // AFTER set_format (which would otherwise overwrite it) and can
+    // happen BEFORE the CSI pipeline comes up (SCCB writes are
+    // independent of the stream).
+    if (camera_sensor_set_preview_fps(&sensor, PREVIEW_TARGET_FPS) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to lower preview fps, continuing at native rate");
+    }
     // NOTE: set_format leaves the sensor stream OFF. We bring up the CSI
     // pipeline FIRST so the CSI PHY is listening before the sensor starts
     // transmitting frames — starting the sensor while nothing is listening
@@ -382,6 +398,7 @@ void app_main(void) {
         // instead — but we still need the preview pipeline to keep running
         // so entering photo/video mode is instant.
         bool got_preview_frame = false;
+        int64_t t_wait_start = esp_timer_get_time();
         if (mode != MODE_VIEW) {
             if (camera_preview_wait_frame(100) == ESP_OK) {
                 got_preview_frame = true;
@@ -391,8 +408,10 @@ void app_main(void) {
                 continue;
             }
         }
+        int64_t t_after_wait = esp_timer_get_time();
 
         pax_background(&fb, BLACK);
+        int64_t t_after_bg = esp_timer_get_time();
 
         if (mode == MODE_VIEW && viewer_has_image()) {
             pax_buf_t img_pax = {0};
@@ -407,6 +426,7 @@ void app_main(void) {
             // the RGB565 → display format conversion into fb.
             pax_draw_image(&fb, &preview_pax, preview_x, preview_y);
         }
+        int64_t t_after_image = esp_timer_get_time();
 
         // HUD: top bar with mode name and key hints.
         char hud[96];
@@ -448,8 +468,23 @@ void app_main(void) {
         } else {
             banner_text[0] = 0;
         }
+        int64_t t_after_hud = esp_timer_get_time();
 
         blit();
+        int64_t t_after_blit = esp_timer_get_time();
+
+        // Dump per-stage timings every ~1 s so we can see which step
+        // dominates. Remove once the main loop is fast enough.
+        static int prof_n = 0;
+        if (++prof_n >= 15) {
+            prof_n = 0;
+            ESP_LOGI(TAG, "loop: wait=%lld bg=%lld img=%lld hud=%lld blit=%lld (us)",
+                     (long long)(t_after_wait  - t_wait_start),
+                     (long long)(t_after_bg    - t_after_wait),
+                     (long long)(t_after_image - t_after_bg),
+                     (long long)(t_after_hud   - t_after_image),
+                     (long long)(t_after_blit  - t_after_hud));
+        }
 
         // Photo capture: the preview pipeline is torn down and rebuilt
         // at 1920x1080 inside photo_capture(), so the UI is frozen on
@@ -459,6 +494,7 @@ void app_main(void) {
             if (mode == MODE_PHOTO) {
                 char saved_path[128] = {0};
                 esp_err_t err = photo_capture(&sensor, preview_w, preview_h,
+                                              PREVIEW_TARGET_FPS,
                                               DCIM_PATH,
                                               saved_path, sizeof(saved_path));
                 if (err == ESP_OK && saved_path[0]) {

@@ -128,7 +128,8 @@ static void build_filename(const char *dir, char *out, size_t n) {
 // chain up. Logs and returns the first error it encounters but always
 // attempts every step so we don't leave the pipeline half-configured.
 static esp_err_t restart_preview(camera_sensor_t *sensor,
-                                 uint32_t preview_w, uint32_t preview_h) {
+                                 uint32_t preview_w, uint32_t preview_h,
+                                 uint32_t preview_fps) {
     esp_err_t first_err = ESP_OK;
     esp_err_t err;
 
@@ -136,6 +137,16 @@ static esp_err_t restart_preview(camera_sensor_t *sensor,
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "restart_preview: set_format_preview: %d", err);
         if (first_err == ESP_OK) first_err = err;
+    }
+
+    // Re-apply the framerate override that main() set up at startup.
+    // set_format_preview reinstated the native-rate VTS.
+    if (preview_fps > 0) {
+        err = camera_sensor_set_preview_fps(sensor, preview_fps);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "restart_preview: set_preview_fps: %d", err);
+            // Non-fatal — preview just runs at native rate.
+        }
     }
 
     err = camera_preview_start(preview_w, preview_h);
@@ -155,6 +166,7 @@ static esp_err_t restart_preview(camera_sensor_t *sensor,
 esp_err_t photo_capture(camera_sensor_t *sensor,
                         uint32_t         preview_req_w,
                         uint32_t         preview_req_h,
+                        uint32_t         preview_fps,
                         const char      *dcim_dir,
                         char            *out_path,
                         size_t           out_path_sz) {
@@ -206,7 +218,7 @@ esp_err_t photo_capture(camera_sensor_t *sensor,
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "set_format_photo: %d", err);
         // Best effort: try to get back to the preview so the app isn't dead.
-        restart_preview(sensor, preview_req_w, preview_req_h);
+        restart_preview(sensor, preview_req_w, preview_req_h, preview_fps);
         return err;
     }
 
@@ -237,7 +249,7 @@ esp_err_t photo_capture(camera_sensor_t *sensor,
     err = camera_photo_capture(sensor, PHOTO_DISCARD_FRAMES, &cap_buf, &cap_w, &cap_h);
     if (err != ESP_OK || !cap_buf) {
         ESP_LOGE(TAG, "camera_photo_capture: %d", err);
-        restart_preview(sensor, preview_req_w, preview_req_h);
+        restart_preview(sensor, preview_req_w, preview_req_h, preview_fps);
         return err != ESP_OK ? err : ESP_FAIL;
     }
 
@@ -245,7 +257,7 @@ esp_err_t photo_capture(camera_sensor_t *sensor,
     //    back alive as quickly as possible. The capture buffer we own is
     //    separate from the preview pipeline's buffers, so they don't
     //    conflict.
-    esp_err_t preview_err = restart_preview(sensor, preview_req_w, preview_req_h);
+    esp_err_t preview_err = restart_preview(sensor, preview_req_w, preview_req_h, preview_fps);
     if (preview_err != ESP_OK) {
         ESP_LOGW(TAG, "preview restart returned %d, continuing with save", preview_err);
     }

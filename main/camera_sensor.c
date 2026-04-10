@@ -15,6 +15,26 @@ static const char *TAG = "camera_sensor";
 #define SCCB_FREQ_HZ            100000
 #define PREVIEW_FORMAT_NAME     "MIPI_2lane_24Minput_RAW8_800x640_50fps"
 
+// OmniVision Timing Group VTS (vertical total size / frame length in
+// lines) register pair. Identical on OV5640, OV5645 and OV5647 — it is
+// part of the standard 5MP OV timing register bank. Writing a larger
+// value extends the vertical blanking interval and therefore slows the
+// frame rate down without touching the PCLK. Max exposure line count
+// tracks VTS automatically on these sensors so the built-in AE loop
+// gets more headroom rather than less.
+#define OV_REG_TIMING_VTS_H     0x380E
+#define OV_REG_TIMING_VTS_L     0x380F
+
+// Base VTS and nominal frame rate of the preview format programmed by
+// camera_sensor_set_format_preview(). Matches
+// OV5647 MIPI_2lane_24Minput_RAW8_800x640_50fps (see
+// managed_components/espressif__esp_cam_sensor/sensors/ov5647/private_include/ov5647_settings.h:81-82).
+// OV5645's 800x640 preset uses the same VTS=984 base; OV5640 differs
+// per resolution mode and would need a different base constant if we
+// ever switch the preview format to OV5640.
+#define PREVIEW_BASE_VTS_LINES  984u
+#define PREVIEW_BASE_FPS        50u
+
 esp_err_t camera_sensor_detect(camera_sensor_t *out) {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out));
@@ -213,4 +233,22 @@ esp_err_t camera_sensor_write_reg(camera_sensor_t *sensor, uint16_t regaddr, uin
         ESP_LOGE(TAG, "S_REG 0x%04x=0x%02x: %d", regaddr, value, err);
     }
     return err;
+}
+
+esp_err_t camera_sensor_set_preview_fps(camera_sensor_t *sensor, uint32_t target_fps) {
+    if (sensor == NULL || target_fps == 0 || target_fps > PREVIEW_BASE_FPS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // new_vts = base_vts * (base_fps / target_fps), rounded.
+    uint32_t vts = (PREVIEW_BASE_VTS_LINES * PREVIEW_BASE_FPS + target_fps / 2u) / target_fps;
+    if (vts > 0xFFFFu) vts = 0xFFFFu;
+
+    esp_err_t err = camera_sensor_write_reg(sensor, OV_REG_TIMING_VTS_H, (uint8_t)((vts >> 8) & 0xFFu));
+    if (err != ESP_OK) return err;
+    err = camera_sensor_write_reg(sensor, OV_REG_TIMING_VTS_L, (uint8_t)(vts & 0xFFu));
+    if (err != ESP_OK) return err;
+
+    ESP_LOGI(TAG, "preview fps override: %" PRIu32 " fps (VTS=%" PRIu32 ")", target_fps, vts);
+    return ESP_OK;
 }

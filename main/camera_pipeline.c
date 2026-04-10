@@ -171,7 +171,13 @@ static void render_task(void *arg) {
         xSemaphoreGive(s_frame_ready);
         n_frames++;
         if (n_frames <= 3 || (n_frames % 30) == 0) {
-            ESP_LOGI(TAG, "frame %" PRIu32, n_frames);
+            // ISR counters alongside n_frames — if get/fin run much
+            // faster than n_frames, the main loop / PPA is the
+            // bottleneck and frames are being dropped at render_ready.
+            // If they track n_frames, the sensor rate is what it is.
+            ESP_LOGI(TAG, "frame %" PRIu32 "  ISR get=%" PRIu32 " fin=%" PRIu32
+                          " srm=%" PRIu32,
+                     n_frames, s_cnt_get_new_trans, s_cnt_trans_finished, s_cnt_srm_done);
         }
     }
     vTaskDelete(NULL);
