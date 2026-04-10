@@ -15,10 +15,9 @@
 #include "freertos/task.h"
 #include "hal/lcd_types.h"
 #include "nvs_flash.h"
-#include "pax_fonts.h"
 #include "pax_gfx.h"
-#include "pax_text.h"
 #include "pax_shapes.h"
+#include "hershey_font.h"
 #include "bmp_writer.h"
 #include "camera_pipeline.h"
 #include "camera_sensor.h"
@@ -61,9 +60,9 @@ static void blit(void) {
 
 static void splash(pax_col_t bg, pax_col_t fg, const char *line1, const char *line2) {
     pax_background(&fb, bg);
-    pax_draw_text(&fb, fg, pax_font_sky_mono, 20, 16, 16, line1);
+    hershey_draw_string(&fb, fg, 16, 16, line1, 24);
     if (line2) {
-        pax_draw_text(&fb, fg, pax_font_sky_mono, 16, 16, 48, line2);
+        hershey_draw_string(&fb, fg, 16, 48, line2, 18);
     }
     blit();
 }
@@ -111,11 +110,16 @@ void app_main(void) {
         return;
     }
 
-    // Initialize the Board Support Package
+    // Initialize the Board Support Package.
+    // Display is configured as native RGB565 so the preview pipeline can
+    // feed its PPA output straight into the framebuffer without any
+    // software colour-space conversion. The ST7701 panel accepts RGB565
+    // directly over MIPI DSI (COLMOD=0x55) so there is no penalty for
+    // picking the lower bit depth here.
     const bsp_configuration_t bsp_configuration = {
         .display =
             {
-                .requested_color_format = LCD_COLOR_PIXEL_FORMAT_RGB888,
+                .requested_color_format = LCD_COLOR_PIXEL_FORMAT_RGB565,
                 .num_fbs                = 1,
             },
     };
@@ -312,7 +316,7 @@ void app_main(void) {
         snprintf(hud, sizeof(hud), "%s   F1 view  F2 photo  F3 video  Esc exit",
                  mode_name(mode));
         pax_simple_rect(&fb, 0xC0000000, 0, 0, (float)logical_w, 22);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 8, 3, hud);
+        hershey_draw_string(&fb, WHITE, 8, 3, hud, 18);
 
         // Context-specific bottom bar.
         const char *bottom_hint = "";
@@ -323,12 +327,12 @@ void app_main(void) {
         }
         int bottom_y = (int)logical_h - 22;
         pax_simple_rect(&fb, 0xC0000000, 0, (float)bottom_y, (float)logical_w, 22);
-        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 8, (float)(bottom_y + 3), bottom_hint);
+        hershey_draw_string(&fb, WHITE, 8, (float)(bottom_y + 3), bottom_hint, 18);
 
         // Transient banner (e.g. "Saved IMG_xxx.bmp").
         if (banner_text[0] && xTaskGetTickCount() < banner_until) {
             pax_simple_rect(&fb, 0xC0000000, 0, 28, (float)logical_w, 22);
-            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 8, 31, banner_text);
+            hershey_draw_string(&fb, WHITE, 8, 31, banner_text, 18);
         } else {
             banner_text[0] = 0;
         }
