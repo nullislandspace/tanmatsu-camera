@@ -8,6 +8,7 @@
 #include "driver/ppa.h"
 #include "esp_attr.h"
 #include "esp_cache.h"
+#include "esp_timer.h"
 #include "esp_cam_ctlr.h"
 #include "esp_cam_ctlr_csi.h"
 #include "esp_cam_ctlr_types.h"
@@ -22,18 +23,18 @@
 
 static const char *TAG = "camera_pipeline";
 
-// Fixed preview sensor format: the OV5647 highest-res MIPI mode. We
-// use this for both preview and photo capture so WYSIWYG is automatic
-// and no format switch is ever required.
-#define PREVIEW_WIDTH       1920
-#define PREVIEW_HEIGHT      1080
+// Fixed CSI lane count — 2 data lanes are physically wired on the
+// Tanmatsu camera connector (see camera.md §2). Everything else is
+// now runtime-configurable via camera_source_t.
 #define PREVIEW_LANE_COUNT  2
-// 1920x1080 RAW10 @30 fps needs ~622 Mbps total, or ~311 Mbps/lane
-// before MIPI overhead. 500 gives comfortable headroom and is inside
-// the ESP32-P4 DPHY envelope.
-#define PREVIEW_LANE_RATE   500
 
-#define BYTES_PER_PIXEL     2     // RGB565 (ISP output, not the RAW10 CSI input)
+#define BYTES_PER_PIXEL     2     // RGB565 (ISP output, not the RAW input)
+
+// Current source descriptor, filled in by camera_preview_start.
+static uint32_t s_src_w         = 0;
+static uint32_t s_src_h         = 0;
+static bool     s_src_is_raw10  = false;
+static uint32_t s_src_lane_rate = 0;
 
 // The preview pipeline bakes the display's 90° rotation into the PPA
 // output so the main UI can skip per-pixel rotation in software. The
@@ -119,15 +120,28 @@ static bool IRAM_ATTR on_get_new_trans(esp_cam_ctlr_handle_t handle, esp_cam_ctl
 
 static bool IRAM_ATTR on_trans_finished(esp_cam_ctlr_handle_t handle, esp_cam_ctlr_trans_t *trans, void *user_data) {
     s_cnt_trans_finished++;
+    // Null-guard: a pending CSI transaction may still complete
+    // during camera_preview_stop() teardown after the semaphore has
+    // been deleted. Read the global into a local once and skip the
+    // give if it's been cleared — better a silently-dropped ISR than
+    // an xQueueGiveFromISR assert on a NULL pxQueue.
+    SemaphoreHandle_t sem = s_transfer_done;
+    if (sem == NULL) return false;
     BaseType_t hpw = pdFALSE;
-    xSemaphoreGiveFromISR(s_transfer_done, &hpw);
+    xSemaphoreGiveFromISR(sem, &hpw);
     return hpw == pdTRUE;
 }
 
 static bool IRAM_ATTR on_srm_done(ppa_client_handle_t ppa_handle, ppa_event_data_t *event, void *user_data) {
     s_cnt_srm_done++;
+    // Same null-guard as on_trans_finished — a stale PPA trans can
+    // complete deep into teardown if the previous mode's render_task
+    // was killed mid-submit, and the completion ISR would otherwise
+    // try to give a semaphore that camera_preview_stop already freed.
+    SemaphoreHandle_t sem = s_srm_done;
+    if (sem == NULL) return false;
     BaseType_t hpw = pdFALSE;
-    xSemaphoreGiveFromISR(s_srm_done, &hpw);
+    xSemaphoreGiveFromISR(sem, &hpw);
     return hpw == pdTRUE;
 }
 
@@ -144,9 +158,17 @@ static void render_task(void *arg) {
     uint32_t n_frames = 0;
     uint32_t n_timeouts = 0;
     while (s_running) {
-        if (xSemaphoreTake(s_transfer_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        // Short timeout so the task wakes up every 100 ms and can
+        // observe s_running being cleared by camera_preview_stop.
+        // Originally 1 s but that made mode switches crash: the stop
+        // path would vTaskDelete us mid-PPA-op, leaving a pending
+        // transaction that the driver could not flush — the
+        // completion ISR would then fire after the semaphore had
+        // been freed. Exiting cleanly means the PPA client is
+        // always idle by the time stop() tries to unregister it.
+        if (xSemaphoreTake(s_transfer_done, pdMS_TO_TICKS(100)) != pdTRUE) {
             n_timeouts++;
-            if ((n_timeouts % 2) == 0) {
+            if ((n_timeouts % 20) == 0) {
                 ESP_LOGW(TAG, "no transfer_done: %" PRIu32 " timeouts, frames=%" PRIu32
                               "  ISR cnts get=%" PRIu32 " fin=%" PRIu32 " srm=%" PRIu32,
                          n_timeouts, n_frames,
@@ -158,10 +180,9 @@ static void render_task(void *arg) {
 
         // Wait until the UI has finished drawing the previous preview frame
         // before we overwrite the preview buffer with a new PPA transform.
-        // If the UI never consumes, we just drop CSI frames — the CSI
-        // keeps running into its double-buffered targets, we just don't
-        // PPA-convert them.
-        if (xSemaphoreTake(s_render_ready, pdMS_TO_TICKS(500)) != pdTRUE) {
+        // Short timeout (100 ms) so the task can still exit quickly on
+        // stop() even if the main loop is also stuck.
+        if (xSemaphoreTake(s_render_ready, pdMS_TO_TICKS(100)) != pdTRUE) {
             continue;
         }
         if (!s_running) break;
@@ -185,17 +206,19 @@ static void render_task(void *arg) {
         // ppa_do_scale_rotate_mirror + srm_done wait must happen
         // atomically from the PPA's point of view — max_pending_trans_num
         // is 1 on this client.
+        int64_t t_mutex_in = esp_timer_get_time();
         xSemaphoreTake(s_ppa_mutex, portMAX_DELAY);
+        int64_t t_mutex_out = esp_timer_get_time();
         // Drain any stale srm_done left behind by a previous op.
         xSemaphoreTake(s_srm_done, 0);
 
         ppa_srm_oper_config_t srm = {
             .in = {
                 .buffer         = (void *)src,
-                .pic_w          = PREVIEW_WIDTH,
-                .pic_h          = PREVIEW_HEIGHT,
-                .block_w        = PREVIEW_WIDTH,
-                .block_h        = PREVIEW_HEIGHT,
+                .pic_w          = s_src_w,
+                .pic_h          = s_src_h,
+                .block_w        = s_src_w,
+                .block_h        = s_src_h,
                 .block_offset_x = 0,
                 .block_offset_y = 0,
                 .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
@@ -205,8 +228,8 @@ static void render_task(void *arg) {
                 .buffer_size    = s_preview_buffer_sz,
                 // With rotation 90/270 the PPA produces an image whose
                 // memory dimensions are input × scale with the axes
-                // swapped — i.e. width = PREVIEW_HEIGHT*scale,
-                // height = PREVIEW_WIDTH*scale. s_preview_w/h already
+                // swapped — i.e. width = s_src_h*scale,
+                // height = s_src_w*scale. s_preview_w/h already
                 // reflect that post-rotation layout.
                 .pic_w          = s_preview_w,
                 .pic_h          = s_preview_h,
@@ -240,25 +263,37 @@ static void render_task(void *arg) {
             xSemaphoreGive(s_ppa_mutex);
             continue;
         }
+        int64_t t_ppa_done = esp_timer_get_time();
         xSemaphoreGive(s_ppa_mutex);
         xSemaphoreGive(s_frame_ready);
         n_frames++;
         if (n_frames <= 3 || (n_frames % 30) == 0) {
-            // ISR counters alongside n_frames — if get/fin run much
-            // faster than n_frames, the main loop / PPA is the
-            // bottleneck and frames are being dropped at render_ready.
-            // If they track n_frames, the sensor rate is what it is.
             ESP_LOGI(TAG, "frame %" PRIu32 "  ISR get=%" PRIu32 " fin=%" PRIu32
-                          " srm=%" PRIu32,
-                     n_frames, s_cnt_get_new_trans, s_cnt_trans_finished, s_cnt_srm_done);
+                          " srm=%" PRIu32 "  mutex_wait=%lld ppa_op=%lld us",
+                     n_frames, s_cnt_get_new_trans, s_cnt_trans_finished, s_cnt_srm_done,
+                     (long long)(t_mutex_out - t_mutex_in),
+                     (long long)(t_ppa_done - t_mutex_out));
         }
     }
+
+    // Let camera_preview_stop know we've exited cleanly — it polls
+    // this pointer so it can go straight to PPA/ISP/CSI teardown
+    // without having to vTaskDelete us from the outside.
+    s_render_task = NULL;
     vTaskDelete(NULL);
 }
 
-esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
+esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint32_t req_h) {
     if (s_running) return ESP_ERR_INVALID_STATE;
+    if (!src || src->width == 0 || src->height == 0 || src->lane_rate_mbps == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (req_w == 0 || req_h == 0) return ESP_ERR_INVALID_ARG;
+
+    s_src_w         = src->width;
+    s_src_h         = src->height;
+    s_src_is_raw10  = src->is_raw10;
+    s_src_lane_rate = src->lane_rate_mbps;
 
     // The ESP32-P4 PPA scale register (PPA_SR_SCAL_X_FRAG_V) has only 4
     // fractional bits — scale factor resolution is 1/16. Asking for a scale
@@ -275,8 +310,8 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
     // aligned, keeping aspect ratio". That's what the PPA scale factor
     // is computed against — the rotation that follows doesn't change
     // how many source pixels we consume, just how they're laid out.
-    float scale_max_x = (float)req_w / (float)PREVIEW_WIDTH;
-    float scale_max_y = (float)req_h / (float)PREVIEW_HEIGHT;
+    float scale_max_x = (float)req_w / (float)s_src_w;
+    float scale_max_y = (float)req_h / (float)s_src_h;
     float scale_max   = scale_max_x < scale_max_y ? scale_max_x : scale_max_y;
     uint32_t frag = (uint32_t)(scale_max * 16.0f);
     if (frag < 1)  frag = 1;
@@ -286,12 +321,12 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
 
     // After PPA rotation 90°/270° the buffer dimensions swap relative
     // to the unrotated scaled image: the panel-native output is
-    // (PREVIEW_HEIGHT * scale) wide × (PREVIEW_WIDTH * scale) tall, i.e.
+    // (s_src_h * scale) wide × (s_src_w * scale) tall, i.e.
     // 480 × 600 at the default 12/16 scale. The buffer is already laid
     // out in the order bsp_display_blit expects, so the main UI can
     // feed it straight in via fbdraw_blit_panel (memcpy per row).
-    s_preview_w = (PREVIEW_HEIGHT * frag) / 16u;
-    s_preview_h = (PREVIEW_WIDTH  * frag) / 16u;
+    s_preview_w = (s_src_h * frag) / 16u;
+    s_preview_h = (s_src_w  * frag) / 16u;
 
     uint32_t cache_line = cache_hal_get_cache_line_size(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_DATA);
     ESP_LOGI(TAG, "preview buf %" PRIu32 "x%" PRIu32 " (panel-native, scale %" PRIu32 "/16) cache_line=%" PRIu32,
@@ -302,7 +337,7 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
     // most-recently-completed frame and is the stable read target
     // for the render task and photo snapshots. 1920x1080 @2 B/px =
     // ~4.15 MB each, ~8.3 MB total. Comfortable in 32 MB PSRAM.
-    s_cam_buf_sz = (size_t)PREVIEW_WIDTH * PREVIEW_HEIGHT * BYTES_PER_PIXEL;
+    s_cam_buf_sz = (size_t)s_src_w * s_src_h * BYTES_PER_PIXEL;
     s_cam_buf_sz = (s_cam_buf_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
     for (int i = 0; i < 2; i++) {
         s_cam_buf[i] = heap_caps_aligned_calloc(cache_line, 1, s_cam_buf_sz,
@@ -344,11 +379,11 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
 
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id                = 0,
-        .h_res                  = PREVIEW_WIDTH,
-        .v_res                  = PREVIEW_HEIGHT,
+        .h_res                  = s_src_w,
+        .v_res                  = s_src_h,
         .data_lane_num          = PREVIEW_LANE_COUNT,
-        .lane_bit_rate_mbps     = PREVIEW_LANE_RATE,
-        .input_data_color_type  = CAM_CTLR_COLOR_RAW10,
+        .lane_bit_rate_mbps     = s_src_lane_rate,
+        .input_data_color_type  = s_src_is_raw10 ? CAM_CTLR_COLOR_RAW10 : CAM_CTLR_COLOR_RAW8,
         .output_data_color_type = CAM_CTLR_COLOR_RGB565,
         .queue_items            = 1,
         .byte_swap_en           = false,
@@ -374,12 +409,12 @@ esp_err_t camera_preview_start(uint32_t req_w, uint32_t req_h) {
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_hz                 = 80 * 1000 * 1000,
         .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
-        .input_data_color_type  = ISP_COLOR_RAW10,
+        .input_data_color_type  = s_src_is_raw10 ? ISP_COLOR_RAW10 : ISP_COLOR_RAW8,
         .output_data_color_type = ISP_COLOR_RGB565,
         .has_line_start_packet  = false,
         .has_line_end_packet    = false,
-        .h_res                  = PREVIEW_WIDTH,
-        .v_res                  = PREVIEW_HEIGHT,
+        .h_res                  = s_src_w,
+        .v_res                  = s_src_h,
         .bayer_order            = COLOR_RAW_ELEMENT_ORDER_GBRG,
     };
     err = esp_isp_new_processor(&isp_cfg, &s_isp);
@@ -434,34 +469,59 @@ fail:
 }
 
 void camera_preview_stop(void) {
+    // Signal every task in the pipeline to exit on its next
+    // cancellation point. The render task re-checks s_running
+    // every 100 ms, so it will observe this within that window.
     s_running = false;
 
-    // Stop CSI first so the hardware stops firing callbacks. The driver's
-    // own per-ctlr state is still intact at this point — we're just
-    // pausing the DMA / bridge.
+    // Stop the CSI hardware so no new on_trans_finished / on_get_new_trans
+    // ISRs fire — render_task may still be mid-PPA-op, but at least we
+    // won't accumulate additional DMA-completion events while we wait
+    // for it to drain.
     if (s_csi) {
         esp_cam_ctlr_stop(s_csi);
     }
 
-    // The receive_task is blocked inside esp_cam_ctlr_receive() on an
-    // internal CSI queue with ESP_CAM_CTLR_MAX_DELAY and will never
-    // notice s_running=false on its own. The render_task might be
-    // waiting on s_transfer_done or s_render_ready with timeouts up to
-    // 1s. Force both to exit before we start deleting the CSI/PPA/ISP
-    // whose objects they still reference — deleting a CSI controller
-    // while a task is still blocked inside it double-acquires an
-    // internal spinlock and panics.
-    if (s_receive_task) {
-        vTaskDelete(s_receive_task);
-        s_receive_task = NULL;
+    // Wait up to 2 s for render_task to exit on its own. It clears
+    // s_render_task just before calling vTaskDelete(NULL), so polling
+    // the pointer is a safe and race-free join mechanism.
+    //
+    // This matters for mode switching: if we vTaskDelete'd
+    // render_task mid-PPA-op like the old code did, the PPA client
+    // would be left with an unprocessed transaction, ppa_unregister
+    // would fail ("client still has unprocessed trans"), and the
+    // eventual completion callback would fire after we'd already
+    // freed s_srm_done — crashing with
+    // "assert failed: xQueueGiveFromISR queue.c:1358 (pxQueue)".
+    // Graceful exit means render_task always finishes its current
+    // ppa op before breaking the loop.
+    for (int i = 0; i < 200 && s_render_task; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (s_render_task) {
+        ESP_LOGW(TAG, "render_task did not exit cleanly, forcing delete");
         vTaskDelete(s_render_task);
         s_render_task = NULL;
     }
-    // Let FreeRTOS run the idle task so the deleted tasks' TCBs are
-    // actually reclaimed before we free anything else.
-    vTaskDelay(pdMS_TO_TICKS(10));
+    if (s_receive_task) {
+        // Legacy variable — no task behind it in the current design,
+        // but keep the hook in case future experiments put one back.
+        vTaskDelete(s_receive_task);
+        s_receive_task = NULL;
+    }
+    // Give the idle task a beat to reclaim the dead task's TCB.
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    // Belt-and-braces: drain any straggling PPA completion before we
+    // unregister the client. If render_task exited gracefully there
+    // won't be any, but if we had to force-delete it there might
+    // still be a trans in flight. Wait up to 500 ms for it.
+    if (s_ppa_mutex && s_srm_done) {
+        if (xSemaphoreTake(s_ppa_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            xSemaphoreTake(s_srm_done, pdMS_TO_TICKS(500));
+            xSemaphoreGive(s_ppa_mutex);
+        }
+    }
 
     if (s_ppa) {
         ppa_unregister_client(s_ppa);
@@ -478,6 +538,9 @@ void camera_preview_stop(void) {
         s_csi = NULL;
     }
 
+    // Delete semaphores LAST. The ISR callbacks null-check the
+    // globals, but the less racy the better: nuking the hardware
+    // first guarantees no ISR can fire by the time we get here.
     if (s_transfer_done) { vSemaphoreDelete(s_transfer_done); s_transfer_done = NULL; }
     if (s_srm_done)      { vSemaphoreDelete(s_srm_done);      s_srm_done      = NULL; }
     if (s_frame_ready)   { vSemaphoreDelete(s_frame_ready);   s_frame_ready   = NULL; }
@@ -493,6 +556,11 @@ void camera_preview_stop(void) {
     }
     s_cam_buf_sz = 0;
     if (s_preview_buffer) { free(s_preview_buffer); s_preview_buffer = NULL; s_preview_buffer_sz = 0; }
+
+    s_src_w         = 0;
+    s_src_h         = 0;
+    s_src_is_raw10  = false;
+    s_src_lane_rate = 0;
 }
 
 void camera_preview_give_render_ready(void) {
@@ -517,8 +585,8 @@ uint32_t       camera_preview_get_height(void) { return s_preview_h; }
 // ISR has most recently promoted as "finished". May be NULL during
 // the very first ISR cycle before any frame has completed.
 const uint8_t *camera_preview_get_raw_pixels(void) { return (const uint8_t *)s_cam_stable; }
-uint32_t       camera_preview_get_raw_width(void)  { return PREVIEW_WIDTH; }
-uint32_t       camera_preview_get_raw_height(void) { return PREVIEW_HEIGHT; }
+uint32_t       camera_preview_get_raw_width(void)  { return s_src_w; }
+uint32_t       camera_preview_get_raw_height(void) { return s_src_h; }
 
 // Photo snapshot: take the current stable double-buffered CSI frame
 // and run it through a PPA mirror-only pass (scale 1.0, rotation 0,
@@ -552,7 +620,7 @@ esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w, uint32_t *ou
     if (out_h) *out_h = 0;
 
     uint32_t cache_line = cache_hal_get_cache_line_size(CACHE_LL_LEVEL_EXT_MEM, CACHE_TYPE_DATA);
-    size_t   snap_sz    = (size_t)PREVIEW_WIDTH * PREVIEW_HEIGHT * BYTES_PER_PIXEL;
+    size_t   snap_sz    = (size_t)s_src_w * s_src_h * BYTES_PER_PIXEL;
     snap_sz = (snap_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
 
     uint8_t *snap = heap_caps_aligned_calloc(cache_line, 1, snap_sz,
@@ -585,10 +653,10 @@ esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w, uint32_t *ou
     ppa_srm_oper_config_t srm = {
         .in = {
             .buffer         = (void *)src,
-            .pic_w          = PREVIEW_WIDTH,
-            .pic_h          = PREVIEW_HEIGHT,
-            .block_w        = PREVIEW_WIDTH,
-            .block_h        = PREVIEW_HEIGHT,
+            .pic_w          = s_src_w,
+            .pic_h          = s_src_h,
+            .block_w        = s_src_w,
+            .block_h        = s_src_h,
             .block_offset_x = 0,
             .block_offset_y = 0,
             .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
@@ -596,8 +664,8 @@ esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w, uint32_t *ou
         .out = {
             .buffer         = snap,
             .buffer_size    = snap_sz,
-            .pic_w          = PREVIEW_WIDTH,
-            .pic_h          = PREVIEW_HEIGHT,
+            .pic_w          = s_src_w,
+            .pic_h          = s_src_h,
             .block_offset_x = 0,
             .block_offset_y = 0,
             .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
@@ -633,7 +701,126 @@ esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w, uint32_t *ou
     xSemaphoreGive(s_ppa_mutex);
 
     *out_buf = snap;
-    if (out_w) *out_w = PREVIEW_WIDTH;
-    if (out_h) *out_h = PREVIEW_HEIGHT;
+    if (out_w) *out_w = s_src_w;
+    if (out_h) *out_h = s_src_h;
+    return ESP_OK;
+}
+
+// Video recording snapshot: scale + colour-space convert the current
+// stable camera frame into a caller-provided YUV420 packed buffer
+// sized for the H.264 hardware encoder.
+//
+// See the header for the parameter contract. Key invariants:
+//   - out_w/out_h must be reachable by a PPA scale factor whose
+//     numerator in 1/16ths is an integer — i.e. out_w == 1920 * n/16
+//     and out_h == 1080 * n/16 for the same integer n in 1..16.
+//   - stride_w/stride_h are the MACROBLOCK-padded dimensions (next
+//     multiple of 16) that the H.264 encoder expects its input
+//     buffer to be sized for. The PPA writes the out_w x out_h
+//     block at buffer offset (0, 0); rows out_h..stride_h-1 and
+//     columns out_w..stride_w-1 are left at their previously
+//     initialised value (caller should zero-init once on alloc).
+esp_err_t camera_video_snapshot(uint8_t  *out_buf,
+                                size_t    out_buf_sz,
+                                uint32_t  out_w,
+                                uint32_t  out_h,
+                                uint32_t  stride_w,
+                                uint32_t  stride_h) {
+    if (out_buf == NULL || out_w == 0 || out_h == 0 ||
+        stride_w < out_w || stride_h < out_h) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_running || s_ppa == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Verify the requested scale is actually representable by PPA's
+    // 1/16 fixed-point scale register. We derive the integer
+    // numerator n from out_w and double-check that out_h is produced
+    // by the same factor — if the caller asks for a non-exact scale
+    // we return INVALID_ARG rather than silently rounding.
+    uint32_t n_from_w = (out_w * 16u) / s_src_w;
+    if (n_from_w == 0 || n_from_w > 16) return ESP_ERR_INVALID_ARG;
+    if ((s_src_w  * n_from_w) / 16u != out_w) return ESP_ERR_INVALID_ARG;
+    if ((s_src_h * n_from_w) / 16u != out_h) return ESP_ERR_INVALID_ARG;
+    float scale = (float)n_from_w / 16.0f;
+
+    // YUV420 packed is 1.5 bytes per pixel at the stride dims.
+    size_t min_sz = (size_t)stride_w * stride_h * 3u / 2u;
+    if (out_buf_sz < min_sz) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // Serialise against render_task / photo_snapshot on the same PPA
+    // client. Split mutex wait from PPA submit+wait so the video
+    // task's per-frame profiling can tell us whether the bottleneck
+    // is contention (the mutex) or the PPA op itself.
+    int64_t t_mutex_in = esp_timer_get_time();
+    xSemaphoreTake(s_ppa_mutex, portMAX_DELAY);
+    int64_t t_mutex_out = esp_timer_get_time();
+    xSemaphoreTake(s_srm_done, 0);
+
+    const uint8_t *src = (const uint8_t *)s_cam_stable;
+    if (src == NULL) {
+        xSemaphoreGive(s_ppa_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ppa_srm_oper_config_t srm = {
+        .in = {
+            .buffer         = (void *)src,
+            .pic_w          = s_src_w,
+            .pic_h          = s_src_h,
+            .block_w        = s_src_w,
+            .block_h        = s_src_h,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+        },
+        .out = {
+            .buffer         = out_buf,
+            .buffer_size    = out_buf_sz,
+            // The output PICTURE dimensions are the padded mult-of-16
+            // stride the H.264 encoder wants. The PPA writes the
+            // scaled block into the top-left corner; the remaining
+            // rows/columns are left alone (zero on first use).
+            .pic_w          = stride_w,
+            .pic_h          = stride_h,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .srm_cm         = PPA_SRM_COLOR_MODE_YUV420,
+        },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x        = scale,
+        .scale_y        = scale,
+        .mirror_x       = PREVIEW_PPA_MIRROR_X,
+        .mirror_y       = PREVIEW_PPA_MIRROR_Y,
+        .rgb_swap       = false,
+        .byte_swap      = false,
+        .mode           = PPA_TRANS_MODE_NON_BLOCKING,
+    };
+    esp_err_t err = ppa_do_scale_rotate_mirror(s_ppa, &srm);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "video snapshot PPA: %d", err);
+        xSemaphoreGive(s_ppa_mutex);
+        return err;
+    }
+    if (xSemaphoreTake(s_srm_done, pdMS_TO_TICKS(500)) != pdTRUE) {
+        ESP_LOGW(TAG, "video snapshot PPA timeout");
+        xSemaphoreGive(s_ppa_mutex);
+        return ESP_ERR_TIMEOUT;
+    }
+    int64_t t_ppa_done = esp_timer_get_time();
+    xSemaphoreGive(s_ppa_mutex);
+
+    // Dump a timing line every ~2 seconds (30 recording frames at
+    // 15 fps) so we can compare mutex-wait vs PPA-op time.
+    static int prof_n = 0;
+    if (++prof_n >= 30) {
+        prof_n = 0;
+        ESP_LOGI(TAG, "vid snapshot: mutex_wait=%lld us, ppa_op=%lld us",
+                 (long long)(t_mutex_out - t_mutex_in),
+                 (long long)(t_ppa_done - t_mutex_out));
+    }
     return ESP_OK;
 }

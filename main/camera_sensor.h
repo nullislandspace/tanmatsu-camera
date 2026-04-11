@@ -26,11 +26,21 @@ void camera_sensor_release(camera_sensor_t *sensor);
 esp_err_t camera_sensor_set_format_by_name(camera_sensor_t *sensor, const char *exact_name,
                                            esp_cam_sensor_format_t *out_fmt);
 
-// Convenience wrappers that pick the preview (800x640 RAW8) and photo
-// (1920x1080 RAW10) formats on the OV5647. Both walk the sensor's exposed
-// format list so behaviour is driver-version tolerant — the format chosen
-// is written back to out_fmt when provided.
+// Convenience wrappers that pick named formats on the OV5647:
+//   - preview = the sensor's highest-resolution MIPI CSI mode
+//                (1920x1080 RAW10 @30fps on 5MP OV). Used by the live
+//                preview in PHOTO mode so every shutter press is just
+//                "snapshot the currently streaming frame".
+//   - video   = a lower-resolution CSI mode optimised for H.264
+//                recording (800x640 RAW8 @50fps). The reduced PSRAM
+//                bandwidth and smaller PPA input make real-time
+//                recording + preview rendering fit inside the PPA
+//                throughput budget.
+//   - photo   = walks the format list and picks the highest-resolution
+//                CSI mode (useful when driver version ships a new
+//                high-res preset and we want to auto-pick it).
 esp_err_t camera_sensor_set_format_preview(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt);
+esp_err_t camera_sensor_set_format_video(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt);
 esp_err_t camera_sensor_set_format_photo(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt);
 
 // Start or stop the sensor output stream via S_STREAM ioctl.

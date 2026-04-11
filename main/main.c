@@ -24,6 +24,7 @@
 #include "photo.h"
 #include "sdcard.h"
 #include "usb_device.h"
+#include "video.h"
 #include "viewer.h"
 
 #define DCIM_PATH "/sd/DCIM"
@@ -34,6 +35,27 @@
 // 15 fps — keeping the sensor locked to that rate means no frame
 // dropping, no phase beating, and no wasted DMA.
 #define PREVIEW_TARGET_FPS 15u
+
+// Source descriptors for the two pipeline configurations the app
+// swaps between. PHOTO uses the sensor's highest-res MIPI mode so
+// preview and still capture can share a single WYSIWYG frame. VIDEO
+// drops to 800x640 RAW8 so the PPA has enough headroom to do both
+// the preview scale AND the YUV420 recording scale inside a 15 fps
+// frame budget (1920x1080 blew past ~83 ms per PPA op, turning the
+// whole pipeline into a 6-fps slideshow). See camera.md §9 for the
+// bandwidth math.
+static const camera_source_t SRC_PHOTO = {
+    .width          = 1920,
+    .height         = 1080,
+    .is_raw10       = true,
+    .lane_rate_mbps = 500,
+};
+static const camera_source_t SRC_VIDEO = {
+    .width          = 800,
+    .height         = 640,
+    .is_raw10       = false,
+    .lane_rate_mbps = 200,
+};
 
 typedef enum {
     MODE_PHOTO = 0,
@@ -107,6 +129,60 @@ static void apply_saved_timezone(void) {
     tzset();
 }
 
+// Tear the current preview pipeline down, reconfigure the sensor to
+// the format associated with the target mode, and bring the pipeline
+// back up. Used on F1/F2/F3 transitions — PHOTO and VIEW share the
+// 1920x1080 RAW10 source because F1 (viewer) doesn't actually stream
+// from the camera, it just reuses the preview pipeline as a backdrop.
+//
+// Returns ESP_OK if the transition completes; on failure the pipeline
+// is left torn down and the caller is expected to surface an error
+// screen / banner to the user.
+static esp_err_t switch_pipeline_to_source(camera_sensor_t *sensor,
+                                           const camera_source_t *src,
+                                           bool is_video_mode,
+                                           uint32_t preview_area_w,
+                                           uint32_t preview_area_h) {
+    // Stop sensor stream first so the CSI DMA stops firing while we
+    // tear down the controller.
+    camera_sensor_stream(sensor, false);
+    camera_preview_stop();
+
+    // Reconfigure the sensor. For PHOTO we use the 1920x1080 RAW10
+    // preset and then override VTS to land at PREVIEW_TARGET_FPS;
+    // for VIDEO we use the 800x640 RAW8 preset and leave the native
+    // 50 fps alone (the video task only pulls at 15 Hz, the extra
+    // frames are just wasted CSI DMA at <15 MB/s which is free).
+    esp_err_t err;
+    if (is_video_mode) {
+        err = camera_sensor_set_format_video(sensor, NULL);
+    } else {
+        err = camera_sensor_set_format_preview(sensor, NULL);
+        if (err == ESP_OK) {
+            if (camera_sensor_set_preview_fps(sensor, PREVIEW_TARGET_FPS) != ESP_OK) {
+                ESP_LOGW(TAG, "fps override failed, continuing at native rate");
+            }
+        }
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "sensor format switch: %d", err);
+        return err;
+    }
+
+    err = camera_preview_start(src, preview_area_w, preview_area_h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "preview start: %d", err);
+        return err;
+    }
+    err = camera_sensor_stream(sensor, true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "stream start: %d", err);
+        camera_preview_stop();
+        return err;
+    }
+    return ESP_OK;
+}
+
 static void wait_for_esc(void) {
     while (1) {
         bsp_input_event_t event;
@@ -128,8 +204,8 @@ void app_main(void) {
     // Give the host-side serial monitor time to reconnect after the USB PHY
     // flip above — the Tanmatsu's monitor mode can take several seconds to
     // re-enumerate, and without this pause the first chunk of startup logs
-    // is lost. Remove (or shorten) this for release builds.
-    vTaskDelay(pdMS_TO_TICKS(10000));
+    // is lost. Uncomment when you need to capture the very first boot logs.
+    // vTaskDelay(pdMS_TO_TICKS(10000));
     // ===== END FOR DEVELOPMENT ONLY =====
 
     // Start the GPIO interrupt service
@@ -294,7 +370,7 @@ void app_main(void) {
     const uint32_t hud_area_x      = preview_area_w;             // 600
     const uint32_t hud_area_w      = logical_w - preview_area_w; // 200
 
-    if (camera_preview_start(preview_area_w, preview_area_h) != ESP_OK) {
+    if (camera_preview_start(&SRC_PHOTO, preview_area_w, preview_area_h) != ESP_OK) {
         splash(RED, WHITE, "Camera error", "Pipeline start failed");
         wait_for_esc();
         return;
@@ -330,11 +406,15 @@ void app_main(void) {
             if (event.type == INPUT_EVENT_TYPE_NAVIGATION && event.args_navigation.state) {
                 switch (event.args_navigation.key) {
                     case BSP_INPUT_NAVIGATION_KEY_ESC:
+                        if (video_is_recording()) {
+                            video_record_stop();
+                        }
                         viewer_close();
                         bsp_device_restart_to_launcher();
                         break;
 
                     case BSP_INPUT_NAVIGATION_KEY_F1:
+                        if (video_is_recording()) break;  // stop recording first
                         if (mode != MODE_VIEW) {
                             // Entering view mode: scan DCIM and decode the
                             // newest image. The live preview keeps running
@@ -354,12 +434,38 @@ void app_main(void) {
                         break;
 
                     case BSP_INPUT_NAVIGATION_KEY_F2:
+                        if (video_is_recording()) break;  // finish recording first
                         if (mode == MODE_VIEW) viewer_close();
+                        if (mode != MODE_PHOTO) {
+                            // Coming back from VIDEO: re-bring the
+                            // pipeline up on the 1920x1080 RAW10
+                            // preset so subsequent photos are sharp.
+                            esp_err_t serr = switch_pipeline_to_source(
+                                &sensor, &SRC_PHOTO, false,
+                                preview_area_w, preview_area_h);
+                            if (serr != ESP_OK) {
+                                SHOW_BANNER("Mode switch failed (%d)", serr);
+                                break;
+                            }
+                        }
                         mode = MODE_PHOTO;
                         break;
 
                     case BSP_INPUT_NAVIGATION_KEY_F3:
+                        if (video_is_recording()) break;  // already in video mode
                         if (mode == MODE_VIEW) viewer_close();
+                        if (mode != MODE_VIDEO) {
+                            // Swap to 800x640 RAW8 so the PPA has
+                            // enough headroom for preview + YUV420
+                            // recording scale inside 15 fps budget.
+                            esp_err_t serr = switch_pipeline_to_source(
+                                &sensor, &SRC_VIDEO, true,
+                                preview_area_w, preview_area_h);
+                            if (serr != ESP_OK) {
+                                SHOW_BANNER("Mode switch failed (%d)", serr);
+                                break;
+                            }
+                        }
                         mode = MODE_VIDEO;
                         break;
 
@@ -483,10 +589,20 @@ void app_main(void) {
                 hud_y += hud_line;
                 break;
             case MODE_VIDEO:
-                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE rec",   hud_font);
-                hud_y += hud_line;
-                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "(WIP)",       hud_font);
-                hud_y += hud_line;
+                if (video_is_recording()) {
+                    uint32_t ms = video_recording_duration_ms();
+                    uint32_t s  = ms / 1000u;
+                    char rec_line[32];
+                    snprintf(rec_line, sizeof(rec_line), "REC %02u:%02u",
+                             (unsigned)(s / 60u), (unsigned)(s % 60u));
+                    fbdraw_hershey_string(&fb, RED, hud_pad_x, hud_y, rec_line, hud_font);
+                    hud_y += hud_line;
+                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE stop", hud_font);
+                    hud_y += hud_line;
+                } else {
+                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE rec", hud_font);
+                    hud_y += hud_line;
+                }
                 break;
             case MODE_VIEW:
                 if (viewer_has_image()) {
@@ -556,6 +672,25 @@ void app_main(void) {
                     SHOW_BANNER("Saved %.48s", basename);
                 } else {
                     SHOW_BANNER("Capture failed (%d)", err);
+                }
+            } else if (mode == MODE_VIDEO) {
+                if (video_is_recording()) {
+                    esp_err_t err = video_record_stop();
+                    if (err == ESP_OK) {
+                        SHOW_BANNER("Recording stopped");
+                    } else {
+                        SHOW_BANNER("Stop failed (%d)", err);
+                    }
+                } else {
+                    char vid_path[128] = {0};
+                    esp_err_t err = video_record_start(DCIM_PATH, vid_path, sizeof(vid_path));
+                    if (err == ESP_OK && vid_path[0]) {
+                        const char *basename = strrchr(vid_path, '/');
+                        basename = basename ? basename + 1 : vid_path;
+                        SHOW_BANNER("Rec %.48s", basename);
+                    } else {
+                        SHOW_BANNER("Rec start failed (%d)", err);
+                    }
                 }
             }
         }

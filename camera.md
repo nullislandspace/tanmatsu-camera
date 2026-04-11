@@ -475,10 +475,18 @@ can play back. That player reads **AVI** files containing either
   real-time**, so 400×240 @ 15 fps has very large headroom. Input
   formats are **I420** or **YUV422** (there is also an `O_UYY_E_VYY`
   variant).
-- **Hardware MP3 encoder (software, but fast)** — the managed component
-  `espressif/esp_audio_codec` provides MP3 encode. It is already in the
-  video player's `managed_components/`, so it is a known-good audio
-  encoder for Tanmatsu.
+- **MP3 encoder (software)** — the managed component
+  `espressif/esp_audio_codec` used to be listed here as the MP3
+  encode source, but **it only ships an MP3 *decoder*** (as of
+  v2.4.1, which is what the video player vendors). Its encoder
+  set is sbc / opus / aac / adpcm / amr / alac / g711 / pcm / lc3
+  — no MP3.
+  The camera project instead vendors the
+  **[Shine](https://github.com/toots/shine)** fixed-point MP3
+  encoder as an ESP-IDF component under `components/shine/`.
+  Shine is small (nine `.c` files), LGPL-2.0, and designed for
+  real-time embedded encode with no psychoacoustic analysis — at
+  16 kHz mono 64 kbps it costs well under 10 % of one P4 core.
 
 ### What the video player expects — the decode-side constraints
 
@@ -581,9 +589,11 @@ plumbing:
   with interleaved video/audio chunks (`00dc` for video, `01wb` for
   audio), and an `idx1` index written at end-of-file. Straightforward,
   well-documented container.
-- **MP3 audio encoder.** Reuse `espressif/esp_audio_codec` — it is
-  already present in the video player's managed components and its
-  MP3 encoder is known to work on ESP32-P4.
+- **MP3 audio encoder.** `espressif/esp_audio_codec` does **not** ship
+  an MP3 encoder (decoder only). The camera project instead vendors
+  the Shine fixed-point MP3 encoder as `components/shine/` (see
+  above). A full silent-track encode + AVI-mux path is validated in
+  `main/video.c`.
 - **Memory budget sanity check.** Rough shopping list:
   - ~140 KB for the H.264 encoder state (if H.264 path)
   - ~1 MB for the full-resolution camera frame
@@ -613,10 +623,14 @@ can sustain, and well below what even full-res MJPEG would cost.
 
 **CPU impact:**
 
-- Software MP3 encode from `espressif/esp_audio_codec` at **16 kHz mono**
-  is the easy case — expect well under 10% of one P4 core. 22.05 kHz or
-  44.1 kHz mono is still cheap; stereo CD-quality MP3 starts to cost
-  more but is still well within budget.
+- Software MP3 encode via the vendored **Shine** encoder
+  (`components/shine/`) at **16 kHz mono** is the easy case —
+  expect well under 10 % of one P4 core. 22.05 kHz or 44.1 kHz
+  mono is still cheap; stereo CD-quality MP3 starts to cost more
+  but is still well within budget. Shine runs on a dedicated
+  audio task pinned to **core 1** in `main/video.c`, which will
+  give the future I²S microphone capture a deterministic CPU
+  budget that is not contended by the main UI / camera tasks.
 - The H.264 encode runs on the dedicated hardware block and takes
   effectively no CPU, so there is plenty of headroom for MP3, AVI
   muxing and a live preview.

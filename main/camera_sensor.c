@@ -21,6 +21,15 @@ static const char *TAG = "camera_sensor";
 // the shutter will save, with zero format-switch latency and no need
 // for AE/AWB snapshot/restore dance.
 #define PREVIEW_FORMAT_NAME     "MIPI_2lane_24Minput_RAW10_1920x1080_30fps"
+// Video recording format. 800x640 RAW8 @50fps is the largest sensor
+// mode that leaves enough PPA throughput to scale the preview AND
+// produce a YUV420 encoder input inside the 15-fps video frame
+// budget. At ~83ms/op on a 1920x1080 source the PPA would already be
+// over budget just doing the preview scale, let alone the recording
+// one; an 800x640 source frame is ~4x smaller so the same PPA work
+// fits comfortably. Matches the format the old working community
+// camera app used as its single preset (camera.md §8).
+#define VIDEO_FORMAT_NAME       "MIPI_2lane_24Minput_RAW8_800x640_50fps"
 
 // OmniVision Timing Group VTS (vertical total size / frame length in
 // lines) register pair. Identical on OV5640, OV5645 and OV5647 — it is
@@ -156,6 +165,10 @@ esp_err_t camera_sensor_set_format_by_name(camera_sensor_t *sensor, const char *
 
 esp_err_t camera_sensor_set_format_preview(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt) {
     return camera_sensor_set_format_by_name(sensor, PREVIEW_FORMAT_NAME, out_fmt);
+}
+
+esp_err_t camera_sensor_set_format_video(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt) {
+    return camera_sensor_set_format_by_name(sensor, VIDEO_FORMAT_NAME, out_fmt);
 }
 
 esp_err_t camera_sensor_set_format_photo(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt) {

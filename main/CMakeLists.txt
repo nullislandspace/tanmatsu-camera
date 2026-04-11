@@ -9,6 +9,8 @@ idf_component_register(
 		"fbdraw.c"
 		"photo.c"
 		"viewer.c"
+		"video.c"
+		"avi_mux.c"
 		"usb_device.c"
 	PRIV_REQUIRES
 		esp_lcd
@@ -23,6 +25,8 @@ idf_component_register(
 		esp_mm
 		vfs
 		badge-bsp
+		esp_h264
+		shine
 	INCLUDE_DIRS
 		"."
 )
