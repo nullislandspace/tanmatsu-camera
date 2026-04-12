@@ -23,4 +23,4 @@ else
     OUTPUT="${INPUT%.avi}.mp4"
 fi
 
-ffmpeg -i "$INPUT" -c:v copy -c:a copy "$OUTPUT"
+ffmpeg -fflags +genpts -i "$INPUT" -c:v copy -c:a copy "$OUTPUT"
