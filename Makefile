@@ -72,7 +72,7 @@ run:
 
 # App repository
 
-APP_SLUG_NAME ?= at.cavac.renzeotype
+APP_SLUG_NAME ?= at.cavac.tanmatype
 APP_REPO_PATH ?= ../tanmatsu-app-repository/$(APP_SLUG_NAME)
 
 .PHONY: apprepo
