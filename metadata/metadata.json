@@ -21,7 +21,12 @@
             "revision": 1,
             "type": "appfs",
             "executable": "application.bin",
-            "assets": []
+            "assets": [
+                {
+                    "source_file": "tanmatype.jpg",
+                    "target_file": "tanmatype.jpg"
+                }
+            ]
         }
     ]
 }

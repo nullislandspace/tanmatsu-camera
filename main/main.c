@@ -25,6 +25,7 @@
 #include "fbdraw.h"
 #include "photo.h"
 #include "sdcard.h"
+#include "splash.h"
 #include "usb_device.h"
 #include "video.h"
 #include "viewer.h"
@@ -358,8 +359,11 @@ void app_main(void) {
     }
     ESP_LOGI(TAG, "%s ready", DCIM_PATH);
 
+    // Show the branded splash screen for 2 seconds (non-fatal if missing).
+    splash_show(&fb);
+
     // Detect the OV5647 and configure it for the preview format.
-    splash(WHITE, BLACK, "Camera", "Detecting sensor...");
+    // The JPEG splash screen stays visible during detection.
     camera_sensor_t sensor = {0};
     if (camera_sensor_detect(&sensor) != ESP_OK) {
         splash(RED, WHITE, "Camera error", "No sensor detected");

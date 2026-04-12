@@ -83,6 +83,7 @@ apprepo: build
 	cp metadata/icon16.png $(APP_REPO_PATH)/icon16.png
 	cp metadata/icon32.png $(APP_REPO_PATH)/icon32.png
 	cp metadata/icon64.png $(APP_REPO_PATH)/icon64.png
+	cp metadata/tanmatype.jpg $(APP_REPO_PATH)/tanmatype.jpg
 	cp $(BUILD)/application.bin $(APP_REPO_PATH)/application.bin
 	@echo "=== App repository updated at $(APP_REPO_PATH) ==="
 

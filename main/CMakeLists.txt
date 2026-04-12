@@ -12,6 +12,7 @@ idf_component_register(
 		"video.c"
 		"avi_mux.c"
 		"usb_device.c"
+		"splash.c"
 	PRIV_REQUIRES
 		esp_lcd
 		nvs_flash
