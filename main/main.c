@@ -9,6 +9,8 @@
 #include "bsp/led.h"
 #include "bsp/power.h"
 #include "driver/gpio.h"
+#include "esp_lcd_mipi_dsi.h"
+#include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -89,8 +91,28 @@ static QueueHandle_t                input_event_queue    = NULL;
 #define HUD_BG      fbdraw_rgb(32, 32, 32)    // dark grey strip behind HUD text
 #define BANNER_BG   fbdraw_rgb(0, 0, 128)     // dark blue banner strip
 
+// Non-blocking display blit. We bypass bsp_display_blit() and manage
+// the DMA-done semaphore ourselves so we can skip frames when the
+// display is still busy transferring the previous one — no blocking,
+// no tearing (double-buffered fb), and the camera pipeline is never
+// stalled by display DMA.
+static esp_lcd_panel_handle_t s_panel    = NULL;
+static SemaphoreHandle_t      s_blit_done = NULL;
+
+static IRAM_ATTR bool on_blit_done(esp_lcd_panel_handle_t panel,
+                                   esp_lcd_dpi_panel_event_data_t *edata,
+                                   void *user_ctx) {
+    BaseType_t hpw = pdFALSE;
+    xSemaphoreGiveFromISR(s_blit_done, &hpw);
+    return hpw == pdTRUE;
+}
+
+// Blocking blit for one-shot screens (splash, errors) where we don't
+// care about frame drops.
 static void blit(void) {
-    bsp_display_blit(0, 0, display_h_res, display_v_res, fb.pixels);
+    xSemaphoreTake(s_blit_done, pdMS_TO_TICKS(1000));
+    esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
+                              display_h_res, display_v_res, fb.pixels);
 }
 
 static void splash(uint16_t bg, uint16_t fg, const char *line1, const char *line2) {
@@ -274,6 +296,26 @@ void app_main(void) {
 
     if (fbdraw_init(&fb, display_h_res, display_v_res) != ESP_OK) {
         ESP_LOGE(TAG, "fbdraw_init failed");
+        return;
+    }
+
+    // Set up non-blocking display blit. Get the panel handle and
+    // register our own DMA-completion callback, replacing the BSP's
+    // default (which we no longer need since we call
+    // esp_lcd_panel_draw_bitmap directly instead of bsp_display_blit).
+    res = bsp_display_get_panel(&s_panel);
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "bsp_display_get_panel: %d", res);
+        return;
+    }
+    s_blit_done = xSemaphoreCreateBinary();
+    xSemaphoreGive(s_blit_done);  // display starts idle
+    esp_lcd_dpi_panel_event_callbacks_t blit_cbs = {
+        .on_color_trans_done = on_blit_done,
+    };
+    res = esp_lcd_dpi_panel_register_event_callbacks(s_panel, &blit_cbs, NULL);
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "register blit callbacks: %d", res);
         return;
     }
 
@@ -509,150 +551,168 @@ void app_main(void) {
         }
         int64_t t_after_wait = esp_timer_get_time();
 
-        // Only clear the HUD strip on every frame — the preview area
-        // is immediately overwritten by the blit and the HUD strip is
-        // the only region that needs a black background beneath the
-        // translucent overlays. Cuts ~8 ms off the old full clear.
-        fbdraw_fill_rect(&fb, (int)hud_area_x, 0,
-                         (int)hud_area_w, (int)logical_h, BLACK);
-        int64_t t_after_bg = esp_timer_get_time();
+        // Skip drawing + blit entirely if the display is still DMA-ing
+        // the previous frame. With double buffering this means we just
+        // drop a display frame — the camera pipeline and input handling
+        // are never stalled by display DMA.
+        bool display_ready = (xSemaphoreTake(s_blit_done, 0) == pdTRUE);
+        int64_t t_after_bg    = t_after_wait;
+        int64_t t_after_image = t_after_wait;
+        int64_t t_after_hud   = t_after_wait;
+        int64_t t_after_blit  = t_after_wait;
 
-        if (mode == MODE_VIEW && viewer_has_image()) {
-            // Also clear the preview area in view mode so stale camera
-            // pixels from before entering view mode don't show through
-            // the letterbox margins around the decoded JPEG.
-            fbdraw_fill_rect(&fb, 0, 0,
-                             (int)preview_area_w, (int)preview_area_h, BLACK);
-            int img_x = ((int)preview_area_w - (int)viewer_get_width())  / 2;
-            int img_y = ((int)preview_area_h - (int)viewer_get_height()) / 2;
-            // Viewer still emits landscape-oriented RGB565 via PAX —
-            // fall back to the CPU rotation copy until viewer.c is
-            // ported to produce panel-native output.
-            fbdraw_blit_rotated(&fb, img_x, img_y,
-                                (const uint16_t *)viewer_get_pixels(),
-                                viewer_get_width(), viewer_get_height());
-        } else if (mode != MODE_VIEW) {
-            // camera_pipeline's PPA produced a 16:9 preview letterboxed
-            // into the 5:4 (600x480) preview area. The PPA output is
-            // stored panel-native: pw columns × ph rows, where pw is
-            // the narrower dimension (337 at 5/16 scale) and ph covers
-            // the full preview-area width in user space (600). Center
-            // it horizontally in the 480-wide panel range, which
-            // corresponds to vertical centring in the user's view.
-            uint32_t pw = camera_preview_get_width();
-            uint32_t ph = camera_preview_get_height();
-            int panel_x_off = ((int)fb.panel_w - (int)pw) / 2;
-            if (panel_x_off < 0) panel_x_off = 0;
+        if (display_ready) {
+            // Only clear the HUD strip on every frame — the preview area
+            // is immediately overwritten by the blit and the HUD strip is
+            // the only region that needs a black background beneath the
+            // translucent overlays. Cuts ~8 ms off the old full clear.
+            fbdraw_fill_rect(&fb, (int)hud_area_x, 0,
+                             (int)hud_area_w, (int)logical_h, BLACK);
+            t_after_bg = esp_timer_get_time();
 
-            // Clear the top and bottom letterbox bars so stale content
-            // from a previous frame or from view mode doesn't show.
-            int top_bar_h = (int)fb.user_h - (panel_x_off + (int)pw);
-            int bot_bar_y = (int)fb.user_h - panel_x_off;
-            int bot_bar_h = panel_x_off;
-            if (top_bar_h > 0) {
+            if (mode == MODE_VIEW && viewer_has_image()) {
+                // Also clear the preview area in view mode so stale camera
+                // pixels from before entering view mode don't show through
+                // the letterbox margins around the decoded JPEG.
                 fbdraw_fill_rect(&fb, 0, 0,
-                                 (int)preview_area_w, top_bar_h, BLACK);
-            }
-            if (bot_bar_h > 0) {
-                fbdraw_fill_rect(&fb, 0, bot_bar_y,
-                                 (int)preview_area_w, bot_bar_h, BLACK);
-            }
+                                 (int)preview_area_w, (int)preview_area_h, BLACK);
+                int img_x = ((int)preview_area_w - (int)viewer_get_width())  / 2;
+                int img_y = ((int)preview_area_h - (int)viewer_get_height()) / 2;
+                // Viewer still emits landscape-oriented RGB565 via PAX —
+                // fall back to the CPU rotation copy until viewer.c is
+                // ported to produce panel-native output.
+                fbdraw_blit_rotated(&fb, img_x, img_y,
+                                    (const uint16_t *)viewer_get_pixels(),
+                                    viewer_get_width(), viewer_get_height());
+            } else if (mode != MODE_VIEW) {
+                // camera_pipeline's PPA produced a 16:9 preview letterboxed
+                // into the 5:4 (600x480) preview area. The PPA output is
+                // stored panel-native: pw columns × ph rows, where pw is
+                // the narrower dimension (337 at 5/16 scale) and ph covers
+                // the full preview-area width in user space (600). Center
+                // it horizontally in the 480-wide panel range, which
+                // corresponds to vertical centring in the user's view.
+                uint32_t pw = camera_preview_get_width();
+                uint32_t ph = camera_preview_get_height();
+                int panel_x_off = ((int)fb.panel_w - (int)pw) / 2;
+                if (panel_x_off < 0) panel_x_off = 0;
 
-            fbdraw_blit_panel(&fb, panel_x_off, 0,
-                              (const uint16_t *)camera_preview_get_pixels(),
-                              pw, ph);
-        }
-        int64_t t_after_image = esp_timer_get_time();
-
-        // HUD strip on the right. All coordinates are in the 200-pixel
-        // wide user-space strip starting at hud_area_x.
-        const int hud_pad_x = (int)hud_area_x + 10;
-        const int hud_font  = 16;
-        const int hud_line  = hud_font + 4;
-        int hud_y = 14;
-
-        // Mode header in a contrasting colour.
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
-                              mode_name(mode), 20);
-        hud_y += 28;
-
-        // Key hint lines.
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F1 view",  hud_font); hud_y += hud_line;
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F2 photo", hud_font); hud_y += hud_line;
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F3 video", hud_font); hud_y += hud_line;
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "Esc exit", hud_font); hud_y += hud_line + 6;
-
-        // Mode-specific hint and state.
-        switch (mode) {
-            case MODE_PHOTO:
-                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE photo", hud_font);
-                hud_y += hud_line;
-                break;
-            case MODE_VIDEO:
-                if (video_is_recording()) {
-                    uint32_t ms = video_recording_duration_ms();
-                    uint32_t s  = ms / 1000u;
-                    char rec_line[32];
-                    snprintf(rec_line, sizeof(rec_line), "REC %02u:%02u",
-                             (unsigned)(s / 60u), (unsigned)(s % 60u));
-                    fbdraw_hershey_string(&fb, RED, hud_pad_x, hud_y, rec_line, hud_font);
-                    hud_y += hud_line;
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE stop", hud_font);
-                    hud_y += hud_line;
-                } else {
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE rec", hud_font);
-                    hud_y += hud_line;
+                // Clear the top and bottom letterbox bars so stale content
+                // from a previous frame or from view mode doesn't show.
+                int top_bar_h = (int)fb.user_h - (panel_x_off + (int)pw);
+                int bot_bar_y = (int)fb.user_h - panel_x_off;
+                int bot_bar_h = panel_x_off;
+                if (top_bar_h > 0) {
+                    fbdraw_fill_rect(&fb, 0, 0,
+                                     (int)preview_area_w, top_bar_h, BLACK);
                 }
-                break;
-            case MODE_VIEW:
-                if (viewer_has_image()) {
-                    char line[32];
-                    snprintf(line, sizeof(line), "%d / %d",
-                             viewer_get_index() + 1, viewer_get_total());
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, line, hud_font);
-                    hud_y += hud_line;
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "< newer", hud_font); hud_y += hud_line;
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "> older", hud_font); hud_y += hud_line;
-                } else {
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "no pics", hud_font);
-                    hud_y += hud_line;
+                if (bot_bar_h > 0) {
+                    fbdraw_fill_rect(&fb, 0, bot_bar_y,
+                                     (int)preview_area_w, bot_bar_h, BLACK);
                 }
-                break;
-        }
 
-        // Transient banner (e.g. "Saved IMG_xxx.jpg"). Draw it in the
-        // bottom of the HUD strip so it doesn't cover the mode/key
-        // hints.
-        if (banner_text[0] && xTaskGetTickCount() < banner_until) {
-            int banner_y = (int)logical_h - 60;
-            fbdraw_fill_rect(&fb, (int)hud_area_x, banner_y,
-                             (int)hud_area_w, 50, BANNER_BG);
-            // Banner text may be too wide for the 200-px HUD strip, so
-            // trim to the first 14 chars and hope for the best. GCC
-            // warns on a naive snprintf("%s") here because the source
-            // is 64 bytes wide, so truncate manually with %.14s.
-            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, banner_y + 16,
-                                  banner_text, hud_font);
-            (void)banner_y;
-        } else {
-            banner_text[0] = 0;
-        }
-        int64_t t_after_hud = esp_timer_get_time();
+                fbdraw_blit_panel(&fb, panel_x_off, 0,
+                                  (const uint16_t *)camera_preview_get_pixels(),
+                                  pw, ph);
+            }
+            t_after_image = esp_timer_get_time();
 
-        blit();
-        int64_t t_after_blit = esp_timer_get_time();
+            // HUD strip on the right. All coordinates are in the 200-pixel
+            // wide user-space strip starting at hud_area_x.
+            const int hud_pad_x = (int)hud_area_x + 10;
+            const int hud_font  = 16;
+            const int hud_line  = hud_font + 4;
+            int hud_y = 14;
+
+            // Mode header in a contrasting colour.
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
+                                  mode_name(mode), 20);
+            hud_y += 28;
+
+            // Key hint lines.
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F1 view",  hud_font); hud_y += hud_line;
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F2 photo", hud_font); hud_y += hud_line;
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F3 video", hud_font); hud_y += hud_line;
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "Esc exit", hud_font); hud_y += hud_line + 6;
+
+            // Mode-specific hint and state.
+            switch (mode) {
+                case MODE_PHOTO:
+                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE photo", hud_font);
+                    hud_y += hud_line;
+                    break;
+                case MODE_VIDEO:
+                    if (video_is_recording()) {
+                        uint32_t ms = video_recording_duration_ms();
+                        uint32_t s  = ms / 1000u;
+                        char rec_line[32];
+                        snprintf(rec_line, sizeof(rec_line), "REC %02u:%02u",
+                                 (unsigned)(s / 60u), (unsigned)(s % 60u));
+                        fbdraw_hershey_string(&fb, RED, hud_pad_x, hud_y, rec_line, hud_font);
+                        hud_y += hud_line;
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE stop", hud_font);
+                        hud_y += hud_line;
+                    } else {
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE rec", hud_font);
+                        hud_y += hud_line;
+                    }
+                    break;
+                case MODE_VIEW:
+                    if (viewer_has_image()) {
+                        char line[32];
+                        snprintf(line, sizeof(line), "%d / %d",
+                                 viewer_get_index() + 1, viewer_get_total());
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, line, hud_font);
+                        hud_y += hud_line;
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "< newer", hud_font); hud_y += hud_line;
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "> older", hud_font); hud_y += hud_line;
+                    } else {
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "no pics", hud_font);
+                        hud_y += hud_line;
+                    }
+                    break;
+            }
+
+            // Transient banner (e.g. "Saved IMG_xxx.jpg"). Draw it in the
+            // bottom of the HUD strip so it doesn't cover the mode/key
+            // hints.
+            if (banner_text[0] && xTaskGetTickCount() < banner_until) {
+                int banner_y = (int)logical_h - 60;
+                fbdraw_fill_rect(&fb, (int)hud_area_x, banner_y,
+                                 (int)hud_area_w, 50, BANNER_BG);
+                // Banner text may be too wide for the 200-px HUD strip, so
+                // trim to the first 14 chars and hope for the best. GCC
+                // warns on a naive snprintf("%s") here because the source
+                // is 64 bytes wide, so truncate manually with %.14s.
+                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, banner_y + 16,
+                                      banner_text, hud_font);
+                (void)banner_y;
+            } else {
+                banner_text[0] = 0;
+            }
+            t_after_hud = esp_timer_get_time();
+
+            // Submit the completed frame to the display and swap to the
+            // other buffer so the next iteration draws into a clean
+            // buffer while DMA reads the one we just submitted.
+            esp_lcd_panel_draw_bitmap(s_panel, 0, 0,
+                                      display_h_res, display_v_res, fb.pixels);
+            fbdraw_swap(&fb);
+            t_after_blit = esp_timer_get_time();
+        }
 
         // Dump per-stage timings every ~1 s so we can see which step
         // dominates. Remove once the main loop is fast enough.
         static int prof_n = 0;
         if (++prof_n >= 15) {
             prof_n = 0;
-            ESP_LOGI(TAG, "loop: wait=%lld bg=%lld img=%lld hud=%lld blit=%lld (us)",
+            ESP_LOGI(TAG, "loop: wait=%lld bg=%lld img=%lld hud=%lld blit=%lld ready=%d (us)",
                      (long long)(t_after_wait  - t_wait_start),
                      (long long)(t_after_bg    - t_after_wait),
                      (long long)(t_after_image - t_after_bg),
                      (long long)(t_after_hud   - t_after_image),
-                     (long long)(t_after_blit  - t_after_hud));
+                     (long long)(t_after_blit  - t_after_hud),
+                     display_ready);
         }
 
         // Photo capture: the preview pipeline is torn down and rebuilt

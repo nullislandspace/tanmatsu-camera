@@ -36,8 +36,10 @@
 //     panel rows (slow — use only when unavoidable)
 
 typedef struct {
-    uint16_t *pixels;       // cache-line aligned, panel_w * panel_h * 2 bytes
-    size_t    pixels_sz;
+    uint16_t *pixels;       // current draw target (points to buf[draw_idx])
+    uint16_t *buf[2];       // double-buffered: cache-line aligned, panel_w * panel_h * 2 bytes each
+    int       draw_idx;     // index into buf[] that `pixels` currently points to
+    size_t    pixels_sz;    // size of each buffer in bytes
     size_t    panel_w;      // 480 on Tanmatsu
     size_t    panel_h;      // 800
     size_t    user_w;       // 800 (= panel_h)
@@ -60,6 +62,12 @@ esp_err_t fbdraw_init(fbdraw_t *fb, size_t panel_w, size_t panel_h);
 
 // Free the framebuffer.
 void fbdraw_deinit(fbdraw_t *fb);
+
+// Swap the draw target to the other buffer. Call this right after
+// bsp_display_blit so the next frame draws into a clean buffer while
+// DMA is still reading the one just submitted. The caller must not
+// touch the previously-blitted buffer after swapping.
+void fbdraw_swap(fbdraw_t *fb);
 
 // Fill the entire panel with a single colour. For colours whose high
 // and low bytes are equal (0x0000, 0xFFFF, ...) this collapses to one

@@ -32,21 +32,33 @@ esp_err_t fbdraw_init(fbdraw_t *fb, size_t panel_w, size_t panel_h) {
     // Round up to the cache line so esp_cache_msync (inside the DSI
     // blit path) is happy.
     fb->pixels_sz = (raw_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
-    fb->pixels    = heap_caps_aligned_calloc(cache_line, 1, fb->pixels_sz,
-                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (fb->pixels == NULL) {
-        ESP_LOGE(TAG, "fb alloc failed (%zu bytes)", fb->pixels_sz);
-        return ESP_ERR_NO_MEM;
+    for (int i = 0; i < 2; i++) {
+        fb->buf[i] = heap_caps_aligned_calloc(cache_line, 1, fb->pixels_sz,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        if (fb->buf[i] == NULL) {
+            ESP_LOGE(TAG, "fb alloc buf[%d] failed (%zu bytes)", i, fb->pixels_sz);
+            // Free the first if the second failed.
+            if (i == 1 && fb->buf[0]) { free(fb->buf[0]); fb->buf[0] = NULL; }
+            return ESP_ERR_NO_MEM;
+        }
     }
+    fb->draw_idx = 0;
+    fb->pixels   = fb->buf[0];
     return ESP_OK;
 }
 
 void fbdraw_deinit(fbdraw_t *fb) {
     if (fb == NULL) return;
-    if (fb->pixels) {
-        free(fb->pixels);
+    for (int i = 0; i < 2; i++) {
+        if (fb->buf[i]) { free(fb->buf[i]); }
     }
     memset(fb, 0, sizeof(*fb));
+}
+
+void fbdraw_swap(fbdraw_t *fb) {
+    if (fb == NULL) return;
+    fb->draw_idx ^= 1;
+    fb->pixels = fb->buf[fb->draw_idx];
 }
 
 // Fast memset-of-16-bit-words. Collapses to one memset for colours
