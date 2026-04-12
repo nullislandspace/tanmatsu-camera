@@ -673,20 +673,15 @@ void app_main(void) {
                     break;
             }
 
-            // Transient banner (e.g. "Saved IMG_xxx.jpg"). Draw it in the
-            // bottom of the HUD strip so it doesn't cover the mode/key
-            // hints.
+            // Transient banner (e.g. "Saved IMG_xxx.jpg"). Draw it
+            // left-aligned over the preview area so long filenames
+            // aren't clipped by the narrow HUD strip.
             if (banner_text[0] && xTaskGetTickCount() < banner_until) {
-                int banner_y = (int)logical_h - 60;
-                fbdraw_fill_rect(&fb, (int)hud_area_x, banner_y,
-                                 (int)hud_area_w, 50, BANNER_BG);
-                // Banner text may be too wide for the 200-px HUD strip, so
-                // trim to the first 14 chars and hope for the best. GCC
-                // warns on a naive snprintf("%s") here because the source
-                // is 64 bytes wide, so truncate manually with %.14s.
-                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, banner_y + 16,
+                int banner_y = (int)logical_h - 50;
+                fbdraw_fill_rect(&fb, 0, banner_y,
+                                 (int)preview_area_w, 40, BANNER_BG);
+                fbdraw_hershey_string(&fb, WHITE, 10, banner_y + 12,
                                       banner_text, hud_font);
-                (void)banner_y;
             } else {
                 banner_text[0] = 0;
             }
