@@ -22,6 +22,8 @@
 #include "bmp_writer.h"
 #include "camera_pipeline.h"
 #include "camera_sensor.h"
+#include "config.h"
+#include "dw9714p.h"
 #include "fbdraw.h"
 #include "photo.h"
 #include "sdcard.h"
@@ -64,16 +66,41 @@ typedef enum {
     MODE_PHOTO = 0,
     MODE_VIDEO,
     MODE_VIEW,
+    MODE_CONFIG,
 } app_mode_t;
 
 static const char *mode_name(app_mode_t m) {
     switch (m) {
-        case MODE_PHOTO: return "PHOTO";
-        case MODE_VIDEO: return "VIDEO";
-        case MODE_VIEW:  return "VIEW";
+        case MODE_PHOTO:  return "PHOTO";
+        case MODE_VIDEO:  return "VIDEO";
+        case MODE_VIEW:   return "VIEW";
+        case MODE_CONFIG: return "CONFIG";
     }
     return "?";
 }
+
+// Focus (DW9714P) runtime state. Position is session-only — each
+// boot starts at mid-range so the user isn't fighting whatever the
+// previous session left the VCM at (e.g. after a lens swap).
+static camera_config_t g_cfg           = {0};
+static bool            g_focus_present = false;  // chip ACKed on boot / toggle-on
+static uint16_t        g_focus_pos     = DW9714P_POS_MID;
+static int             g_focus_dir     = 0;       // -1, 0, +1
+static int64_t         g_focus_last_us = 0;
+
+// Config menu items. One entry per toggleable boolean; extend here
+// when adding more settings. The loop in the MODE_CONFIG handler
+// draws and drives this table directly.
+typedef struct {
+    const char *label;
+    bool       *value;
+} cfg_item_t;
+
+static cfg_item_t g_cfg_items[] = {
+    { "DW9714P focus", &g_cfg.focus_enabled },
+};
+#define CFG_ITEM_COUNT ((int)(sizeof(g_cfg_items) / sizeof(g_cfg_items[0])))
+static int g_cfg_sel = 0;
 
 static char const TAG[] = "main";
 
@@ -359,6 +386,24 @@ void app_main(void) {
     }
     ESP_LOGI(TAG, "%s ready", DCIM_PATH);
 
+    // Load /sd/camera.cfg. Missing file is non-fatal — config_load
+    // seeds defaults and writes a template for the user. If the
+    // DW9714P focus option is enabled, probe the chip now so we can
+    // (a) apply the mid-range starting position and (b) warn via
+    // banner if the module isn't actually attached.
+    config_load(&g_cfg);
+    bool show_focus_missing_banner = false;
+    if (g_cfg.focus_enabled) {
+        if (dw9714p_probe() == ESP_OK && dw9714p_init() == ESP_OK) {
+            dw9714p_set_position(g_focus_pos);
+            g_focus_present = true;
+            ESP_LOGI(TAG, "DW9714P ready, focus=%u", g_focus_pos);
+        } else {
+            ESP_LOGW(TAG, "DW9714P enabled in config but not detected");
+            show_focus_missing_banner = true;
+        }
+    }
+
     // Show the branded splash screen for 2 seconds (non-fatal if missing).
     splash_show(&fb);
 
@@ -437,6 +482,16 @@ void app_main(void) {
     char       banner_text[64] = {0};
     TickType_t banner_until    = 0;
 
+    if (show_focus_missing_banner) {
+        snprintf(banner_text, sizeof(banner_text), "DW9714P not detected");
+        banner_until = xTaskGetTickCount() + pdMS_TO_TICKS(3500);
+    }
+
+    // Tracks which mode the user was in before opening the config
+    // menu so F4/ESC returns them there. Only meaningful when
+    // mode == MODE_CONFIG.
+    app_mode_t prev_mode = MODE_PHOTO;
+
     // Helper lambda-ish: a transient banner with a default 2.5s duration.
     #define SHOW_BANNER(fmt, ...) do { \
         snprintf(banner_text, sizeof(banner_text), fmt, ##__VA_ARGS__); \
@@ -449,14 +504,86 @@ void app_main(void) {
         // frame (so the user gets visual feedback that the shutter fired).
         bsp_input_event_t event;
         while (xQueueReceive(input_event_queue, &event, 0) == pdTRUE) {
+            // UP/DOWN need both press and release so we can implement
+            // hold-to-scan focus. Handle those first, before the
+            // press-only switch below.
+            if (event.type == INPUT_EVENT_TYPE_NAVIGATION &&
+                (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_UP ||
+                 event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_DOWN)) {
+                if (mode == MODE_CONFIG) {
+                    if (event.args_navigation.state) {
+                        if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_UP) {
+                            g_cfg_sel = (g_cfg_sel - 1 + CFG_ITEM_COUNT) % CFG_ITEM_COUNT;
+                        } else {
+                            g_cfg_sel = (g_cfg_sel + 1) % CFG_ITEM_COUNT;
+                        }
+                    }
+                } else if (g_cfg.focus_enabled && g_focus_present &&
+                           mode != MODE_VIEW) {
+                    int dir = (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_UP)
+                                ? +1 : -1;
+                    if (event.args_navigation.state) {
+                        g_focus_dir     = dir;
+                        g_focus_last_us = esp_timer_get_time();
+                    } else if (g_focus_dir == dir) {
+                        g_focus_dir = 0;
+                    }
+                }
+                continue;
+            }
+
             if (event.type == INPUT_EVENT_TYPE_NAVIGATION && event.args_navigation.state) {
                 switch (event.args_navigation.key) {
                     case BSP_INPUT_NAVIGATION_KEY_ESC:
+                        if (mode == MODE_CONFIG) {
+                            mode = prev_mode;
+                            break;
+                        }
                         if (video_is_recording()) {
                             video_record_stop();
                         }
                         viewer_close();
                         bsp_device_restart_to_launcher();
+                        break;
+
+                    case BSP_INPUT_NAVIGATION_KEY_F4:
+                        if (video_is_recording()) break;
+                        if (mode == MODE_CONFIG) {
+                            mode = prev_mode;
+                        } else {
+                            prev_mode = mode;
+                            mode      = MODE_CONFIG;
+                            g_cfg_sel = 0;
+                        }
+                        break;
+
+                    case BSP_INPUT_NAVIGATION_KEY_RETURN:
+                        if (mode == MODE_CONFIG && CFG_ITEM_COUNT > 0) {
+                            bool *v    = g_cfg_items[g_cfg_sel].value;
+                            bool  prev = *v;
+                            *v         = !prev;
+
+                            // Side effect for focus_enabled: verify the
+                            // chip is actually there before we commit.
+                            if (v == &g_cfg.focus_enabled) {
+                                if (*v) {
+                                    if (dw9714p_probe() == ESP_OK &&
+                                        dw9714p_init()  == ESP_OK) {
+                                        dw9714p_set_position(g_focus_pos);
+                                        g_focus_present = true;
+                                    } else {
+                                        *v = false;  // revert toggle
+                                        SHOW_BANNER("DW9714P not detected");
+                                    }
+                                } else {
+                                    g_focus_present = false;
+                                    g_focus_dir     = 0;
+                                }
+                            }
+                            if (*v != prev) {
+                                config_save(&g_cfg);
+                            }
+                        }
                         break;
 
                     case BSP_INPUT_NAVIGATION_KEY_F1:
@@ -534,7 +661,32 @@ void app_main(void) {
                 }
             }
             if (event.type == INPUT_EVENT_TYPE_KEYBOARD && event.args_keyboard.ascii == ' ') {
-                space_pending = true;
+                if (mode == MODE_CONFIG) {
+                    // SPACE toggles the selected config item (mirrors RETURN).
+                    if (CFG_ITEM_COUNT > 0) {
+                        bool *v    = g_cfg_items[g_cfg_sel].value;
+                        bool  prev = *v;
+                        *v         = !prev;
+                        if (v == &g_cfg.focus_enabled) {
+                            if (*v) {
+                                if (dw9714p_probe() == ESP_OK &&
+                                    dw9714p_init()  == ESP_OK) {
+                                    dw9714p_set_position(g_focus_pos);
+                                    g_focus_present = true;
+                                } else {
+                                    *v = false;
+                                    SHOW_BANNER("DW9714P not detected");
+                                }
+                            } else {
+                                g_focus_present = false;
+                                g_focus_dir     = 0;
+                            }
+                        }
+                        if (*v != prev) config_save(&g_cfg);
+                    }
+                } else {
+                    space_pending = true;
+                }
             }
         }
 
@@ -588,6 +740,27 @@ void app_main(void) {
                 fbdraw_blit_rotated(&fb, img_x, img_y,
                                     (const uint16_t *)viewer_get_pixels(),
                                     viewer_get_width(), viewer_get_height());
+            } else if (mode == MODE_CONFIG) {
+                // Blank the preview area; the menu list is drawn below
+                // the camera-preview branch so we skip that branch here.
+                fbdraw_fill_rect(&fb, 0, 0,
+                                 (int)preview_area_w, (int)preview_area_h, BLACK);
+                int mx = 20;
+                int my = 30;
+                fbdraw_hershey_string(&fb, WHITE, mx, my, "Configuration", 22);
+                my += 36;
+                fbdraw_hershey_string(&fb, WHITE, mx, my,
+                                      "UP/DN select  SPACE toggle", 14);
+                my += 28;
+                for (int i = 0; i < CFG_ITEM_COUNT; ++i) {
+                    char row[64];
+                    snprintf(row, sizeof(row), "%s [%c] %s",
+                             (i == g_cfg_sel) ? ">" : " ",
+                             *g_cfg_items[i].value ? 'x' : ' ',
+                             g_cfg_items[i].label);
+                    fbdraw_hershey_string(&fb, WHITE, mx, my, row, 18);
+                    my += 26;
+                }
             } else if (mode != MODE_VIEW) {
                 // camera_pipeline's PPA produced a 16:9 preview letterboxed
                 // into the 5:4 (600x480) preview area. The PPA output is
@@ -621,6 +794,27 @@ void app_main(void) {
             }
             t_after_image = esp_timer_get_time();
 
+            // Focus stepping. A full sweep across 0..1023 takes ~4 s,
+            // i.e. 256 steps/s ≈ 3906 µs per step. We scale steps by
+            // the elapsed wall time since the last step so a slow
+            // frame loop doesn't make the scan feel jittery.
+            if (g_focus_dir != 0 && g_cfg.focus_enabled && g_focus_present &&
+                mode != MODE_VIEW && mode != MODE_CONFIG) {
+                int64_t now  = esp_timer_get_time();
+                int64_t dt   = now - g_focus_last_us;
+                int     step = (int)((dt * 256) / 1000000);
+                if (step > 0) {
+                    int32_t np = (int32_t)g_focus_pos + g_focus_dir * step;
+                    if (np < (int32_t)DW9714P_POS_MIN) np = DW9714P_POS_MIN;
+                    if (np > (int32_t)DW9714P_POS_MAX) np = DW9714P_POS_MAX;
+                    if ((uint16_t)np != g_focus_pos) {
+                        g_focus_pos = (uint16_t)np;
+                        dw9714p_set_position(g_focus_pos);
+                    }
+                    g_focus_last_us = now;
+                }
+            }
+
             // HUD strip on the right. All coordinates are in the 200-pixel
             // wide user-space strip starting at hud_area_x.
             const int hud_pad_x = (int)hud_area_x + 10;
@@ -637,6 +831,7 @@ void app_main(void) {
             fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F1 view",  hud_font); hud_y += hud_line;
             fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F2 photo", hud_font); hud_y += hud_line;
             fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F3 video", hud_font); hud_y += hud_line;
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F4 Config", hud_font); hud_y += hud_line;
             fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "Esc exit", hud_font); hud_y += hud_line + 6;
 
             // Mode-specific hint and state.
@@ -675,6 +870,24 @@ void app_main(void) {
                         hud_y += hud_line;
                     }
                     break;
+                case MODE_CONFIG:
+                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "UP/DN sel",   hud_font); hud_y += hud_line;
+                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE tog",   hud_font); hud_y += hud_line;
+                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F4/Esc back", hud_font); hud_y += hud_line;
+                    break;
+            }
+
+            // Focus readout — visible whenever the chip is present and
+            // we're not in the config menu (the menu already shows the
+            // state) or the file viewer.
+            if (g_cfg.focus_enabled && g_focus_present &&
+                mode != MODE_VIEW && mode != MODE_CONFIG) {
+                char fl[16];
+                snprintf(fl, sizeof(fl), "Focus %4u", (unsigned)g_focus_pos);
+                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, fl, hud_font);
+                hud_y += hud_line;
+                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "UP/DN focus", hud_font);
+                hud_y += hud_line;
             }
 
             // Transient banner (e.g. "Saved IMG_xxx.jpg"). Draw it

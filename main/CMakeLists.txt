@@ -13,6 +13,8 @@ idf_component_register(
 		"avi_mux.c"
 		"usb_device.c"
 		"splash.c"
+		"dw9714p.c"
+		"config.c"
 	PRIV_REQUIRES
 		esp_lcd
 		nvs_flash
