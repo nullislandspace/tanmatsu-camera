@@ -18,6 +18,8 @@ idf_component_register(
 		"focus/focus_simulator.c"
 		"focus/autofocus.c"
 		"config.c"
+		"intfs.c"
+		"icons.c"
 	PRIV_REQUIRES
 		esp_lcd
 		nvs_flash
@@ -33,6 +35,8 @@ idf_component_register(
 		badge-bsp
 		esp_h264
 		shine
+		wear_levelling
+		pax-codecs
 	INCLUDE_DIRS
 		"."
 		"focus"

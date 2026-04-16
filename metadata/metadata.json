@@ -25,6 +25,10 @@
                 {
                     "source_file": "tanmatype.jpg",
                     "target_file": "tanmatype.jpg"
+                },
+                {
+                    "source_file": "esc.png",
+                    "target_file": "esc.png"
                 }
             ]
         }

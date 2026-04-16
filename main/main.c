@@ -27,6 +27,8 @@
 #include "focus/focus_driver.h"
 #include "fbdraw.h"
 #include "photo.h"
+#include "icons.h"
+#include "intfs.h"
 #include "sdcard.h"
 #include "splash.h"
 #include "usb_device.h"
@@ -458,6 +460,11 @@ void app_main(void) {
         return;
     }
 
+    // Mount the wear-levelled internal FAT partition (/int) — the
+    // launcher stores HUD icons and other shared assets there. Failure
+    // is non-fatal; icons_load() falls back to text labels.
+    intfs_init();
+
     // Mount the SD card and create the DCIM folder.
     splash(WHITE, BLACK, "Camera", "Mounting SD card...");
     res = sdcard_init();
@@ -475,6 +482,12 @@ void app_main(void) {
         return;
     }
     ESP_LOGI(TAG, "%s ready", DCIM_PATH);
+
+    // Load function-key icons. Both /sd and /int are now mounted, so
+    // the ESC override under /sd/apps/at.cavac.tanmatype/ wins over
+    // the launcher default at /int/icons/. Best effort — missing PNGs
+    // are tolerated and the HUD draws "F1" / "Esc" text instead.
+    icons_load();
 
     // Load /sd/camera.cfg. Missing file is non-fatal — config_load
     // seeds defaults and writes a template for the user. If the focus
@@ -928,12 +941,38 @@ void app_main(void) {
                                   mode_name(mode), 20);
             hud_y += 28;
 
-            // Key hint lines.
-            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F1 view",  hud_font); hud_y += hud_line;
-            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F2 photo", hud_font); hud_y += hud_line;
-            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F3 video", hud_font); hud_y += hud_line;
-            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F4 Config", hud_font); hud_y += hud_line;
-            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "Esc exit", hud_font); hud_y += hud_line + 6;
+            // Key hint lines: 32x32 colour icon + label, with the
+            // text fallback ("F1", etc.) used when the launcher icon
+            // PNGs aren't installed yet.
+            #define KEY_ROW_H    32
+            #define KEY_ICON_GAP 6
+            #define KEY_TEXT_DY  ((KEY_ROW_H - hud_font) / 2)
+            const struct {
+                icon_key_t  icon;
+                const char *fallback;
+                const char *label;
+            } krows[] = {
+                { ICON_F1,  "F1",  "view"   },
+                { ICON_F2,  "F2",  "photo"  },
+                { ICON_F3,  "F3",  "video"  },
+                { ICON_F4,  "F4",  "Config" },
+                { ICON_ESC, "Esc", "exit"   },
+            };
+            for (size_t k = 0; k < sizeof(krows) / sizeof(krows[0]); k++) {
+                int label_x = hud_pad_x;
+                if (icons_get(krows[k].icon)) {
+                    icons_blit(&fb, krows[k].icon, hud_pad_x, hud_y);
+                    label_x = hud_pad_x + icons_width(krows[k].icon) + KEY_ICON_GAP;
+                } else {
+                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y + KEY_TEXT_DY,
+                                          krows[k].fallback, hud_font);
+                    label_x = hud_pad_x + 36;
+                }
+                fbdraw_hershey_string(&fb, WHITE, label_x, hud_y + KEY_TEXT_DY,
+                                      krows[k].label, hud_font);
+                hud_y += KEY_ROW_H + 2;
+            }
+            hud_y += 4;
 
             // Mode-specific hint and state.
             switch (mode) {
