@@ -1,5 +1,7 @@
 #include "camera_pipeline.h"
 
+#include "focus/autofocus.h"
+
 #include <inttypes.h>
 #include <math.h>
 #include <string.h>
@@ -424,6 +426,12 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
     }
     ESP_ERROR_CHECK(esp_isp_enable(s_isp));
 
+    // Hardware autofocus statistics tap. Failure is non-fatal — the
+    // preview pipeline still works without AF.
+    if (autofocus_init(s_isp, s_src_w, s_src_h) != ESP_OK) {
+        ESP_LOGW(TAG, "autofocus_init failed, AF disabled");
+    }
+
     ppa_client_config_t ppa_cfg = {
         .oper_type             = PPA_OPERATION_SRM,
         .max_pending_trans_num = 1,
@@ -528,6 +536,7 @@ void camera_preview_stop(void) {
         s_ppa = NULL;
     }
     if (s_isp) {
+        autofocus_shutdown();
         esp_isp_disable(s_isp);
         esp_isp_del_processor(s_isp);
         s_isp = NULL;

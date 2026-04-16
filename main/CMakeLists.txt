@@ -13,7 +13,10 @@ idf_component_register(
 		"avi_mux.c"
 		"usb_device.c"
 		"splash.c"
-		"dw9714p.c"
+		"focus/dw9714p.c"
+		"focus/focus_driver.c"
+		"focus/focus_simulator.c"
+		"focus/autofocus.c"
 		"config.c"
 	PRIV_REQUIRES
 		esp_lcd
@@ -32,6 +35,7 @@ idf_component_register(
 		shine
 	INCLUDE_DIRS
 		"."
+		"focus"
 )
 
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=unused-variable" APPEND)

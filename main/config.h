@@ -7,15 +7,26 @@
 // and editable by the user on any PC — just pull the SD card and open
 // the file. Format is `key=value` per line, `#` introduces a comment.
 //
-// Default for every option is OFF / conservative so the out-of-the-box
-// experience on stock hardware is unchanged.
+// Schema (see config.c for the file header that gets seeded):
+//   focus_driver=<name>     name of the focus driver to use; one of
+//                            the entries in focus_driver_registry[].
+//                            "simulator" by default — simulator is
+//                            always present so the focus + autofocus
+//                            UI is testable on stock hardware.
+//   focus_enabled=<0|1>     master enable for the focus subsystem.
+//                            When 1 the boot path activates the
+//                            chosen driver; when 0 nothing happens.
+//   autofocus_enabled=<0|1> enable the hardware AF state machine.
+//                            Ignored unless focus_enabled=1 *and*
+//                            the driver actually probes successfully.
 
-#define CONFIG_PATH "/sd/camera.cfg"
+#define CONFIG_PATH                 "/sd/camera.cfg"
+#define CONFIG_FOCUS_DRIVER_MAXLEN  16
 
 typedef struct {
-    // Enable DW9714P manual focus controls (UP/DOWN scan + HUD readout).
-    // Most users don't have this chip — default false.
+    char focus_driver[CONFIG_FOCUS_DRIVER_MAXLEN];
     bool focus_enabled;
+    bool autofocus_enabled;
 } camera_config_t;
 
 // Populate *out with defaults, then overlay any values found in

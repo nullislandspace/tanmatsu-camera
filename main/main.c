@@ -23,7 +23,8 @@
 #include "camera_pipeline.h"
 #include "camera_sensor.h"
 #include "config.h"
-#include "dw9714p.h"
+#include "focus/autofocus.h"
+#include "focus/focus_driver.h"
 #include "fbdraw.h"
 #include "photo.h"
 #include "sdcard.h"
@@ -79,28 +80,114 @@ static const char *mode_name(app_mode_t m) {
     return "?";
 }
 
-// Focus (DW9714P) runtime state. Position is session-only — each
-// boot starts at mid-range so the user isn't fighting whatever the
-// previous session left the VCM at (e.g. after a lens swap).
+// Focus subsystem runtime state. Position is session-only — each boot
+// starts at mid-range so the user isn't fighting whatever the previous
+// session left the VCM at (e.g. after a lens swap). The driver itself
+// (real chip vs. simulator vs. off) is selected via the config menu;
+// see focus_driver.h.
 static camera_config_t g_cfg           = {0};
-static bool            g_focus_present = false;  // chip ACKed on boot / toggle-on
-static uint16_t        g_focus_pos     = DW9714P_POS_MID;
-static int             g_focus_dir     = 0;       // -1, 0, +1
+static bool            g_focus_present = false;  // active driver probed OK
+static uint16_t        g_focus_pos     = 512;
+static int             g_focus_dir     = 0;      // -1, 0, +1
 static int64_t         g_focus_last_us = 0;
 
-// Config menu items. One entry per toggleable boolean; extend here
-// when adding more settings. The loop in the MODE_CONFIG handler
-// draws and drives this table directly.
+// Config menu items. Tagged struct so a single table can hold both
+// boolean checkboxes and a string-cycler for the focus driver name.
+typedef enum {
+    CFG_KIND_BOOL,
+    CFG_KIND_DRIVER,
+} cfg_kind_t;
+
 typedef struct {
     const char *label;
-    bool       *value;
+    cfg_kind_t  kind;
+    void       *target;  // bool* (BOOL) or char[] (DRIVER)
 } cfg_item_t;
 
 static cfg_item_t g_cfg_items[] = {
-    { "DW9714P focus", &g_cfg.focus_enabled },
+    { "Driver",    CFG_KIND_DRIVER, g_cfg.focus_driver       },
+    { "Focus",     CFG_KIND_BOOL,   &g_cfg.focus_enabled     },
+    { "Autofocus", CFG_KIND_BOOL,   &g_cfg.autofocus_enabled },
 };
 #define CFG_ITEM_COUNT ((int)(sizeof(g_cfg_items) / sizeof(g_cfg_items[0])))
 static int g_cfg_sel = 0;
+
+// Item is selectable / can be toggled? Autofocus is greyed out unless
+// a focus driver is currently active (Focus on + chip probed OK).
+static bool cfg_item_enabled(const cfg_item_t *it) {
+    if (it->target == &g_cfg.autofocus_enabled) return g_focus_present;
+    return true;
+}
+
+typedef enum {
+    CFG_ACT_NOOP,           // disabled row, nothing happened
+    CFG_ACT_CHANGED,        // value changed; please save
+    CFG_ACT_PROBE_FAILED,   // driver probe rejected; show banner
+} cfg_act_result_t;
+
+// RETURN/SPACE on a config row. Bool rows toggle, the driver row
+// cycles to the next entry in focus_driver_registry[].
+static cfg_act_result_t cfg_item_activate(int idx) {
+    cfg_item_t *it = &g_cfg_items[idx];
+    if (!cfg_item_enabled(it)) return CFG_ACT_NOOP;
+
+    if (it->kind == CFG_KIND_DRIVER) {
+        char *target = (char *)it->target;
+        const focus_driver_t *cur = focus_driver_by_name(target);
+        int n = focus_driver_count();
+        int cur_idx = -1;
+        for (int i = 0; i < n; i++) {
+            if (focus_driver_by_index(i) == cur) { cur_idx = i; break; }
+        }
+        const focus_driver_t *next = focus_driver_by_index((cur_idx + 1) % n);
+
+        // Cycling the driver always force-disables Focus + Autofocus
+        // so the user has to explicitly opt in to the new chip. This
+        // sidesteps the messy "what if the new driver fails to probe
+        // mid-swap" path entirely — toggling Focus back on does a
+        // clean probe and a clear banner if the new driver isn't
+        // there.
+        if (g_cfg.focus_enabled || g_focus_present) {
+            focus_select("");
+            g_cfg.focus_enabled     = false;
+            g_focus_present         = false;
+            g_focus_dir             = 0;
+            g_cfg.autofocus_enabled = false;
+            autofocus_set_enabled(false);
+        }
+        strncpy(target, next->name, CONFIG_FOCUS_DRIVER_MAXLEN - 1);
+        target[CONFIG_FOCUS_DRIVER_MAXLEN - 1] = '\0';
+        return CFG_ACT_CHANGED;
+    }
+
+    // CFG_KIND_BOOL
+    bool *v    = (bool *)it->target;
+    bool  prev = *v;
+    *v         = !prev;
+
+    if (v == &g_cfg.focus_enabled) {
+        if (*v) {
+            if (focus_select(g_cfg.focus_driver) == ESP_OK) {
+                g_focus_pos     = focus_active()->pos_default;
+                g_focus_present = true;
+            } else {
+                *v = false;  // revert
+                return CFG_ACT_PROBE_FAILED;
+            }
+        } else {
+            focus_select("");
+            g_focus_present         = false;
+            g_focus_dir             = 0;
+            // Force autofocus off too — keeps persisted state consistent.
+            g_cfg.autofocus_enabled = false;
+            autofocus_set_enabled(false);
+        }
+    } else if (v == &g_cfg.autofocus_enabled) {
+        autofocus_set_enabled(g_focus_present && *v);
+    }
+
+    return (*v != prev) ? CFG_ACT_CHANGED : CFG_ACT_NOOP;
+}
 
 static char const TAG[] = "main";
 
@@ -116,8 +203,11 @@ static QueueHandle_t                input_event_queue    = NULL;
 #define BLACK       FBDRAW_BLACK
 #define WHITE       FBDRAW_WHITE
 #define RED         FBDRAW_RED
+#define YELLOW      fbdraw_rgb(255, 220, 0)
 #define HUD_BG      fbdraw_rgb(32, 32, 32)    // dark grey strip behind HUD text
+#define HUD_SEP     fbdraw_rgb(96, 96, 96)    // divider line in HUD
 #define BANNER_BG   fbdraw_rgb(0, 0, 128)     // dark blue banner strip
+#define MENU_HL_BG  fbdraw_rgb(64, 64, 0)     // dark yellow highlight in menu
 
 // Non-blocking display blit. We bypass bsp_display_blit() and manage
 // the DMA-done semaphore ourselves so we can skip frames when the
@@ -387,19 +477,21 @@ void app_main(void) {
     ESP_LOGI(TAG, "%s ready", DCIM_PATH);
 
     // Load /sd/camera.cfg. Missing file is non-fatal — config_load
-    // seeds defaults and writes a template for the user. If the
-    // DW9714P focus option is enabled, probe the chip now so we can
-    // (a) apply the mid-range starting position and (b) warn via
+    // seeds defaults and writes a template for the user. If the focus
+    // subsystem is enabled, activate the configured driver now so we
+    // can (a) apply the mid-range starting position and (b) warn via
     // banner if the module isn't actually attached.
     config_load(&g_cfg);
     bool show_focus_missing_banner = false;
     if (g_cfg.focus_enabled) {
-        if (dw9714p_probe() == ESP_OK && dw9714p_init() == ESP_OK) {
-            dw9714p_set_position(g_focus_pos);
+        if (focus_select(g_cfg.focus_driver) == ESP_OK) {
+            g_focus_pos     = focus_active()->pos_default;
             g_focus_present = true;
-            ESP_LOGI(TAG, "DW9714P ready, focus=%u", g_focus_pos);
+            ESP_LOGI(TAG, "focus driver '%s' ready, pos=%u",
+                     focus_active_name(), g_focus_pos);
         } else {
-            ESP_LOGW(TAG, "DW9714P enabled in config but not detected");
+            ESP_LOGW(TAG, "focus driver '%s' enabled in config but not detected",
+                     g_cfg.focus_driver);
             show_focus_missing_banner = true;
         }
     }
@@ -483,9 +575,14 @@ void app_main(void) {
     TickType_t banner_until    = 0;
 
     if (show_focus_missing_banner) {
-        snprintf(banner_text, sizeof(banner_text), "DW9714P not detected");
+        snprintf(banner_text, sizeof(banner_text), "%s not detected",
+                 g_cfg.focus_driver);
         banner_until = xTaskGetTickCount() + pdMS_TO_TICKS(3500);
     }
+
+    // Apply autofocus enable to match the loaded config now that we
+    // know whether the driver is actually present.
+    autofocus_set_enabled(g_focus_present && g_cfg.autofocus_enabled);
 
     // Tracks which mode the user was in before opening the config
     // menu so F4/ESC returns them there. Only meaningful when
@@ -518,15 +615,20 @@ void app_main(void) {
                             g_cfg_sel = (g_cfg_sel + 1) % CFG_ITEM_COUNT;
                         }
                     }
-                } else if (g_cfg.focus_enabled && g_focus_present &&
-                           mode != MODE_VIEW) {
+                } else if (g_focus_present && mode != MODE_VIEW) {
                     int dir = (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_UP)
                                 ? +1 : -1;
                     if (event.args_navigation.state) {
                         g_focus_dir     = dir;
                         g_focus_last_us = esp_timer_get_time();
+                        if (g_cfg.autofocus_enabled) {
+                            autofocus_set_manual_override(true);
+                        }
                     } else if (g_focus_dir == dir) {
                         g_focus_dir = 0;
+                        if (g_cfg.autofocus_enabled) {
+                            autofocus_set_manual_override(false);
+                        }
                     }
                 }
                 continue;
@@ -559,29 +661,11 @@ void app_main(void) {
 
                     case BSP_INPUT_NAVIGATION_KEY_RETURN:
                         if (mode == MODE_CONFIG && CFG_ITEM_COUNT > 0) {
-                            bool *v    = g_cfg_items[g_cfg_sel].value;
-                            bool  prev = *v;
-                            *v         = !prev;
-
-                            // Side effect for focus_enabled: verify the
-                            // chip is actually there before we commit.
-                            if (v == &g_cfg.focus_enabled) {
-                                if (*v) {
-                                    if (dw9714p_probe() == ESP_OK &&
-                                        dw9714p_init()  == ESP_OK) {
-                                        dw9714p_set_position(g_focus_pos);
-                                        g_focus_present = true;
-                                    } else {
-                                        *v = false;  // revert toggle
-                                        SHOW_BANNER("DW9714P not detected");
-                                    }
-                                } else {
-                                    g_focus_present = false;
-                                    g_focus_dir     = 0;
-                                }
-                            }
-                            if (*v != prev) {
+                            cfg_act_result_t r = cfg_item_activate(g_cfg_sel);
+                            if (r == CFG_ACT_CHANGED) {
                                 config_save(&g_cfg);
+                            } else if (r == CFG_ACT_PROBE_FAILED) {
+                                SHOW_BANNER("%s not detected", g_cfg.focus_driver);
                             }
                         }
                         break;
@@ -662,27 +746,13 @@ void app_main(void) {
             }
             if (event.type == INPUT_EVENT_TYPE_KEYBOARD && event.args_keyboard.ascii == ' ') {
                 if (mode == MODE_CONFIG) {
-                    // SPACE toggles the selected config item (mirrors RETURN).
                     if (CFG_ITEM_COUNT > 0) {
-                        bool *v    = g_cfg_items[g_cfg_sel].value;
-                        bool  prev = *v;
-                        *v         = !prev;
-                        if (v == &g_cfg.focus_enabled) {
-                            if (*v) {
-                                if (dw9714p_probe() == ESP_OK &&
-                                    dw9714p_init()  == ESP_OK) {
-                                    dw9714p_set_position(g_focus_pos);
-                                    g_focus_present = true;
-                                } else {
-                                    *v = false;
-                                    SHOW_BANNER("DW9714P not detected");
-                                }
-                            } else {
-                                g_focus_present = false;
-                                g_focus_dir     = 0;
-                            }
+                        cfg_act_result_t r = cfg_item_activate(g_cfg_sel);
+                        if (r == CFG_ACT_CHANGED) {
+                            config_save(&g_cfg);
+                        } else if (r == CFG_ACT_PROBE_FAILED) {
+                            SHOW_BANNER("%s not detected", g_cfg.focus_driver);
                         }
-                        if (*v != prev) config_save(&g_cfg);
                     }
                 } else {
                     space_pending = true;
@@ -750,16 +820,37 @@ void app_main(void) {
                 fbdraw_hershey_string(&fb, WHITE, mx, my, "Configuration", 22);
                 my += 36;
                 fbdraw_hershey_string(&fb, WHITE, mx, my,
-                                      "UP/DN select  SPACE toggle", 14);
+                                      "UP/DN select  SPACE toggle/cycle", 14);
                 my += 28;
+                const uint16_t DIM     = fbdraw_rgb(96, 96, 96);
+                const int      row_h   = 26;
+                const int      row_pad = 4;
                 for (int i = 0; i < CFG_ITEM_COUNT; ++i) {
-                    char row[64];
-                    snprintf(row, sizeof(row), "%s [%c] %s",
-                             (i == g_cfg_sel) ? ">" : " ",
-                             *g_cfg_items[i].value ? 'x' : ' ',
-                             g_cfg_items[i].label);
-                    fbdraw_hershey_string(&fb, WHITE, mx, my, row, 18);
-                    my += 26;
+                    const cfg_item_t *it    = &g_cfg_items[i];
+                    bool              avail = cfg_item_enabled(it);
+                    bool              sel   = (i == g_cfg_sel);
+                    uint16_t          col   = sel  ? (avail ? YELLOW : DIM)
+                                                   : (avail ? WHITE  : DIM);
+                    if (sel) {
+                        fbdraw_fill_rect(&fb, mx - row_pad, my - row_pad,
+                                         (int)preview_area_w - 2 * (mx - row_pad),
+                                         row_h, MENU_HL_BG);
+                    }
+                    char row[80];
+                    if (it->kind == CFG_KIND_DRIVER) {
+                        const focus_driver_t *drv =
+                            focus_driver_by_name((const char *)it->target);
+                        const char *shown = drv ? drv->display_name : "???";
+                        snprintf(row, sizeof(row), "%-9s < %s >",
+                                 it->label, shown);
+                    } else {
+                        bool v = *(bool *)it->target;
+                        snprintf(row, sizeof(row), "[%c] %s%s",
+                                 v ? 'x' : ' ', it->label,
+                                 avail ? "" : " (needs Focus)");
+                    }
+                    fbdraw_hershey_string(&fb, col, mx, my, row, 18);
+                    my += row_h;
                 }
             } else if (mode != MODE_VIEW) {
                 // camera_pipeline's PPA produced a 16:9 preview letterboxed
@@ -794,25 +885,35 @@ void app_main(void) {
             }
             t_after_image = esp_timer_get_time();
 
-            // Focus stepping. A full sweep across 0..1023 takes ~4 s,
-            // i.e. 256 steps/s ≈ 3906 µs per step. We scale steps by
-            // the elapsed wall time since the last step so a slow
-            // frame loop doesn't make the scan feel jittery.
-            if (g_focus_dir != 0 && g_cfg.focus_enabled && g_focus_present &&
+            // Manual focus stepping. A full sweep across the driver's
+            // range takes ~4 s, i.e. 256 steps/s ≈ 3906 µs per step.
+            // We scale steps by the elapsed wall time since the last
+            // step so a slow frame loop doesn't make the scan feel
+            // jittery.
+            const focus_driver_t *fd = focus_active();
+            if (g_focus_dir != 0 && g_focus_present && fd &&
                 mode != MODE_VIEW && mode != MODE_CONFIG) {
                 int64_t now  = esp_timer_get_time();
                 int64_t dt   = now - g_focus_last_us;
                 int     step = (int)((dt * 256) / 1000000);
                 if (step > 0) {
                     int32_t np = (int32_t)g_focus_pos + g_focus_dir * step;
-                    if (np < (int32_t)DW9714P_POS_MIN) np = DW9714P_POS_MIN;
-                    if (np > (int32_t)DW9714P_POS_MAX) np = DW9714P_POS_MAX;
+                    if (np < (int32_t)fd->pos_min) np = fd->pos_min;
+                    if (np > (int32_t)fd->pos_max) np = fd->pos_max;
                     if ((uint16_t)np != g_focus_pos) {
                         g_focus_pos = (uint16_t)np;
-                        dw9714p_set_position(g_focus_pos);
+                        focus_set_position(g_focus_pos);
                     }
                     g_focus_last_us = now;
                 }
+            }
+
+            // Hardware autofocus tick. Skipped entirely when AF is
+            // disabled (autofocus_tick is a no-op in that case, but
+            // the explicit gate keeps the cost obvious here).
+            if (g_focus_present && g_cfg.autofocus_enabled &&
+                mode != MODE_VIEW && mode != MODE_CONFIG) {
+                autofocus_tick(&g_focus_pos);
             }
 
             // HUD strip on the right. All coordinates are in the 200-pixel
@@ -877,16 +978,43 @@ void app_main(void) {
                     break;
             }
 
-            // Focus readout — visible whenever the chip is present and
-            // we're not in the config menu (the menu already shows the
-            // state) or the file viewer.
-            if (g_cfg.focus_enabled && g_focus_present &&
+            // Focus readout — visible whenever a focus driver is
+            // active and we're not in the config menu (the menu shows
+            // the state already) or the file viewer. Drawn as its own
+            // block separated from the interaction hints above by a
+            // gap and a thin divider line so it reads as a state
+            // panel rather than another keybinding.
+            if (g_focus_present &&
                 mode != MODE_VIEW && mode != MODE_CONFIG) {
+                hud_y += 14;  // gap above the focus block
+                fbdraw_fill_rect(&fb, hud_pad_x, hud_y,
+                                 (int)hud_area_w - 20, 1, HUD_SEP);
+                hud_y += 8;
+
                 char fl[16];
                 snprintf(fl, sizeof(fl), "Focus %4u", (unsigned)g_focus_pos);
                 fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, fl, hud_font);
                 hud_y += hud_line;
-                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "UP/DN focus", hud_font);
+
+                const char *af_msg = "AF: none";
+                if (g_cfg.autofocus_enabled) {
+                    switch (autofocus_hud_state()) {
+                        case AF_HUD_SEARCH:   af_msg = "AF: searching"; break;
+                        case AF_HUD_LOCK:     af_msg = "AF: locked";    break;
+                        case AF_HUD_OVERRIDE: af_msg = "AF: manual";    break;
+                        default:              af_msg = "AF: off";       break;
+                    }
+                }
+                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, af_msg, hud_font);
+                hud_y += hud_line;
+
+                char dl[24];
+                snprintf(dl, sizeof(dl), "DRV: %s", focus_active_name());
+                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, dl, hud_font);
+                hud_y += hud_line;
+
+                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
+                                      "UP/DN focus", hud_font);
                 hud_y += hud_line;
             }
 
