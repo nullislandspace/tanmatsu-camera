@@ -19,6 +19,11 @@
 //   autofocus_enabled=<0|1> enable the hardware AF state machine.
 //                            Ignored unless focus_enabled=1 *and*
 //                            the driver actually probes successfully.
+//   rotate_180=<0|1>        flip the camera image 180° (preview AND
+//                            saved photos/videos). Use when the
+//                            sensor is physically mounted upside
+//                            down. Does NOT affect viewing of
+//                            already-saved photos.
 
 #define CONFIG_PATH                 "/sd/camera.cfg"
 #define CONFIG_FOCUS_DRIVER_MAXLEN  16
@@ -27,6 +32,7 @@ typedef struct {
     char focus_driver[CONFIG_FOCUS_DRIVER_MAXLEN];
     bool focus_enabled;
     bool autofocus_enabled;
+    bool rotate_180;
 } camera_config_t;
 
 // Populate *out with defaults, then overlay any values found in

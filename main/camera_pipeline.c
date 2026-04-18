@@ -49,8 +49,21 @@ static uint32_t s_src_lane_rate = 0;
 // rotate in the opposite sense to the fbdraw CCW3 panel transform
 // derived from pax_orientation.c.
 #define PREVIEW_PPA_ROTATION   PPA_SRM_ROTATION_ANGLE_270
-#define PREVIEW_PPA_MIRROR_X   true
-#define PREVIEW_PPA_MIRROR_Y   true
+
+// PPA mirror flags applied to preview, photo and video paths. Default
+// (true, true) corrects the OV5647's natural orientation so the user
+// sees a correct landscape image. Toggling both to (false, false)
+// adds a 180° rotation — used when the sensor module is physically
+// mounted upside down (settings menu "Rotate 180°"). Read every
+// frame in the render task / capture path, so updates take effect
+// on the next frame without a pipeline restart.
+static bool s_mirror_x = true;
+static bool s_mirror_y = true;
+
+void camera_pipeline_set_rotate_180(bool on) {
+    s_mirror_x = !on;
+    s_mirror_y = !on;
+}
 
 static esp_cam_ctlr_handle_t s_csi      = NULL;
 static isp_proc_handle_t     s_isp      = NULL;
@@ -246,8 +259,8 @@ static void render_task(void *arg) {
             // Sensor feed is vertically flipped AND left/right mirrored
             // relative to how the user expects to see it on the display.
             // Both flips are free on the PPA.
-            .mirror_x       = PREVIEW_PPA_MIRROR_X,
-            .mirror_y       = PREVIEW_PPA_MIRROR_Y,
+            .mirror_x       = s_mirror_x,
+            .mirror_y       = s_mirror_y,
             .rgb_swap       = false,
             .byte_swap      = false,
             .mode           = PPA_TRANS_MODE_NON_BLOCKING,
@@ -682,8 +695,8 @@ esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w, uint32_t *ou
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,   // landscape, don't rotate
         .scale_x        = 1.0f,                       // 1:1
         .scale_y        = 1.0f,
-        .mirror_x       = PREVIEW_PPA_MIRROR_X,
-        .mirror_y       = PREVIEW_PPA_MIRROR_Y,
+        .mirror_x       = s_mirror_x,
+        .mirror_y       = s_mirror_y,
         .rgb_swap       = false,
         .byte_swap      = false,
         .mode           = PPA_TRANS_MODE_NON_BLOCKING,
@@ -802,8 +815,8 @@ esp_err_t camera_video_snapshot(uint8_t  *out_buf,
         .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
         .scale_x        = scale,
         .scale_y        = scale,
-        .mirror_x       = PREVIEW_PPA_MIRROR_X,
-        .mirror_y       = PREVIEW_PPA_MIRROR_Y,
+        .mirror_x       = s_mirror_x,
+        .mirror_y       = s_mirror_y,
         .rgb_swap       = false,
         .byte_swap      = false,
         .mode           = PPA_TRANS_MODE_NON_BLOCKING,

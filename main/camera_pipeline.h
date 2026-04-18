@@ -45,6 +45,14 @@ esp_err_t camera_preview_start(const camera_source_t *src,
 // Tear down the pipeline and free all buffers.
 void camera_preview_stop(void);
 
+// Toggle a 180° rotation applied to all live capture paths (preview,
+// photo, video). Default false. Implemented as a pair of mirror_x /
+// mirror_y flips on the PPA, so it costs nothing at runtime. Takes
+// effect on the next frame; no pipeline restart needed. Saved photos
+// in the viewer are unaffected — they were captured with whatever
+// setting was active at the time of capture.
+void camera_pipeline_set_rotate_180(bool on);
+
 // Signal that the main loop has finished consuming the latest preview frame
 // and is ready to accept the next CSI transaction. This replaces the
 // LV_EVENT_REFR_READY hook the old code used.

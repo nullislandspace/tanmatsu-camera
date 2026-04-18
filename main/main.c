@@ -107,9 +107,10 @@ typedef struct {
 } cfg_item_t;
 
 static cfg_item_t g_cfg_items[] = {
-    { "Driver",    CFG_KIND_DRIVER, g_cfg.focus_driver       },
-    { "Focus",     CFG_KIND_BOOL,   &g_cfg.focus_enabled     },
-    { "Autofocus", CFG_KIND_BOOL,   &g_cfg.autofocus_enabled },
+    { "Driver",     CFG_KIND_DRIVER, g_cfg.focus_driver       },
+    { "Focus",      CFG_KIND_BOOL,   &g_cfg.focus_enabled     },
+    { "Autofocus",  CFG_KIND_BOOL,   &g_cfg.autofocus_enabled },
+    { "Rotate 180", CFG_KIND_BOOL,   &g_cfg.rotate_180        },
 };
 #define CFG_ITEM_COUNT ((int)(sizeof(g_cfg_items) / sizeof(g_cfg_items[0])))
 static int g_cfg_sel = 0;
@@ -186,6 +187,8 @@ static cfg_act_result_t cfg_item_activate(int idx) {
         }
     } else if (v == &g_cfg.autofocus_enabled) {
         autofocus_set_enabled(g_focus_present && *v);
+    } else if (v == &g_cfg.rotate_180) {
+        camera_pipeline_set_rotate_180(*v);
     }
 
     return (*v != prev) ? CFG_ACT_CHANGED : CFG_ACT_NOOP;
@@ -495,6 +498,7 @@ void app_main(void) {
     // can (a) apply the mid-range starting position and (b) warn via
     // banner if the module isn't actually attached.
     config_load(&g_cfg);
+    camera_pipeline_set_rotate_180(g_cfg.rotate_180);
     bool show_focus_missing_banner = false;
     if (g_cfg.focus_enabled) {
         if (focus_select(g_cfg.focus_driver) == ESP_OK) {
