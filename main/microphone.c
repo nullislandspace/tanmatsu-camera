@@ -103,9 +103,10 @@ static const char *TAG = "microphone";
 // energy is concentrated below ~4 kHz and everything above is
 // effectively noise for a handheld voice recorder. Cutoff of ~4 kHz
 // at the mic's 44.8 kHz frame rate: α = 1 - exp(-2π × 4000 / 44800)
-// ≈ 0.430, Q16 encoded = 28180. Gentle -6 dB/oct rolloff (≈ -12 dB
-// at 10 kHz, -18 dB at 20 kHz) — not aggressive enough to muffle
-// sibilants but knocks the HF noise floor down by a factor of 8-10.
+// ≈ 0.430, Q16 encoded = 28180. We cascade the filter twice
+// (see mic_task_fn) for a -12 dB/oct rolloff, which knocks HF noise
+// down by a further ~9 dB at 11 kHz vs a single pole while leaving
+// voice formants (<4 kHz) essentially untouched.
 #define MIC_LPF_ALPHA_Q16  28180u
 
 static i2s_chan_handle_t    s_rx_handle  = NULL;
@@ -164,8 +165,12 @@ static void mic_task_fn(void *arg) {
     // Low-pass filter state — the previous filtered output, so the
     // one-pole IIR y[n] = α·x[n] + (1-α)·y[n-1] survives across
     // blocks. Stored as int32 to keep a little extra headroom for
-    // the Q16 accumulator arithmetic.
-    int32_t  lpf_prev    = 0;
+    // the Q16 accumulator arithmetic. Two stages are cascaded for a
+    // -12 dB/oct rolloff; lpf_prev1 is the first stage's output
+    // (which also feeds the second stage), lpf_prev2 is the second
+    // stage's output.
+    int32_t  lpf_prev1   = 0;
+    int32_t  lpf_prev2   = 0;
 
     while (s_running) {
         size_t got_bytes = 0;
@@ -229,18 +234,26 @@ static void mic_task_fn(void *arg) {
             if (s32 >  INT16_MAX) s32 =  INT16_MAX;
             if (s32 <  INT16_MIN) s32 =  INT16_MIN;
 
-            // One-pole IIR low-pass: lpf_prev is the previous output,
-            // MIC_LPF_ALPHA_Q16 is α in Q16. int64 intermediate avoids
-            // the sign-bit overflow that would occur mixing two int32
-            // products near full scale.
-            int64_t acc =
-                (int64_t)s32            * (int64_t)MIC_LPF_ALPHA_Q16 +
-                (int64_t)lpf_prev       * (int64_t)(65536u - MIC_LPF_ALPHA_Q16);
-            int32_t y = (int32_t)(acc >> 16);
+            // Two-stage cascaded one-pole IIR low-pass: each stage is
+            // y[n] = α·x[n] + (1-α)·y[n-1], MIC_LPF_ALPHA_Q16 is α in
+            // Q16. int64 intermediate avoids the sign-bit overflow
+            // that would occur mixing two int32 products near full
+            // scale. Cascading gives -12 dB/oct rolloff with the same
+            // cutoff as a single pole.
+            uint32_t one_minus_alpha = 65536u - MIC_LPF_ALPHA_Q16;
+            int64_t  acc1 =
+                (int64_t)s32       * (int64_t)MIC_LPF_ALPHA_Q16 +
+                (int64_t)lpf_prev1 * (int64_t)one_minus_alpha;
+            int32_t  y1 = (int32_t)(acc1 >> 16);
+            lpf_prev1   = y1;
+            int64_t  acc2 =
+                (int64_t)y1        * (int64_t)MIC_LPF_ALPHA_Q16 +
+                (int64_t)lpf_prev2 * (int64_t)one_minus_alpha;
+            int32_t  y = (int32_t)(acc2 >> 16);
             if (y >  INT16_MAX) y =  INT16_MAX;
             if (y <  INT16_MIN) y =  INT16_MIN;
-            lpf_prev  = y;
-            int16_t x = (int16_t)y;
+            lpf_prev2   = y;
+            int16_t x   = (int16_t)y;
 
             int32_t v = (x < 0) ? -(int32_t)x : (int32_t)x;
             if ((uint32_t)v > peak) peak = (uint16_t)v;
