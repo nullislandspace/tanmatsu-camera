@@ -32,7 +32,7 @@ L/R tied to GND makes the microphone drive SD during the **left** half of
 the WS frame. In firmware, configure the I2S slot as `MONO_LEFT` (or read
 a stereo stream and take the left channel).
 
-## Stereo wiring (two microphones sharing SD)
+## Stereo wiring (two microphones sharing SD) - NOT SUPPORTED BY CAMERA APP
 
 Both microphones share the clock and data lines — no extra GPIOs are
 needed beyond the mono wiring. Only the L/R strap differs between the

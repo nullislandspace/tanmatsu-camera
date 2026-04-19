@@ -94,25 +94,31 @@ static uint16_t        g_focus_pos     = 512;
 static int             g_focus_dir     = 0;      // -1, 0, +1
 static int64_t         g_focus_last_us = 0;
 
-// Config menu items. Tagged struct so a single table can hold both
-// boolean checkboxes and a string-cycler for the focus driver name.
+// Config menu items. Tagged struct so a single table can hold boolean
+// checkboxes, a string-cycler for the focus driver name, and bounded
+// integer cyclers (e.g. mic gain).
 typedef enum {
     CFG_KIND_BOOL,
     CFG_KIND_DRIVER,
+    CFG_KIND_INT,
 } cfg_kind_t;
 
 typedef struct {
     const char *label;
     cfg_kind_t  kind;
-    void       *target;  // bool* (BOOL) or char[] (DRIVER)
+    void       *target;  // bool* (BOOL) / char[] (DRIVER) / int* (INT)
+    int         imin;    // CFG_KIND_INT only — inclusive lower bound
+    int         imax;    // CFG_KIND_INT only — inclusive upper bound
 } cfg_item_t;
 
 static cfg_item_t g_cfg_items[] = {
-    { "Driver",     CFG_KIND_DRIVER, g_cfg.focus_driver       },
-    { "Focus",      CFG_KIND_BOOL,   &g_cfg.focus_enabled     },
-    { "Autofocus",  CFG_KIND_BOOL,   &g_cfg.autofocus_enabled },
-    { "Rotate 180", CFG_KIND_BOOL,   &g_cfg.rotate_180        },
-    { "Microphone", CFG_KIND_BOOL,   &g_cfg.mic_enabled       },
+    { "Driver",     CFG_KIND_DRIVER, g_cfg.focus_driver,       0, 0 },
+    { "Focus",      CFG_KIND_BOOL,   &g_cfg.focus_enabled,     0, 0 },
+    { "Autofocus",  CFG_KIND_BOOL,   &g_cfg.autofocus_enabled, 0, 0 },
+    { "Rotate 180", CFG_KIND_BOOL,   &g_cfg.rotate_180,        0, 0 },
+    { "Microphone", CFG_KIND_BOOL,   &g_cfg.mic_enabled,       0, 0 },
+    { "Mic Gain",   CFG_KIND_INT,    &g_cfg.mic_gain,
+                    CONFIG_MIC_GAIN_MIN, CONFIG_MIC_GAIN_MAX },
 };
 #define CFG_ITEM_COUNT ((int)(sizeof(g_cfg_items) / sizeof(g_cfg_items[0])))
 static int g_cfg_sel = 0;
@@ -163,6 +169,18 @@ static cfg_act_result_t cfg_item_activate(int idx) {
         strncpy(target, next->name, CONFIG_FOCUS_DRIVER_MAXLEN - 1);
         target[CONFIG_FOCUS_DRIVER_MAXLEN - 1] = '\0';
         return CFG_ACT_CHANGED;
+    }
+
+    if (it->kind == CFG_KIND_INT) {
+        int *iv   = (int *)it->target;
+        int  prev = *iv;
+        int  next = prev + 1;
+        if (next > it->imax) next = it->imin;  // wrap
+        *iv = next;
+        if (iv == &g_cfg.mic_gain) {
+            microphone_set_gain(*iv);
+        }
+        return (*iv != prev) ? CFG_ACT_CHANGED : CFG_ACT_NOOP;
     }
 
     // CFG_KIND_BOOL
@@ -501,6 +519,7 @@ void app_main(void) {
     // banner if the module isn't actually attached.
     config_load(&g_cfg);
     camera_pipeline_set_rotate_180(g_cfg.rotate_180);
+    microphone_set_gain(g_cfg.mic_gain);
     bool show_focus_missing_banner = false;
     if (g_cfg.focus_enabled) {
         if (focus_select(g_cfg.focus_driver) == ESP_OK) {
@@ -784,6 +803,28 @@ void app_main(void) {
                         mode = MODE_VIDEO;
                         break;
 
+                    case BSP_INPUT_NAVIGATION_KEY_VOLUME_UP:
+                    case BSP_INPUT_NAVIGATION_KEY_VOLUME_DOWN:
+                        // Live mic-gain trim in video mode (preview +
+                        // recording). Clamp to the configured range,
+                        // push the new value into the mic task, and
+                        // persist to /sd/camera.cfg so the next boot
+                        // starts at the user's preferred level.
+                        if (mode == MODE_VIDEO) {
+                            int delta = (event.args_navigation.key ==
+                                         BSP_INPUT_NAVIGATION_KEY_VOLUME_UP)
+                                            ? +1 : -1;
+                            int newg  = g_cfg.mic_gain + delta;
+                            if (newg < CONFIG_MIC_GAIN_MIN) newg = CONFIG_MIC_GAIN_MIN;
+                            if (newg > CONFIG_MIC_GAIN_MAX) newg = CONFIG_MIC_GAIN_MAX;
+                            if (newg != g_cfg.mic_gain) {
+                                g_cfg.mic_gain = newg;
+                                microphone_set_gain(newg);
+                                config_save(&g_cfg);
+                            }
+                        }
+                        break;
+
                     case BSP_INPUT_NAVIGATION_KEY_LEFT:
                         if (mode == MODE_VIEW) {
                             // ◄ = newer. Ends at index 0.
@@ -901,6 +942,10 @@ void app_main(void) {
                         const char *shown = drv ? drv->display_name : "???";
                         snprintf(row, sizeof(row), "%-9s < %s >",
                                  it->label, shown);
+                    } else if (it->kind == CFG_KIND_INT) {
+                        int iv = *(int *)it->target;
+                        snprintf(row, sizeof(row), "%-9s < %d >",
+                                 it->label, iv);
                     } else {
                         bool v = *(bool *)it->target;
                         snprintf(row, sizeof(row), "[%c] %s%s",
@@ -1048,6 +1093,16 @@ void app_main(void) {
                     // [0..32767]; we map it to a bar that fills the
                     // HUD strip width minus the pad on either side.
                     if (microphone_is_running()) {
+                        // Digital gain readout. Shown above the peak
+                        // bar so the user knows what VOL+/- adjusts
+                        // without having to enter the config menu.
+                        char gain_line[24];
+                        snprintf(gain_line, sizeof(gain_line),
+                                 "Gain %dx", g_cfg.mic_gain);
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
+                                              gain_line, hud_font);
+                        hud_y += hud_line;
+
                         uint16_t peak    = microphone_peak_level();
                         int      bar_x   = hud_pad_x;
                         int      bar_w   = (int)hud_area_w - 20;

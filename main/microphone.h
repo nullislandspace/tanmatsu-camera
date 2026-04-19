@@ -61,6 +61,15 @@ uint16_t microphone_peak_level(void);
 // recording wall-clock start, not with stale pre-record data.
 void microphone_capture_reset(void);
 
+// Set the fixed digital gain multiplier applied after the 16-bit slot
+// extraction. Input is clamped to [1, 8]. Safe to call at any time,
+// even while the reader task is running — the read side is a single
+// 32-bit load of a volatile int, so no locking is required.
+void microphone_set_gain(int gain);
+
+// Current digital gain multiplier ([1, 8]).
+int microphone_get_gain(void);
+
 // Pull up to `n_samples` int16 mono samples (at 16 kHz) out of the
 // internal ring buffer. Blocks up to `timeout` for the first sample;
 // returns however many samples were actually received. The caller is

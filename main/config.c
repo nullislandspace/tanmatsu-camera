@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include "esp_log.h"
@@ -23,7 +24,8 @@ static const char CFG_HEADER[] =
     "# rotate_180         rotate the camera image 180° (preview + saved\n"
     "#                     files). For sensors mounted upside down.\n"
     "# mic_enabled        enable the INMP441 I2S microphone. When 1, video\n"
-    "#                     mode captures live audio and shows a level meter.\n";
+    "#                     mode captures live audio and shows a level meter.\n"
+    "# mic_gain           digital gain multiplier for mic samples (1..8).\n";
 
 static void defaults(camera_config_t *out) {
     strncpy(out->focus_driver, "simulator", CONFIG_FOCUS_DRIVER_MAXLEN - 1);
@@ -32,6 +34,13 @@ static void defaults(camera_config_t *out) {
     out->autofocus_enabled = false;
     out->rotate_180        = false;
     out->mic_enabled       = false;
+    out->mic_gain          = CONFIG_MIC_GAIN_DEFAULT;
+}
+
+static int clamp_mic_gain(int v) {
+    if (v < CONFIG_MIC_GAIN_MIN) return CONFIG_MIC_GAIN_MIN;
+    if (v > CONFIG_MIC_GAIN_MAX) return CONFIG_MIC_GAIN_MAX;
+    return v;
 }
 
 // Trim leading/trailing whitespace in-place, return the (possibly
@@ -70,11 +79,12 @@ esp_err_t config_save(const camera_config_t *cfg) {
     fprintf(f, "autofocus_enabled=%d\n", cfg->autofocus_enabled ? 1 : 0);
     fprintf(f, "rotate_180=%d\n",        cfg->rotate_180 ? 1 : 0);
     fprintf(f, "mic_enabled=%d\n",       cfg->mic_enabled ? 1 : 0);
+    fprintf(f, "mic_gain=%d\n",          clamp_mic_gain(cfg->mic_gain));
     fclose(f);
-    ESP_LOGI(TAG, "saved %s (driver=%s focus=%d af=%d rot180=%d mic=%d)",
+    ESP_LOGI(TAG, "saved %s (driver=%s focus=%d af=%d rot180=%d mic=%d gain=%d)",
              CONFIG_PATH, cfg->focus_driver,
              cfg->focus_enabled, cfg->autofocus_enabled,
-             cfg->rotate_180, cfg->mic_enabled);
+             cfg->rotate_180, cfg->mic_enabled, cfg->mic_gain);
     return ESP_OK;
 }
 
@@ -126,14 +136,22 @@ esp_err_t config_load(camera_config_t *out) {
             if (!parse_bool(val, &out->mic_enabled)) {
                 ESP_LOGW(TAG, "bad value for mic_enabled: '%s'", val);
             }
+        } else if (strcmp(key, "mic_gain") == 0) {
+            char *endp = NULL;
+            long  n    = strtol(val, &endp, 10);
+            if (endp && endp != val && *endp == '\0') {
+                out->mic_gain = clamp_mic_gain((int)n);
+            } else {
+                ESP_LOGW(TAG, "bad value for mic_gain: '%s'", val);
+            }
         } else {
             ESP_LOGW(TAG, "unknown key '%s'", key);
         }
     }
     fclose(f);
-    ESP_LOGI(TAG, "loaded %s (driver=%s focus=%d af=%d rot180=%d mic=%d)",
+    ESP_LOGI(TAG, "loaded %s (driver=%s focus=%d af=%d rot180=%d mic=%d gain=%d)",
              CONFIG_PATH, out->focus_driver,
              out->focus_enabled, out->autofocus_enabled,
-             out->rotate_180, out->mic_enabled);
+             out->rotate_180, out->mic_enabled, out->mic_gain);
     return ESP_OK;
 }

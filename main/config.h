@@ -31,9 +31,17 @@
 //                            stays on silent audio (backwards-
 //                            compatible with hardware that has no
 //                            mic wired up).
+//   mic_gain=<1..8>         fixed digital gain multiplier applied
+//                            to mic samples after the 16-bit slot
+//                            extraction (before the LPF + resampler).
+//                            Raise for quiet environments, lower if
+//                            loud speech is clipping.
 
 #define CONFIG_PATH                 "/sd/camera.cfg"
 #define CONFIG_FOCUS_DRIVER_MAXLEN  16
+#define CONFIG_MIC_GAIN_MIN         1
+#define CONFIG_MIC_GAIN_MAX         8
+#define CONFIG_MIC_GAIN_DEFAULT     4
 
 typedef struct {
     char focus_driver[CONFIG_FOCUS_DRIVER_MAXLEN];
@@ -41,6 +49,7 @@ typedef struct {
     bool autofocus_enabled;
     bool rotate_180;
     bool mic_enabled;
+    int  mic_gain;
 } camera_config_t;
 
 // Populate *out with defaults, then overlay any values found in

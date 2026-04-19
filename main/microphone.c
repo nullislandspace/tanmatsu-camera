@@ -87,15 +87,17 @@ static const char *TAG = "microphone";
 // accumulation; this buffer takes ~23 s to fill at that drift).
 #define MIC_STREAM_BYTES   32768u
 
-// Fixed digital gain applied after the 16-bit extraction. Normal
-// speech at arm's length produces raw peaks around ±1M (≈±3900 after
-// the >> 8 extraction). 4× puts that in the 15k-ish range
-// (≈50 % of int16 scale), visible on the meter and audible on
-// playback. Loud shouts (observed raw peak ±13M → ±51k before gain)
-// already exceed int16 scale, so they saturate cleanly — acceptable
-// for a voice recorder. Hardcoded for now; can be promoted to a
-// config setting once we've validated the pipeline end-to-end.
-#define MIC_GAIN           4
+// Digital gain applied after the 16-bit extraction. Normal speech at
+// arm's length produces raw peaks around ±1M (≈±3900 after the >> 8
+// extraction). 4× puts that in the 15k-ish range (≈50 % of int16
+// scale), visible on the meter and audible on playback. Loud shouts
+// (observed raw peak ±13M → ±51k before gain) already exceed int16
+// scale, so they saturate cleanly — acceptable for a voice recorder.
+// Exposed as a runtime setting via microphone_set_gain() so the user
+// can tune it from the config menu / volume buttons.
+#define MIC_GAIN_MIN       1
+#define MIC_GAIN_MAX       8
+#define MIC_GAIN_DEFAULT   4
 
 // One-pole IIR low-pass filter coefficient in Q16.16. The INMP441
 // produces a noticeable amount of high-frequency self-noise + digital
@@ -114,6 +116,7 @@ static TaskHandle_t         s_task       = NULL;
 static StreamBufferHandle_t s_pcm_stream = NULL;
 static volatile bool        s_running    = false;
 static volatile uint16_t    s_peak_level = 0;
+static volatile int         s_gain       = MIC_GAIN_DEFAULT;
 
 // Debug raw-capture state. When s_dbg_active is true, the mic task
 // appends each i2s_channel_read() into this buffer (up to the
@@ -230,7 +233,7 @@ static void mic_task_fn(void *arg) {
         uint16_t peak   = 0;
         size_t   out_ix = 0;
         for (size_t i = 0; i < n; i += 2) {
-            int32_t s32 = ((int32_t)(raw[i] >> 8)) * MIC_GAIN;
+            int32_t s32 = ((int32_t)(raw[i] >> 8)) * (int32_t)s_gain;
             if (s32 >  INT16_MAX) s32 =  INT16_MAX;
             if (s32 <  INT16_MIN) s32 =  INT16_MIN;
 
@@ -435,6 +438,16 @@ void microphone_capture_reset(void) {
     if (s_pcm_stream) {
         xStreamBufferReset(s_pcm_stream);
     }
+}
+
+void microphone_set_gain(int gain) {
+    if (gain < MIC_GAIN_MIN) gain = MIC_GAIN_MIN;
+    if (gain > MIC_GAIN_MAX) gain = MIC_GAIN_MAX;
+    s_gain = gain;
+}
+
+int microphone_get_gain(void) {
+    return s_gain;
 }
 
 size_t microphone_read_pcm(int16_t *dst, size_t n_samples, TickType_t timeout) {
