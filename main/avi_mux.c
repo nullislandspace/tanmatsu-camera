@@ -191,34 +191,37 @@ static esp_err_t write_headers(avi_mux_t *mux) {
 
     // strh audio (56 bytes).
     //
-    // For MP3 in AVI we use the widely-compatible "CBR as fake PCM"
-    // layout: dwSampleSize = 1 (one byte per "sample"),
-    // dwScale = 1, dwRate = nAvgBytesPerSec, dwLength = total bytes.
-    // The per-chunk pts that ffmpeg / mplayer derive from this is
-    // just the cumulative byte count, and time = bytes / dwRate
-    // gives the correct per-frame 36 ms for our 64 kbps CBR stream.
+    // For MP3 in AVI we use the "MP3 frame" time base that ffmpeg
+    // writes and that the Zōtorōpu videoplayer's parser expects:
+    //   dwScale       = samples_per_frame (1152 for MPEG-1)
+    //   dwRate        = sample_rate (44100)
+    //   dwLength      = number of MP3 frames in the stream
+    //   dwSampleSize  = 0   (variable — each chunk is one MP3 frame)
+    //   nBlockAlign   = samples_per_frame
     //
-    // The "obvious" alternative — dwSampleSize=0 + dwRate=sample_rate
-    // + dwLength=PCM samples — makes ffmpeg compute pts at half the
-    // real rate (it treats chunk bytes as sample units at
-    // sample-rate), which in turn trips its "non-interleaved AVI"
-    // heuristic even though the chunks are perfectly interleaved.
+    // Stream duration is dwLength × dwScale / dwRate seconds. The
+    // "fake-PCM" alternative (dwSampleSize=1, dwRate=bytes/sec)
+    // played ok in desktop tools but made the videoplayer lose
+    // sync because its AVI parser treats the audio stream duration
+    // as the total in the header, not as the per-chunk frame count
+    // — see the A/V sync regression documented when this was
+    // changed from that form.
     if (wr_fcc(f, FCC_STRH)) return ESP_FAIL;
     if (wr_u32(f, 56)) return ESP_FAIL;
-    if (wr_fcc(f, FCC_AUDS)) return ESP_FAIL;                      // fccType
-    if (wr_fcc(f, 0)) return ESP_FAIL;                             // fccHandler (0 for audio by convention)
-    if (wr_u32(f, 0)) return ESP_FAIL;                             // dwFlags
-    if (wr_u16(f, 0)) return ESP_FAIL;                             // wPriority
-    if (wr_u16(f, 0)) return ESP_FAIL;                             // wLanguage
-    if (wr_u32(f, 0)) return ESP_FAIL;                             // dwInitialFrames
-    if (wr_u32(f, 1)) return ESP_FAIL;                             // dwScale
-    if (wr_u32(f, mux->audio_avg_bytes_per_sec)) return ESP_FAIL;  // dwRate = bytes/sec (CBR fake-PCM)
-    if (wr_u32(f, 0)) return ESP_FAIL;                             // dwStart
+    if (wr_fcc(f, FCC_AUDS)) return ESP_FAIL;                        // fccType
+    if (wr_fcc(f, 0)) return ESP_FAIL;                               // fccHandler (0 for audio by convention)
+    if (wr_u32(f, 0)) return ESP_FAIL;                               // dwFlags
+    if (wr_u16(f, 0)) return ESP_FAIL;                               // wPriority
+    if (wr_u16(f, 0)) return ESP_FAIL;                               // wLanguage
+    if (wr_u32(f, 0)) return ESP_FAIL;                               // dwInitialFrames
+    if (wr_u32(f, mux->audio_samples_per_frame)) return ESP_FAIL;    // dwScale = samples/frame
+    if (wr_u32(f, mux->audio_sample_rate)) return ESP_FAIL;          // dwRate = sample rate
+    if (wr_u32(f, 0)) return ESP_FAIL;                               // dwStart
     mux->auds_length_pos = cur_pos(f);
-    if (wr_u32(f, 0)) return ESP_FAIL;                             // dwLength (patched: total BYTES at close)
-    if (wr_u32(f, 0x4000)) return ESP_FAIL;                        // dwSuggestedBufferSize (~16 KB)
-    if (wr_u32(f, 0xFFFFFFFFu)) return ESP_FAIL;                   // dwQuality
-    if (wr_u32(f, 1)) return ESP_FAIL;                             // dwSampleSize = 1 byte/sample
+    if (wr_u32(f, 0)) return ESP_FAIL;                               // dwLength (patched: total MP3 frames at close)
+    if (wr_u32(f, 0x4000)) return ESP_FAIL;                          // dwSuggestedBufferSize (~16 KB)
+    if (wr_u32(f, 0xFFFFFFFFu)) return ESP_FAIL;                     // dwQuality
+    if (wr_u32(f, 0)) return ESP_FAIL;                               // dwSampleSize = 0 (VBR/framed)
     if (wr_u16(f, 0)) return ESP_FAIL;
     if (wr_u16(f, 0)) return ESP_FAIL;
     if (wr_u16(f, 0)) return ESP_FAIL;
@@ -228,13 +231,13 @@ static esp_err_t write_headers(avi_mux_t *mux) {
     // Required for Windows compatibility and matches what ffmpeg writes.
     if (wr_fcc(f, FCC_STRF)) return ESP_FAIL;
     if (wr_u32(f, 30)) return ESP_FAIL;
-    if (wr_u16(f, 0x0055)) return ESP_FAIL;                        // wFormatTag: WAVE_FORMAT_MPEGLAYER3
-    if (wr_u16(f, mux->audio_channels)) return ESP_FAIL;           // nChannels
-    if (wr_u32(f, mux->audio_sample_rate)) return ESP_FAIL;        // nSamplesPerSec
-    if (wr_u32(f, mux->audio_avg_bytes_per_sec)) return ESP_FAIL;  // nAvgBytesPerSec
-    if (wr_u16(f, 1)) return ESP_FAIL;                             // nBlockAlign (1 for VBR/CBR chunks)
-    if (wr_u16(f, 0)) return ESP_FAIL;                             // wBitsPerSample (0 for MP3)
-    if (wr_u16(f, 12)) return ESP_FAIL;                            // cbSize (12 = MPEGLAYER3 extension)
+    if (wr_u16(f, 0x0055)) return ESP_FAIL;                          // wFormatTag: WAVE_FORMAT_MPEGLAYER3
+    if (wr_u16(f, mux->audio_channels)) return ESP_FAIL;             // nChannels
+    if (wr_u32(f, mux->audio_sample_rate)) return ESP_FAIL;          // nSamplesPerSec
+    if (wr_u32(f, mux->audio_avg_bytes_per_sec)) return ESP_FAIL;    // nAvgBytesPerSec
+    if (wr_u16(f, mux->audio_samples_per_frame)) return ESP_FAIL;    // nBlockAlign = samples/frame (matches ffmpeg)
+    if (wr_u16(f, 0)) return ESP_FAIL;                               // wBitsPerSample (0 for MP3)
+    if (wr_u16(f, 12)) return ESP_FAIL;                              // cbSize (12 = MPEGLAYER3 extension)
     // MPEGLAYER3WAVEFORMAT extension
     if (wr_u16(f, 1)) return ESP_FAIL;                             // wID = MPEGLAYER3_ID_MPEG
     if (wr_u32(f, 2)) return ESP_FAIL;                             // fdwFlags = MPEGLAYER3_FLAG_PADDING_OFF
@@ -264,17 +267,20 @@ esp_err_t avi_mux_open(avi_mux_t *mux, const char *path,
                        uint32_t video_fps,
                        uint32_t audio_sample_rate,
                        uint16_t audio_channels,
-                       uint32_t audio_avg_bytes_per_sec) {
+                       uint32_t audio_avg_bytes_per_sec,
+                       uint16_t audio_samples_per_frame) {
     if (!mux || !path) return ESP_ERR_INVALID_ARG;
+    if (audio_samples_per_frame == 0) return ESP_ERR_INVALID_ARG;
     memset(mux, 0, sizeof(*mux));
-    mux->video_width            = video_width;
-    mux->video_height           = video_height;
-    mux->video_fps              = video_fps;
-    mux->audio_sample_rate      = audio_sample_rate;
-    mux->audio_channels         = audio_channels;
-    mux->audio_bits_per_sample  = 0;           // MP3 convention
-    mux->audio_format_tag       = 0x0055;      // MPEGLAYER3
+    mux->video_width             = video_width;
+    mux->video_height            = video_height;
+    mux->video_fps               = video_fps;
+    mux->audio_sample_rate       = audio_sample_rate;
+    mux->audio_channels          = audio_channels;
+    mux->audio_bits_per_sample   = 0;           // MP3 convention
+    mux->audio_format_tag        = 0x0055;      // MPEGLAYER3
     mux->audio_avg_bytes_per_sec = audio_avg_bytes_per_sec;
+    mux->audio_samples_per_frame = audio_samples_per_frame;
 
     mux->f = fastopen(path, "wb");
     if (!mux->f) {
@@ -351,6 +357,12 @@ esp_err_t avi_mux_write_audio(avi_mux_t *mux, const void *data, size_t size,
 
     mux->audio_samples_written += samples_covered;
     mux->audio_bytes_written   += (uint32_t)size;
+    // Each call represents one MP3 frame (Shine emits one frame per
+    // shine_encode_buffer call). Track the frame count for the audio
+    // strh.dwLength patch at close time.
+    if (samples_covered > 0) {
+        mux->audio_frames_written++;
+    }
     return ESP_OK;
 }
 
@@ -404,13 +416,13 @@ esp_err_t avi_mux_close(avi_mux_t *mux) {
     if (wr_u32(f, total_bps)) return ESP_FAIL;
 
     // Patch video strh.dwLength and audio strh.dwLength.
-    // Audio dwLength is in BYTES to match the "CBR fake-PCM" strh
-    // layout (dwSampleSize=1, dwRate=nAvgBytesPerSec) — players
-    // then derive duration as total_bytes / dwRate seconds.
+    // Audio dwLength is in MP3 FRAMES — matching the strh layout
+    // above (dwScale=samples/frame, dwRate=sample_rate), giving a
+    // stream duration of dwLength × dwScale / dwRate seconds.
     if (fseek(f, (long)mux->vids_length_pos, SEEK_SET)) return ESP_FAIL;
     if (wr_u32(f, mux->video_frames_written)) return ESP_FAIL;
     if (fseek(f, (long)mux->auds_length_pos, SEEK_SET)) return ESP_FAIL;
-    if (wr_u32(f, mux->audio_bytes_written)) return ESP_FAIL;
+    if (wr_u32(f, mux->audio_frames_written)) return ESP_FAIL;
 
     // Back to end and close.
     fflush(f);

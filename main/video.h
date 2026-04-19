@@ -10,12 +10,11 @@
 // aligned buffer.
 //
 // The audio path runs in its own FreeRTOS task pinned to core 1 so
-// that a future I²S microphone capture has deterministic timing. For
-// now the audio source is a 440 Hz square wave generator used as a
-// placeholder — it validates the full "audio in → Shine MP3 encode →
-// AVI 01wb chunks" pipeline without hardware dependencies. Replacing
-// the generator with a real I²S RX ring buffer is the only change
-// the audio path will need when the mic lands.
+// that I²S microphone capture has deterministic timing. When the
+// INMP441 mic is enabled (config.mic_enabled + MODE_VIDEO active),
+// the audio task pulls samples out of microphone.c's ring buffer;
+// otherwise each frame is filled with silence. Shine encoding and
+// AVI 01wb muxing are unchanged either way.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -39,6 +38,10 @@ extern "C" {
 // `out_path` receives the absolute path of the file that was opened
 // so the caller can show it to the user on the HUD. `dcim_dir` is
 // the directory to create the file in (typically /sd/DCIM).
+//
+// Expects the microphone subsystem to already be running if the user
+// wants live audio on the track — the mic lifecycle is owned by the
+// main UI loop, which starts/stops it on MODE_VIDEO entry/exit.
 esp_err_t video_record_start(const char *dcim_dir, char *out_path, size_t out_path_sz);
 
 // Stop the running recording: signal both tasks to flush + exit,

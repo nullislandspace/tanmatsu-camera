@@ -20,6 +20,7 @@ idf_component_register(
 		"config.c"
 		"intfs.c"
 		"icons.c"
+		"microphone.c"
 	PRIV_REQUIRES
 		esp_lcd
 		nvs_flash

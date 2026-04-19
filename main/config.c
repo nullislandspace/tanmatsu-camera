@@ -21,7 +21,9 @@ static const char CFG_HEADER[] =
     "# autofocus_enabled  enable hardware autofocus (needs focus_enabled=1\n"
     "#                     and a working chip).\n"
     "# rotate_180         rotate the camera image 180° (preview + saved\n"
-    "#                     files). For sensors mounted upside down.\n";
+    "#                     files). For sensors mounted upside down.\n"
+    "# mic_enabled        enable the INMP441 I2S microphone. When 1, video\n"
+    "#                     mode captures live audio and shows a level meter.\n";
 
 static void defaults(camera_config_t *out) {
     strncpy(out->focus_driver, "simulator", CONFIG_FOCUS_DRIVER_MAXLEN - 1);
@@ -29,6 +31,7 @@ static void defaults(camera_config_t *out) {
     out->focus_enabled     = false;
     out->autofocus_enabled = false;
     out->rotate_180        = false;
+    out->mic_enabled       = false;
 }
 
 // Trim leading/trailing whitespace in-place, return the (possibly
@@ -66,10 +69,12 @@ esp_err_t config_save(const camera_config_t *cfg) {
     fprintf(f, "focus_enabled=%d\n",     cfg->focus_enabled ? 1 : 0);
     fprintf(f, "autofocus_enabled=%d\n", cfg->autofocus_enabled ? 1 : 0);
     fprintf(f, "rotate_180=%d\n",        cfg->rotate_180 ? 1 : 0);
+    fprintf(f, "mic_enabled=%d\n",       cfg->mic_enabled ? 1 : 0);
     fclose(f);
-    ESP_LOGI(TAG, "saved %s (driver=%s focus=%d af=%d rot180=%d)",
+    ESP_LOGI(TAG, "saved %s (driver=%s focus=%d af=%d rot180=%d mic=%d)",
              CONFIG_PATH, cfg->focus_driver,
-             cfg->focus_enabled, cfg->autofocus_enabled, cfg->rotate_180);
+             cfg->focus_enabled, cfg->autofocus_enabled,
+             cfg->rotate_180, cfg->mic_enabled);
     return ESP_OK;
 }
 
@@ -117,13 +122,18 @@ esp_err_t config_load(camera_config_t *out) {
             if (!parse_bool(val, &out->rotate_180)) {
                 ESP_LOGW(TAG, "bad value for rotate_180: '%s'", val);
             }
+        } else if (strcmp(key, "mic_enabled") == 0) {
+            if (!parse_bool(val, &out->mic_enabled)) {
+                ESP_LOGW(TAG, "bad value for mic_enabled: '%s'", val);
+            }
         } else {
             ESP_LOGW(TAG, "unknown key '%s'", key);
         }
     }
     fclose(f);
-    ESP_LOGI(TAG, "loaded %s (driver=%s focus=%d af=%d rot180=%d)",
+    ESP_LOGI(TAG, "loaded %s (driver=%s focus=%d af=%d rot180=%d mic=%d)",
              CONFIG_PATH, out->focus_driver,
-             out->focus_enabled, out->autofocus_enabled, out->rotate_180);
+             out->focus_enabled, out->autofocus_enabled,
+             out->rotate_180, out->mic_enabled);
     return ESP_OK;
 }

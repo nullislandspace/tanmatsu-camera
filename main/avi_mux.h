@@ -41,6 +41,7 @@ typedef struct {
     uint16_t audio_bits_per_sample;   // for the WAVEFORMATEX header only; MP3 uses 0 here conventionally but 16 is accepted
     uint32_t audio_format_tag;        // WAVEFORMATEX wFormatTag (0x0055 = MP3)
     uint32_t audio_avg_bytes_per_sec; // CBR bitrate/8
+    uint16_t audio_samples_per_frame; // MP3 samples per frame (1152 for MPEG-1, 576 for MPEG-2)
 
     // File offsets captured during write so we can patch sizes at close.
     size_t   riff_size_pos;   // offset of RIFF size field
@@ -54,6 +55,7 @@ typedef struct {
     // Running counters.
     uint32_t video_frames_written;
     uint32_t audio_samples_written;
+    uint32_t audio_frames_written;  // MP3-chunk count — goes into the audio strh dwLength
     uint32_t video_bytes_written;   // raw payload bytes, for max_bytes_per_sec estimate
     uint32_t audio_bytes_written;
 
@@ -68,15 +70,20 @@ typedef struct {
 
 // Open a new AVI file for writing. Writes the RIFF + hdrl headers
 // and leaves the file positioned at the start of the movi chunk
-// contents, ready for chunk writes. The `audio_avg_bytes_per_sec`
-// parameter determines the declared dwAvgBytesPerSec in the audio
-// strh/strf — for 64 kbps MP3 pass 8000.
+// contents, ready for chunk writes. `audio_avg_bytes_per_sec` is
+// the WAVEFORMATEX nAvgBytesPerSec (CBR bitrate / 8; 16000 for
+// 128 kbps). `audio_samples_per_frame` is how many PCM samples one
+// encoded MP3 frame contains (1152 for MPEG-1, 576 for MPEG-2) —
+// the muxer uses it for the audio-stream time base so the stream
+// length is expressed in frames, matching what ffmpeg writes and
+// what the Zōtorōpu videoplayer expects to parse.
 esp_err_t avi_mux_open(avi_mux_t *mux, const char *path,
                        uint32_t video_width, uint32_t video_height,
                        uint32_t video_fps,
                        uint32_t audio_sample_rate,
                        uint16_t audio_channels,
-                       uint32_t audio_avg_bytes_per_sec);
+                       uint32_t audio_avg_bytes_per_sec,
+                       uint16_t audio_samples_per_frame);
 
 // Write one compressed video frame (00dc). The caller must know
 // whether this was an IDR / keyframe and pass `keyframe=true` so the

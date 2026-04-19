@@ -26,6 +26,7 @@
 
 #include "avi_mux.h"
 #include "camera_pipeline.h"
+#include "microphone.h"
 
 static const char *TAG = "video";
 
@@ -43,9 +44,21 @@ static const char *TAG = "video";
 //   * GOP=15 means one keyframe per second, which keeps seeks
 //     responsive on the videoplayer side without inflating the
 //     bitrate much.
-//   * Audio is mono 16 kHz 64 kbps — the cheapest MP3 configuration
-//     Shine still supports comfortably, and camera.md §9 flags it as
-//     the well-under-10% target.
+//   * Audio is stereo 44.1 kHz 128 kbps MPEG-1 Layer III, joint-
+//     stereo mode. Rate + channel count + bitrate all match the
+//     parameters the companion videoplayer's convert_h264.sh
+//     script uses (libmp3lame -b:a 128k -ar 44100 -ac 2): the
+//     videoplayer writes decoded samples straight to a STEREO I2S
+//     without ever checking the MP3's channel count, so a mono MP3
+//     gets played back at half speed with every other sample ending
+//     up in the wrong channel. Joint-stereo on an L==R signal
+//     compresses almost as well as mono because the side channel
+//     is zero; the mic is mono in hardware and we just duplicate
+//     into both channels at encode time. Rate-wise, the ESP32-P4
+//     I2S peripheral can't synthesise 44.1 kHz exactly (PLL_F160M
+//     is 2^11 × 5^7, no factor of 3); a 48 kHz configured mic
+//     request lands at ~44.8 kHz actual and we resample to 44.1
+//     in microphone.c. 0.27 semitone pitch offset, imperceptible.
 #define VIDEO_W                400u
 #define VIDEO_H                320u
 #define VIDEO_W_PADDED         400u                 // already mult-of-16
@@ -54,20 +67,10 @@ static const char *TAG = "video";
 #define VIDEO_BITRATE          400000u
 #define VIDEO_GOP              15u
 
-#define AUDIO_SAMPLE_RATE      16000u
-#define AUDIO_CHANNELS         1u
-#define AUDIO_BITRATE_KBPS     64
-#define AUDIO_AVG_BYTES_PER_S  (AUDIO_BITRATE_KBPS * 1000 / 8) // 8000
-
-// 440 Hz square wave placeholder signal — the user explicitly asked
-// for a tone rather than silence so we can tell at a glance whether
-// the audio path is live. Will be replaced by an I²S RX ring read
-// once the microphone hardware is attached.
-#define AUDIO_TONE_HZ          440u
-// Tone amplitude is conservative (25 % full scale) so decoders don't
-// clip and the headphones don't hurt on playback — this is a test
-// signal, not content.
-#define AUDIO_TONE_AMPLITUDE   8192
+#define AUDIO_SAMPLE_RATE      44100u
+#define AUDIO_CHANNELS         2u
+#define AUDIO_BITRATE_KBPS     128
+#define AUDIO_AVG_BYTES_PER_S  (AUDIO_BITRATE_KBPS * 1000 / 8) // 16000
 
 // YUV420 "packed" (O_UYY_E_VYY) buffer size at padded stride — this
 // is the exact size h264_enc expects when width/height are rounded
@@ -112,7 +115,6 @@ typedef struct {
     shine_t   shine;
     int       shine_samples_per_frame;    // returned by shine_samples_per_pass()
     int16_t  *pcm_scratch;                // one frame worth of interleaved int16_t PCM
-    uint32_t  tone_phase;                 // square wave phase (sample counter mod period)
 
     // Writer pipeline. Producer tasks (video_task, audio_task)
     // encode their frames and push them onto these two queues; the
@@ -163,35 +165,47 @@ static void build_filename(const char *dir, char *out, size_t n) {
 
 // --- Video task -------------------------------------------------------------
 
-// Placeholder audio source. Currently produces silence; leave the
-// 440 Hz square wave generator below available (but not wired up)
-// so we can flip back to a known-good tone whenever we need to
-// sanity-check the audio pipeline end-to-end. Will be replaced by
-// a read from the I²S microphone ring buffer once that hardware is
-// wired up.
-static void generate_tone(int16_t *dst, int samples, uint32_t sample_rate, uint32_t *phase) {
-    (void)sample_rate;
-    (void)phase;
-    memset(dst, 0, (size_t)samples * sizeof(int16_t));
-}
-
-#if 0  // 440 Hz square-wave generator — kept for quick A/B testing
-static void generate_tone_440(int16_t *dst, int samples, uint32_t sample_rate, uint32_t *phase) {
-    // Half-period length in samples: sample_rate / (2 * freq).
-    uint32_t half_period = sample_rate / (2u * AUDIO_TONE_HZ);
-    if (half_period == 0) half_period = 1;
-    uint32_t p = *phase;
-    for (int i = 0; i < samples; ++i) {
-        // Square wave: +A for first half, -A for second half.
-        int16_t v = (p < half_period) ? (int16_t)AUDIO_TONE_AMPLITUDE
-                                      : (int16_t)(-AUDIO_TONE_AMPLITUDE);
-        dst[i] = v;
-        p++;
-        if (p >= 2u * half_period) p = 0;
+// Fill `dst` with one Shine frame of audio. If the INMP441 microphone
+// is running (config toggle `mic_enabled` plus MODE_VIDEO is active
+// in the UI), we pull samples from its ring buffer; any shortfall and
+// the disabled case are both handled by zero-filling. The mic task
+// delivers samples at its actual ~44.8 kHz frame rate which we label
+// as 44.1 kHz here — see the AUDIO_SAMPLE_RATE comment for why.
+static void fill_audio_frame(int16_t *dst, int samples) {
+    size_t got = 0;
+    if (microphone_is_running()) {
+        // 100 ms timeout — the mic stream-buffer's trigger level is
+        // one full audio frame, so Receive blocks for ~26 ms in the
+        // steady state (one mic frame period) and returns as soon as
+        // a complete frame is ready. The long timeout only matters if
+        // the mic stalls entirely, in which case we zero-fill to keep
+        // the recorder running.
+        got = microphone_read_pcm(dst, (size_t)samples, pdMS_TO_TICKS(100));
     }
-    *phase = p;
+    if (got < (size_t)samples) {
+        memset(dst + got, 0, ((size_t)samples - got) * sizeof(int16_t));
+    }
+
+    // Drain-rate telemetry — pair with microphone.c's rate log so we
+    // can see if the audio task pulls faster or slower than the mic
+    // pushes. A mismatch here is what causes chop + pitch shift.
+    static uint64_t total_got       = 0;
+    static uint64_t total_requested = 0;
+    static int64_t  win_start_us    = 0;
+    if (win_start_us == 0) win_start_us = esp_timer_get_time();
+    total_got       += got;
+    total_requested += (uint64_t)samples;
+    int64_t now = esp_timer_get_time();
+    int64_t win = now - win_start_us;
+    if (win >= 5000000) {
+        uint32_t got_hz = (uint32_t)(total_got       * 1000000ull / (uint64_t)win);
+        uint32_t req_hz = (uint32_t)(total_requested * 1000000ull / (uint64_t)win);
+        ESP_LOGI(TAG, "audio drain: got=%u Hz req=%u Hz (cfg=%u Hz)",
+                 (unsigned)got_hz, (unsigned)req_hz, (unsigned)AUDIO_SAMPLE_RATE);
+        total_got = total_requested = 0;
+        win_start_us = now;
+    }
 }
-#endif
 
 // Wall-clock paced sleep. The caller tracks the absolute µs target
 // for the next wake-up; this function sleeps the FreeRTOS tick count
@@ -405,35 +419,29 @@ static void audio_task_fn(void *arg) {
         return;
     }
 
-    // Drift-free pacing, same scheme as the video task. At 16 kHz
-    // mono with 576 samples/frame the target period is exactly
-    // 36000 µs — which the 10 ms FreeRTOS tick cannot hit, so
-    // vTaskDelayUntil(pdMS_TO_TICKS(36)) rounds down to 30 ms and
-    // runs the audio timeline 20 % faster than wall-clock. The
-    // µs-tracked next_us below averages out the tick jitter so
-    // audio_samples_written grows at exactly AUDIO_SAMPLE_RATE.
-    const int64_t period_us = ((int64_t)samples_per_frame * 1000000)
-                               / (int64_t)AUDIO_SAMPLE_RATE;
-    int64_t next_us = esp_timer_get_time() + period_us;
-
-    // Channel-major pointer array — mono points both channels at the
-    // same scratch.
+    // Pacing: the microphone's stream buffer has a trigger level of
+    // one audio frame worth of bytes, so fill_audio_frame's
+    // xStreamBufferReceive blocks until a full frame is ready and
+    // returns immediately after. That naturally rate-limits this
+    // task to the mic's production rate — no need for a separate
+    // wall-clock sleep, and no tick-rounding drift that made the
+    // audio track come up short of the video track. If the mic
+    // stalls entirely, the 100 ms Receive timeout kicks in and we
+    // zero-fill to keep the recorder producing chunks.
+    //
+    // Channel-major pointer array — the mic is mono so we point
+    // both L and R at the same scratch; joint-stereo in Shine
+    // compresses the (zero) side channel away for free.
     int16_t *chan_bufs[2] = { s_rec.pcm_scratch, s_rec.pcm_scratch };
 
     uint64_t acc_gen_us = 0, acc_enc_us = 0, acc_write_us = 0;
     int      acc_n      = 0;
 
     while (s_rec.running) {
-        sleep_until_us(next_us);
-        next_us += period_us;
-        if (!s_rec.running) break;
-
         int64_t t0 = esp_timer_get_time();
-        // Placeholder source: 440 Hz square wave. Replace with a
-        // ring-buffer read from I²S RX when the mic lands.
-        generate_tone(s_rec.pcm_scratch, samples_per_frame,
-                      AUDIO_SAMPLE_RATE, &s_rec.tone_phase);
+        fill_audio_frame(s_rec.pcm_scratch, samples_per_frame);
         int64_t t1 = esp_timer_get_time();
+        if (!s_rec.running) break;
 
         int written = 0;
         unsigned char *mp3 = shine_encode_buffer(s_rec.shine, chan_bufs, &written);
@@ -551,9 +559,15 @@ static esp_err_t setup_h264_encoder(void) {
 static esp_err_t setup_shine(void) {
     shine_config_t cfg;
     shine_set_config_mpeg_defaults(&cfg.mpeg);
-    cfg.wave.channels   = PCM_MONO;
+    // Stereo + joint-stereo: we feed Shine the same mono buffer as
+    // both L and R (see audio_task_fn's chan_bufs), and joint-
+    // stereo's mid/side encoding makes the (zero) side channel
+    // essentially free — the resulting MP3 is barely larger than
+    // the equivalent mono encode, but decodes into something the
+    // videoplayer's stereo I2S can play correctly.
+    cfg.wave.channels   = PCM_STEREO;
     cfg.wave.samplerate = AUDIO_SAMPLE_RATE;
-    cfg.mpeg.mode       = MONO;
+    cfg.mpeg.mode       = JOINT_STEREO;
     cfg.mpeg.bitr       = AUDIO_BITRATE_KBPS;
     cfg.mpeg.emph       = NONE;
     cfg.mpeg.copyright  = 0;
@@ -588,7 +602,6 @@ static esp_err_t setup_shine(void) {
         s_rec.shine = NULL;
         return ESP_ERR_NO_MEM;
     }
-    s_rec.tone_phase = 0;
     ESP_LOGI(TAG, "shine ready: %u Hz mono %d kbps, %d samples/frame",
              (unsigned)AUDIO_SAMPLE_RATE, AUDIO_BITRATE_KBPS,
              s_rec.shine_samples_per_frame);
@@ -674,7 +687,8 @@ esp_err_t video_record_start(const char *dcim_dir, char *out_path, size_t out_pa
     err = avi_mux_open(&s_rec.mux, s_rec.path,
                        VIDEO_W, VIDEO_H, VIDEO_FPS,
                        AUDIO_SAMPLE_RATE, (uint16_t)AUDIO_CHANNELS,
-                       AUDIO_AVG_BYTES_PER_S);
+                       AUDIO_AVG_BYTES_PER_S,
+                       (uint16_t)s_rec.shine_samples_per_frame);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "avi_mux_open: %d", err);
         teardown_all();
@@ -698,6 +712,12 @@ esp_err_t video_record_start(const char *dcim_dir, char *out_path, size_t out_pa
     //     the hardware-bound encode steps, but gets plenty of
     //     wall-clock time to keep up with the ~43 chunks/sec
     //     combined rate.
+    // Drop anything the mic has been accumulating while the user sat
+    // in the video-mode HUD: we want the first AVI audio chunk to
+    // line up with the video start timestamp, not with sound from
+    // before the user pressed record.
+    microphone_capture_reset();
+
     s_rec.running        = true;
     s_rec.producers_done = 0;
     s_rec.start_us       = esp_timer_get_time();

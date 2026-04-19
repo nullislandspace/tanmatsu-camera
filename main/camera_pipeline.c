@@ -282,6 +282,7 @@ static void render_task(void *arg) {
         xSemaphoreGive(s_ppa_mutex);
         xSemaphoreGive(s_frame_ready);
         n_frames++;
+        /*
         if (n_frames <= 3 || (n_frames % 30) == 0) {
             ESP_LOGI(TAG, "frame %" PRIu32 "  ISR get=%" PRIu32 " fin=%" PRIu32
                           " srm=%" PRIu32 "  mutex_wait=%lld ppa_op=%lld us",
@@ -289,6 +290,7 @@ static void render_task(void *arg) {
                      (long long)(t_mutex_out - t_mutex_in),
                      (long long)(t_ppa_done - t_mutex_out));
         }
+        */
     }
 
     // Let camera_preview_stop know we've exited cleanly — it polls

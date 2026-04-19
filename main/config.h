@@ -24,6 +24,13 @@
 //                            sensor is physically mounted upside
 //                            down. Does NOT affect viewing of
 //                            already-saved photos.
+//   mic_enabled=<0|1>       enable the INMP441 I2S microphone on
+//                            I2S1 (pins E8/E9/E10). When 1, video
+//                            mode captures live audio and shows a
+//                            HUD level meter; when 0 the recorder
+//                            stays on silent audio (backwards-
+//                            compatible with hardware that has no
+//                            mic wired up).
 
 #define CONFIG_PATH                 "/sd/camera.cfg"
 #define CONFIG_FOCUS_DRIVER_MAXLEN  16
@@ -33,6 +40,7 @@ typedef struct {
     bool focus_enabled;
     bool autofocus_enabled;
     bool rotate_180;
+    bool mic_enabled;
 } camera_config_t;
 
 // Populate *out with defaults, then overlay any values found in

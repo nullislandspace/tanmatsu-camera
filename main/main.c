@@ -29,6 +29,7 @@
 #include "photo.h"
 #include "icons.h"
 #include "intfs.h"
+#include "microphone.h"
 #include "sdcard.h"
 #include "splash.h"
 #include "usb_device.h"
@@ -111,6 +112,7 @@ static cfg_item_t g_cfg_items[] = {
     { "Focus",      CFG_KIND_BOOL,   &g_cfg.focus_enabled     },
     { "Autofocus",  CFG_KIND_BOOL,   &g_cfg.autofocus_enabled },
     { "Rotate 180", CFG_KIND_BOOL,   &g_cfg.rotate_180        },
+    { "Microphone", CFG_KIND_BOOL,   &g_cfg.mic_enabled       },
 };
 #define CFG_ITEM_COUNT ((int)(sizeof(g_cfg_items) / sizeof(g_cfg_items[0])))
 static int g_cfg_sel = 0;
@@ -606,6 +608,15 @@ void app_main(void) {
     // mode == MODE_CONFIG.
     app_mode_t prev_mode = MODE_PHOTO;
 
+    // The mic runs whenever the user is in video mode (actual or
+    // via the config menu entered from it) AND the mic_enabled config
+    // bit is set. We reconcile declaratively once per loop iteration
+    // so any combination of mode change + config toggle converges
+    // without each call-site needing its own start/stop plumbing.
+    #define MIC_SHOULD_RUN(m, pm) ( \
+        g_cfg.mic_enabled && \
+        ((m) == MODE_VIDEO || ((m) == MODE_CONFIG && (pm) == MODE_VIDEO)))
+
     // Helper lambda-ish: a transient banner with a default 2.5s duration.
     #define SHOW_BANNER(fmt, ...) do { \
         snprintf(banner_text, sizeof(banner_text), fmt, ##__VA_ARGS__); \
@@ -613,6 +624,20 @@ void app_main(void) {
     } while (0)
 
     while (1) {
+        // Bring the mic state in line with the current mode + config
+        // before any other per-frame work. Start/stop failures are
+        // logged by microphone.c; we don't surface them here because
+        // the mic is optional hardware — the user can unplug it and
+        // we keep falling back to silent audio tracks.
+        {
+            bool want = MIC_SHOULD_RUN(mode, prev_mode);
+            if (want && !microphone_is_running()) {
+                microphone_start();
+            } else if (!want && microphone_is_running()) {
+                microphone_stop();
+            }
+        }
+
         // Drain any queued input events. Mode switches apply immediately;
         // space is latched so capture runs AFTER the blit of the current
         // frame (so the user gets visual feedback that the shutter fired).
@@ -683,6 +708,22 @@ void app_main(void) {
                                 config_save(&g_cfg);
                             } else if (r == CFG_ACT_PROBE_FAILED) {
                                 SHOW_BANNER("%s not detected", g_cfg.focus_driver);
+                            }
+                        } else if (mode == MODE_VIDEO && !video_is_recording()) {
+                            // Debug hook: dump 5 s of raw I2S samples
+                            // to /sd/miccal.wav for offline analysis.
+                            // The main loop is blocked during the
+                            // dump — fine for a temporary diagnostic.
+                            if (!microphone_is_running()) {
+                                SHOW_BANNER("Enable mic in config first");
+                            } else {
+                                esp_err_t derr = microphone_debug_raw_dump(
+                                    "/sd/miccal.wav", 5);
+                                if (derr == ESP_OK) {
+                                    SHOW_BANNER("Saved /sd/miccal.wav");
+                                } else {
+                                    SHOW_BANNER("Dump failed: %d", derr);
+                                }
                             }
                         }
                         break;
@@ -999,6 +1040,34 @@ void app_main(void) {
                         fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE rec", hud_font);
                         hud_y += hud_line;
                     }
+                    // Audio level meter. Shown whenever the mic is
+                    // actually running so the user can verify at a
+                    // glance that sound is reaching the chip — no
+                    // need to record, transfer and play back a clip
+                    // just to check wiring / enable. Peak value is
+                    // [0..32767]; we map it to a bar that fills the
+                    // HUD strip width minus the pad on either side.
+                    if (microphone_is_running()) {
+                        uint16_t peak    = microphone_peak_level();
+                        int      bar_x   = hud_pad_x;
+                        int      bar_w   = (int)hud_area_w - 20;
+                        int      bar_h   = 8;
+                        int      fill_w  = (int)((uint32_t)peak * (uint32_t)bar_w / 32768u);
+                        if (fill_w > bar_w) fill_w = bar_w;
+                        // Colour shifts green → yellow → red as the
+                        // signal approaches clipping, matching the
+                        // convention every audio tool on the planet
+                        // uses so the user reads it instantly.
+                        uint16_t fill_col =
+                            (peak > 26000) ? RED :
+                            (peak > 16000) ? YELLOW :
+                                             fbdraw_rgb(0, 200, 0);
+                        fbdraw_fill_rect(&fb, bar_x, hud_y, bar_w, bar_h, HUD_BG);
+                        if (fill_w > 0) {
+                            fbdraw_fill_rect(&fb, bar_x, hud_y, fill_w, bar_h, fill_col);
+                        }
+                        hud_y += bar_h + 4;
+                    }
                     break;
                 case MODE_VIEW:
                     if (viewer_has_image()) {
@@ -1089,6 +1158,7 @@ void app_main(void) {
         static int prof_n = 0;
         if (++prof_n >= 15) {
             prof_n = 0;
+            /*
             ESP_LOGI(TAG, "loop: wait=%lld bg=%lld img=%lld hud=%lld blit=%lld ready=%d (us)",
                      (long long)(t_after_wait  - t_wait_start),
                      (long long)(t_after_bg    - t_after_wait),
@@ -1096,6 +1166,7 @@ void app_main(void) {
                      (long long)(t_after_hud   - t_after_image),
                      (long long)(t_after_blit  - t_after_hud),
                      display_ready);
+             */
         }
 
         // Photo capture: the preview pipeline is torn down and rebuilt
