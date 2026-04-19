@@ -419,16 +419,29 @@ static void audio_task_fn(void *arg) {
         return;
     }
 
-    // Pacing: the microphone's stream buffer has a trigger level of
-    // one audio frame worth of bytes, so fill_audio_frame's
-    // xStreamBufferReceive blocks until a full frame is ready and
-    // returns immediately after. That naturally rate-limits this
-    // task to the mic's production rate — no need for a separate
-    // wall-clock sleep, and no tick-rounding drift that made the
-    // audio track come up short of the video track. If the mic
-    // stalls entirely, the 100 ms Receive timeout kicks in and we
-    // zero-fill to keep the recorder producing chunks.
+    // Pacing has two modes depending on whether the mic is running:
     //
+    //   * Mic ON — the mic's stream buffer has a trigger level of one
+    //     audio frame worth of bytes, so fill_audio_frame's
+    //     microphone_read_pcm blocks until a full frame is ready and
+    //     returns immediately after. That naturally rate-limits this
+    //     task to the mic's production rate with no drift.
+    //
+    //   * Mic OFF — fill_audio_frame short-circuits to a memset of
+    //     silence with zero wall-clock cost. Without an external
+    //     pacer the task would spin as fast as Shine can encode 576
+    //     zeros (Shine is deterministic, so this is CPU-bound at
+    //     ~8-10 ms/frame — i.e. ~3x too fast), producing far more
+    //     audio chunks per second than the declared 22.05 kHz rate.
+    //     The AVI's audio timeline then runs ahead of the video and
+    //     playback desyncs badly. To avoid that we fall back to a
+    //     wall-clock sleep of one frame period whenever the mic isn't
+    //     running, using the same drift-free incrementing `next_us`
+    //     pattern as video_task_fn.
+    const int64_t frame_period_us =
+        ((int64_t)samples_per_frame * 1000000LL) / (int64_t)AUDIO_SAMPLE_RATE;
+    int64_t next_us = esp_timer_get_time() + frame_period_us;
+
     // Channel-major pointer array. Shine's mono encoder reads only
     // channel 0 (see layer3.c:shine_encode_buffer — the stride is
     // config->wave.channels which is 1 for PCM_MONO), so a single-
@@ -439,6 +452,17 @@ static void audio_task_fn(void *arg) {
     int      acc_n      = 0;
 
     while (s_rec.running) {
+        // Mic-off pacing (see comment above): sleep to the wall-clock
+        // target before reading, so silent-audio recordings don't run
+        // ahead of the video track. When the mic is running we skip
+        // the sleep entirely and let microphone_read_pcm pace us; we
+        // still advance next_us so a mid-recording state change (not
+        // currently possible but cheap insurance) picks up cleanly.
+        if (!microphone_is_running()) {
+            sleep_until_us(next_us);
+        }
+        next_us += frame_period_us;
+
         int64_t t0 = esp_timer_get_time();
         fill_audio_frame(s_rec.pcm_scratch, samples_per_frame);
         int64_t t1 = esp_timer_get_time();
