@@ -52,15 +52,19 @@ static const char *TAG = "microphone";
 // Resampler constants. Empirically the LEFT-channel frame rate on a
 // 48 kHz I2S config lands at ~44,800 Hz (the P4's fractional divider
 // can't hit 48 kHz exactly — see the long comment above). We resample
-// to 44,100 Hz so that the rate we write into the MP3 header is the
-// rate our samples actually represent.
+// to 22,050 Hz so the output matches the MPEG-II Layer III rate that
+// Shine encodes below (and that the AVI file advertises). Dropping
+// to 22.05 kHz mono makes Shine's per-frame workload about a quarter
+// of the 44.1 kHz stereo configuration, which was bottlenecking the
+// audio task at ~30 ms/frame on RISC-V and causing ~13 % of samples
+// to be dropped at the stream buffer.
 //
 // RESAMPLE_STEP_Q16 is the fixed-point increment added to the phase
 // accumulator for each *output* sample, expressed in units where
 // 65536 = one source-sample interval. For downsampling
 // (src_hz > dst_hz) this is > 65536.
 #define MIC_SRC_HZ         44800u
-#define MIC_DST_HZ         44100u
+#define MIC_DST_HZ         22050u
 #define RESAMPLE_STEP_Q16  ((uint32_t)((MIC_SRC_HZ * 65536ull) / MIC_DST_HZ))
 
 // Pin assignments — see microphone.h header comment and
@@ -334,14 +338,14 @@ esp_err_t microphone_start(void) {
         return err;
     }
 
-    // Trigger level = 2304 bytes = 1152 int16 mono samples = one MPEG-1
-    // Layer III frame at 44.1 kHz. With this, xStreamBufferReceive
+    // Trigger level = 1152 bytes = 576 int16 mono samples = one MPEG-II
+    // Layer III frame at 22.05 kHz. With this, xStreamBufferReceive
     // blocks precisely until a full audio frame's worth is available,
     // which naturally paces the recorder's audio task to the mic's
     // production rate (no tick-rounded sleep needed on its side). For
     // other target rates/codecs we'd need to adjust — but right now
-    // 44.1 kHz MPEG-1 is baked into the whole audio chain.
-    s_pcm_stream = xStreamBufferCreate(MIC_STREAM_BYTES, 2304);
+    // 22.05 kHz MPEG-II mono is baked into the whole audio chain.
+    s_pcm_stream = xStreamBufferCreate(MIC_STREAM_BYTES, 1152);
     if (!s_pcm_stream) {
         ESP_LOGE(TAG, "stream buffer create failed");
         i2s_del_channel(s_rx_handle);
@@ -422,9 +426,32 @@ void microphone_capture_reset(void) {
 
 size_t microphone_read_pcm(int16_t *dst, size_t n_samples, TickType_t timeout) {
     if (!s_running || !s_pcm_stream || !dst || n_samples == 0) return 0;
-    size_t got = xStreamBufferReceive(s_pcm_stream, dst,
-                                      n_samples * sizeof(int16_t), timeout);
-    return got / sizeof(int16_t);
+
+    // FreeRTOS stream buffers only honour the trigger level when the
+    // receiver is *blocked* — once the reader is scheduled it will
+    // return whatever happens to be in the buffer, even if that's
+    // far less than requested (the relevant check in stream_buffer.c
+    // compares against xBytesToStoreMessageLength, which is 0 for a
+    // plain stream buffer, NOT against the trigger level). That
+    // meant the audio task was seeing partial frames nearly every
+    // iteration; the caller zero-filled the missing half and we
+    // encoded silence 40 % of the time. Loop here until we've
+    // actually accumulated the full requested amount or the overall
+    // timeout expires, so the caller gets contiguous live audio.
+    size_t target_bytes = n_samples * sizeof(int16_t);
+    size_t got_bytes    = 0;
+    TickType_t start    = xTaskGetTickCount();
+    while (got_bytes < target_bytes) {
+        TickType_t elapsed   = xTaskGetTickCount() - start;
+        TickType_t remaining = (elapsed >= timeout) ? 0 : (timeout - elapsed);
+        size_t n = xStreamBufferReceive(s_pcm_stream,
+                                        (uint8_t *)dst + got_bytes,
+                                        target_bytes - got_bytes,
+                                        remaining);
+        if (n == 0) break; // timeout reached with nothing new
+        got_bytes += n;
+    }
+    return got_bytes / sizeof(int16_t);
 }
 
 // --- Debug raw dump --------------------------------------------------------

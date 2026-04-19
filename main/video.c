@@ -44,21 +44,21 @@ static const char *TAG = "video";
 //   * GOP=15 means one keyframe per second, which keeps seeks
 //     responsive on the videoplayer side without inflating the
 //     bitrate much.
-//   * Audio is stereo 44.1 kHz 128 kbps MPEG-1 Layer III, joint-
-//     stereo mode. Rate + channel count + bitrate all match the
-//     parameters the companion videoplayer's convert_h264.sh
-//     script uses (libmp3lame -b:a 128k -ar 44100 -ac 2): the
-//     videoplayer writes decoded samples straight to a STEREO I2S
-//     without ever checking the MP3's channel count, so a mono MP3
-//     gets played back at half speed with every other sample ending
-//     up in the wrong channel. Joint-stereo on an L==R signal
-//     compresses almost as well as mono because the side channel
-//     is zero; the mic is mono in hardware and we just duplicate
-//     into both channels at encode time. Rate-wise, the ESP32-P4
-//     I2S peripheral can't synthesise 44.1 kHz exactly (PLL_F160M
-//     is 2^11 × 5^7, no factor of 3); a 48 kHz configured mic
-//     request lands at ~44.8 kHz actual and we resample to 44.1
-//     in microphone.c. 0.27 semitone pitch offset, imperceptible.
+//   * Audio is mono 22.05 kHz 64 kbps MPEG-II Layer III. At 44.1 kHz
+//     stereo MPEG-I (our previous config), Shine was spending
+//     ~30 ms/frame on RISC-V — 15 % over budget for the 26.1 ms
+//     per-frame window — which caused ~13 % of mic samples to be
+//     dropped at the stream buffer and the recorded audio to come
+//     up short. Dropping to 22.05 kHz mono quarters the per-frame
+//     workload (half the samples × half the channels) and leaves
+//     generous headroom. Per-frame time budget at 576 samples /
+//     22050 Hz is still 26.1 ms — identical to MPEG-I — but Shine
+//     comes in around ~7-8 ms so we never drop samples. Quality-
+//     wise this is voice-memo territory, appropriate for a handheld
+//     mic: 11 kHz Nyquist covers all speech formants and sibilants.
+//     Rate-wise the ESP32-P4 I2S still runs at 48 kHz nominal
+//     (actual ~44.8 kHz — PLL_F160M is 2^11 × 5^7, no factor of 3)
+//     and we resample 44.8 → 22.05 in microphone.c.
 #define VIDEO_W                400u
 #define VIDEO_H                320u
 #define VIDEO_W_PADDED         400u                 // already mult-of-16
@@ -67,10 +67,10 @@ static const char *TAG = "video";
 #define VIDEO_BITRATE          400000u
 #define VIDEO_GOP              15u
 
-#define AUDIO_SAMPLE_RATE      44100u
-#define AUDIO_CHANNELS         2u
-#define AUDIO_BITRATE_KBPS     128
-#define AUDIO_AVG_BYTES_PER_S  (AUDIO_BITRATE_KBPS * 1000 / 8) // 16000
+#define AUDIO_SAMPLE_RATE      22050u
+#define AUDIO_CHANNELS         1u
+#define AUDIO_BITRATE_KBPS     64
+#define AUDIO_AVG_BYTES_PER_S  (AUDIO_BITRATE_KBPS * 1000 / 8) // 8000
 
 // YUV420 "packed" (O_UYY_E_VYY) buffer size at padded stride — this
 // is the exact size h264_enc expects when width/height are rounded
@@ -429,10 +429,11 @@ static void audio_task_fn(void *arg) {
     // stalls entirely, the 100 ms Receive timeout kicks in and we
     // zero-fill to keep the recorder producing chunks.
     //
-    // Channel-major pointer array — the mic is mono so we point
-    // both L and R at the same scratch; joint-stereo in Shine
-    // compresses the (zero) side channel away for free.
-    int16_t *chan_bufs[2] = { s_rec.pcm_scratch, s_rec.pcm_scratch };
+    // Channel-major pointer array. Shine's mono encoder reads only
+    // channel 0 (see layer3.c:shine_encode_buffer — the stride is
+    // config->wave.channels which is 1 for PCM_MONO), so a single-
+    // entry array is all we need.
+    int16_t *chan_bufs[1] = { s_rec.pcm_scratch };
 
     uint64_t acc_gen_us = 0, acc_enc_us = 0, acc_write_us = 0;
     int      acc_n      = 0;
@@ -559,15 +560,15 @@ static esp_err_t setup_h264_encoder(void) {
 static esp_err_t setup_shine(void) {
     shine_config_t cfg;
     shine_set_config_mpeg_defaults(&cfg.mpeg);
-    // Stereo + joint-stereo: we feed Shine the same mono buffer as
-    // both L and R (see audio_task_fn's chan_bufs), and joint-
-    // stereo's mid/side encoding makes the (zero) side channel
-    // essentially free — the resulting MP3 is barely larger than
-    // the equivalent mono encode, but decodes into something the
-    // videoplayer's stereo I2S can play correctly.
-    cfg.wave.channels   = PCM_STEREO;
+    // Mono MPEG-II at 22.05 kHz — see the AUDIO_* defines comment at
+    // the top of this file for the reasoning. The videoplayer's
+    // convert_h264.sh produces stereo 44.1 kHz today; the videoplayer
+    // decoder side will need a pass to confirm it handles mono MP3s
+    // cleanly without channel-doubling or speed-doubling artefacts
+    // before this is considered done.
+    cfg.wave.channels   = PCM_MONO;
     cfg.wave.samplerate = AUDIO_SAMPLE_RATE;
-    cfg.mpeg.mode       = JOINT_STEREO;
+    cfg.mpeg.mode       = MONO;
     cfg.mpeg.bitr       = AUDIO_BITRATE_KBPS;
     cfg.mpeg.emph       = NONE;
     cfg.mpeg.copyright  = 0;

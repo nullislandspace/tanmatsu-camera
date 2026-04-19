@@ -241,7 +241,7 @@ static esp_err_t write_headers(avi_mux_t *mux) {
     // MPEGLAYER3WAVEFORMAT extension
     if (wr_u16(f, 1)) return ESP_FAIL;                             // wID = MPEGLAYER3_ID_MPEG
     if (wr_u32(f, 2)) return ESP_FAIL;                             // fdwFlags = MPEGLAYER3_FLAG_PADDING_OFF
-    if (wr_u16(f, 1152)) return ESP_FAIL;                          // nBlockSize (samples per MPEG frame, Layer III)
+    if (wr_u16(f, mux->audio_samples_per_frame)) return ESP_FAIL;  // nBlockSize (samples per MPEG frame: 1152 Layer-III MPEG-I, 576 MPEG-II)
     if (wr_u16(f, 1)) return ESP_FAIL;                             // nFramesPerBlock
     if (wr_u16(f, 1393)) return ESP_FAIL;                          // nCodecDelay (Fraunhofer default for MP3)
 
