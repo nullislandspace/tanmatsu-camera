@@ -15,18 +15,15 @@
 //   L/R → GND (mic drives the LEFT half-frame)
 //   VDD → +3.3V, GND → GND
 //
-// Internally the I2S controller runs at 48 kHz nominal in STEREO
-// Philips mode with 32-bit slots (BCLK ≈ 3.072 MHz, inside INMP441
-// spec). The ESP32-P4 has no APLL for I2S and PLL_F160M can't
-// synthesise 48 kHz exactly; the fractional divider lands at
-// ~44.8 kHz actual frame rate. A background reader task drains DMA
-// continuously, picks the LEFT slot out of each stereo frame (the
-// INMP441 drives only LEFT because its L/R strap is tied to GND),
-// applies digital gain with saturation, computes a rolling peak for
-// the HUD meter, and publishes the samples as int16 mono PCM at the
-// mic's actual frame rate. Downstream AVI/Shine code labels the
-// stream as 44.1 kHz, which is 1.6 % off reality — a pitch shift
-// below the threshold of perception for speech.
+// Internally the I2S controller runs at 44.1 kHz in STEREO Philips
+// mode with 32-bit slots (BCLK = 2.8224 MHz, inside INMP441 spec).
+// A background reader task drains DMA continuously, picks the LEFT
+// slot out of each stereo frame (the INMP441 drives only LEFT
+// because its L/R strap is tied to GND), applies a 2-stage IIR
+// low-pass + digital gain with saturation, computes a rolling peak
+// for the HUD meter, then keeps every other LEFT sample to halve
+// the rate to 22.05 kHz mono — exactly the rate Shine encodes and
+// the AVI file advertises, so no fractional resampling is needed.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -79,10 +76,10 @@ size_t microphone_read_pcm(int16_t *dst, size_t n_samples, TickType_t timeout);
 
 // Debug helper: capture `seconds` worth of raw I2S samples (the
 // stereo-interleaved int32 stream BEFORE gain, peak tracking, LEFT
-// extraction and the 44.8→44.1 kHz resampler) into a PSRAM buffer,
-// then write them to `path` as a standard 32-bit PCM stereo WAV
-// claiming MIC_I2S_RATE_NOM (48 kHz). Blocks until the capture is
-// complete. Requires microphone_is_running() == true.
+// extraction and the 2:1 decimator) into a PSRAM buffer, then write
+// them to `path` as a standard 32-bit PCM stereo WAV claiming
+// MIC_I2S_RATE_NOM (44.1 kHz). Blocks until the capture is complete.
+// Requires microphone_is_running() == true.
 //
 // The file opens directly in any audio tool (Audacity, ffmpeg,
 // numpy's scipy.io.wavfile). The LEFT channel carries the actual

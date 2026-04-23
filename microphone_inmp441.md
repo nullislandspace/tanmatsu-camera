@@ -69,18 +69,96 @@ Implemented in `main/microphone.c` / `main/microphone.h`.
   codec path — which uses `I2S_NUM_0` in the BSP — is reserved for future
   audio playback without conflict.
 - RX-only channel, `I2S_ROLE_MASTER`, Philips standard mode.
-- `I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO)`.
-  The default `slot_mask` for mono is `I2S_STD_SLOT_LEFT`, which matches the
-  L/R → GND strap.
+- `I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO)`.
+  STEREO is **deliberate** even though only one mic is wired — see the
+  "Pitfalls" section below for why MONO mode doesn't work as expected on
+  the P4 RX path.
 - `gpio_cfg`: `.bclk = GPIO_NUM_54`, `.ws = GPIO_NUM_49`,
   `.din = GPIO_NUM_53`, `.mclk = I2S_GPIO_UNUSED`,
   `.dout = I2S_GPIO_UNUSED`.
-- **I2S runs at 32 kHz** internally so BCLK = 2.048 MHz, landing exactly on
-  the INMP441's spec minimum. A background reader task decimates 2:1 into a
-  stream buffer delivering 16 kHz mono int16 PCM to the recorder — which
-  keeps the existing AVI/Shine path (also 16 kHz mono) unchanged.
-- Peak detection runs over the full 32 kHz input for best level-meter
-  response and is exposed as `microphone_peak_level()` (0..32767).
+- **I2S runs at 44.1 kHz** so BCLK = 2.8224 MHz, comfortably inside the
+  INMP441's 2.048–4.096 MHz BCLK range. The reader task drains DMA, picks
+  the LEFT slot (RIGHT carries the floating DIN pin), gain-scales,
+  applies a 2-stage IIR low-pass (~4 kHz cutoff — also serves as the
+  decimation anti-alias), then keeps every other sample to halve the
+  rate to **22.05 kHz mono** — the exact rate Shine encodes and the AVI
+  file advertises. No fractional resampler, no rate drift.
+- DMA: 16 descriptors × 256 frames = ~93 ms of buffered audio. Each
+  `i2s_channel_read` consumes exactly one descriptor (2048 bytes); see
+  "Pitfalls" for why this is non-negotiable.
+- Reader task `mic_rx` runs at FreeRTOS priority **7**, above the video
+  encoder (`vid_rec`, prio 6) and audio encoder (`aud_rec`, prio 6) so
+  the I2S DMA reader is never preempted by the heavy encode work.
+- Telemetry: 5-second log line `rate: raw=N Hz emitted=N Hz (cfg=N Hz)
+  drops=N` lets you spot rate-mismatch or DMA-overflow regressions
+  without instrumentation. Healthy operation reads `raw≈88200`,
+  `emitted≈22050`, `drops=0`.
+- An `on_recv_q_ovf` ISR callback increments the `drops` counter when
+  the IDF's RX queue overflows (otherwise the IDF silently discards
+  the oldest descriptor without warning).
+- Peak detection runs over the full 44.1 kHz input (before decimation)
+  for best level-meter response and is exposed as
+  `microphone_peak_level()` (0..32767).
 - Lifecycle is driven by the main UI loop: the mic starts on
   MODE_VIDEO entry (when `config.mic_enabled` is set) and stops on exit.
   The HUD shows a green/yellow/red level bar whenever the mic is running.
+
+## Pitfalls discovered the hard way
+
+These all caused real bugs that wasted hours of debugging. Document them
+so the next person doesn't fall in.
+
+### MONO slot mask doesn't filter on P4 RX
+
+The IDF's `I2S_STD_SLOT_LEFT` mask is documented to deliver only the
+LEFT slot's data, but on the ESP32-P4 RX path it does **not** filter —
+both slots arrive interleaved in DMA, with the RIGHT slot carrying
+whatever the floating DIN pin produced (typically all-`0xFFFFFFFF`
+because the INMP441 tri-states during the unused half-frame).
+
+Workaround: configure STEREO explicitly and stride-2 through the
+buffer to pick the LEFT samples in software. The downstream cost is
+negligible — the IIR + decimator already iterate the buffer.
+
+### `i2s_channel_read` returns ESP_ERR_TIMEOUT with valid partial bytes
+
+`i2s_channel_read` doesn't atomically grab N descriptors. Internally it
+loops, calling `xQueueReceive` once per descriptor, copying data out,
+until the requested size is reached or a per-descriptor timeout fires.
+If the timeout fires partway through a multi-descriptor request, the
+function returns `ESP_ERR_TIMEOUT` with `bytes_read = (already-fetched
+bytes)` — i.e., **valid data is left in your buffer that you must
+process or you lose it**.
+
+The previous version of this driver requested 2 descriptors per call
+(4096 bytes) and did `if (err != ESP_OK) continue;`, which silently
+discarded ~2048 bytes on every timed-out read. The result looked exactly
+like a clock-divider bug: a rate-shaped phantom shortfall (~16 % at
+44.1 kHz, ~7 % at 48 kHz) with no other symptoms.
+
+Workaround: read **exactly one descriptor's worth per call**
+(`MIC_DMA_FRAMES = dma_frame_num × slots_per_frame`). Each call needs
+only one `xQueueReceive`, so it either succeeds atomically or returns
+0 bytes — no partial state to mishandle.
+
+### IDF RX ISR silently drops descriptors on queue overflow
+
+`components/esp_driver_i2s/i2s_common.c` (the `i2s_dma_rx_callback`) ::
+when the message queue is full and **no `on_recv_q_ovf` callback is
+registered**, the ISR discards the oldest descriptor without logging,
+without setting an error flag, and without notifying the reader. The
+loss appears downstream as a slow producer rate.
+
+Workaround: always register `on_recv_q_ovf` and surface the count in
+periodic telemetry. We do this via `mic_on_q_ovf` and the `drops=N`
+field in the 5-second rate log.
+
+### ESP32-P4 I2S clock source is XTAL by default, not PLL
+
+Unlike older ESP32 family chips, on the P4 `I2S_CLK_SRC_DEFAULT`
+resolves to `SOC_MOD_CLK_XTAL` (40 MHz), not a PLL. The 9-bit
+fractional divider can synthesize any standard audio rate to within
+parts-per-million accuracy from XTAL — clock setup is rarely the
+problem when audio rate looks wrong on the P4 (despite that being the
+first-instinct hypothesis). See the `i2s_channel_read` partial-read
+trap above for what's actually likely going wrong.
