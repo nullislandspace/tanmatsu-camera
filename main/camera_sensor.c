@@ -13,23 +13,20 @@
 static const char *TAG = "camera_sensor";
 
 #define SCCB_FREQ_HZ            100000
-// Unified format: preview and photo capture both run on the sensor's
-// highest-resolution MIPI mode. The preview pipeline PPA-scales this
-// into a letterboxed 16:9 display image, and photo capture is a
-// "stop sensor, grab current frame, start sensor" snapshot of the same
-// buffer — so the preview is always a true WYSIWYG preview of what
-// the shutter will save, with zero format-switch latency and no need
-// for AE/AWB snapshot/restore dance.
-#define PREVIEW_FORMAT_NAME     "MIPI_2lane_24Minput_RAW10_1920x1080_30fps"
-// Video recording format. 800x640 RAW8 @50fps is the largest sensor
-// mode that leaves enough PPA throughput to scale the preview AND
-// produce a YUV420 encoder input inside the 15-fps video frame
-// budget. At ~83ms/op on a 1920x1080 source the PPA would already be
-// over budget just doing the preview scale, let alone the recording
-// one; an 800x640 source frame is ~4x smaller so the same PPA work
-// fits comfortably. Matches the format the old working community
-// camera app used as its single preset (camera.md §8).
-#define VIDEO_FORMAT_NAME       "MIPI_2lane_24Minput_RAW8_800x640_50fps"
+
+// Per-sensor preview / video format names. preview is what mode PHOTO
+// (and VIEW, which reuses the preview as its backdrop) streams at;
+// video is what mode VIDEO streams at. On the OV5647 the two are
+// different — preview is the high-res RAW10 1920x1080 (every shutter
+// press is a snapshot of the live frame, full WYSIWYG) and video
+// drops to 800x640 RAW8 to stay inside the PPA throughput budget for
+// realtime encoding. On OV5640/OV5645 we use one shared RGB565 format
+// for all modes: those sensors deliver finished pixels directly, the
+// resolutions are already modest, and the PPA budget is fine.
+#define PREVIEW_FORMAT_OV5647   "MIPI_2lane_24Minput_RAW10_1920x1080_30fps"
+#define VIDEO_FORMAT_OV5647     "MIPI_2lane_24Minput_RAW8_800x640_50fps"
+#define SHARED_FORMAT_OV5640    "MIPI_2lane_24Minput_RGB565_1280x720_14fps"
+#define SHARED_FORMAT_OV5645    "MIPI_2lane_24Minput_RGB565_1280x960_30fps"
 
 // OmniVision Timing Group VTS (vertical total size / frame length in
 // lines) register pair. Identical on OV5640, OV5645 and OV5647 — it is
@@ -38,17 +35,45 @@ static const char *TAG = "camera_sensor";
 // frame rate down without touching the PCLK. Max exposure line count
 // tracks VTS automatically on these sensors so the built-in AE loop
 // gets more headroom rather than less.
+//
+// We treat the VTS-register write as the only working frame-rate cap:
+// previous attempts to limit fps via driver ioctls or alternate format
+// presets did not actually slow the OV5647. Read the active format's
+// nominal fps and the driver-just-written VTS register pair via SCCB
+// after every set_format_*() call so the same scaling math works for
+// any sensor + format pair without hardcoded base constants.
 #define OV_REG_TIMING_VTS_H     0x380E
 #define OV_REG_TIMING_VTS_L     0x380F
 
-// Base VTS and nominal frame rate for the 1920x1080 RAW10 preset:
-// ov5647_settings.h:492-493 writes VTS=1199 with a nominal 30 fps.
-// The 800x640 preset was empirically ~28% slow vs its nominal, so
-// 30 fps here might actually be closer to 21-22 fps in practice —
-// recalibrate after measuring the fin counter with the target VTS
-// applied.
-#define PREVIEW_BASE_VTS_LINES  1199u
-#define PREVIEW_BASE_FPS        30u
+// Map a driver-supplied sensor name string ("OV5647", "OV5640", ...)
+// onto our enum. Unknown names leave kind=UNKNOWN; the caller treats
+// that as "best-effort OV5647-style RAW pipeline" since the detect
+// loop already proved the sensor responds to SCCB and the standard OV
+// VTS bank.
+static camera_sensor_kind_t name_to_kind(const char *name) {
+    if (name == NULL) return CAMERA_SENSOR_UNKNOWN;
+    if (strcmp(name, "OV5647") == 0) return CAMERA_SENSOR_OV5647;
+    if (strcmp(name, "OV5640") == 0) return CAMERA_SENSOR_OV5640;
+    if (strcmp(name, "OV5645") == 0) return CAMERA_SENSOR_OV5645;
+    return CAMERA_SENSOR_UNKNOWN;
+}
+
+// Read VTS H/L back from the sensor and stash both that and the
+// active format's reported fps onto the sensor handle, so a later
+// camera_sensor_set_preview_fps() can scale relative to whatever the
+// driver just wrote rather than carrying a hardcoded OV5647-specific
+// base value. Failures are non-fatal — they just leave fps override
+// unavailable for the current format.
+static void capture_fps_base(camera_sensor_t *sensor, const esp_cam_sensor_format_t *fmt) {
+    if (sensor == NULL || fmt == NULL) return;
+    sensor->base_fps        = fmt->fps;
+    sensor->base_vts_lines  = 0;
+
+    uint8_t vts_h = 0, vts_l = 0;
+    if (camera_sensor_read_reg(sensor, OV_REG_TIMING_VTS_H, &vts_h) != ESP_OK) return;
+    if (camera_sensor_read_reg(sensor, OV_REG_TIMING_VTS_L, &vts_l) != ESP_OK) return;
+    sensor->base_vts_lines = ((uint32_t)vts_h << 8) | vts_l;
+}
 
 esp_err_t camera_sensor_detect(camera_sensor_t *out) {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
@@ -102,10 +127,21 @@ esp_err_t camera_sensor_detect(camera_sensor_t *out) {
         return ESP_ERR_NOT_FOUND;
     }
 
-    out->device = device;
-    out->sccb   = sccb;
-    ESP_LOGI(TAG, "Camera sensor detected");
+    out->device         = device;
+    out->sccb           = sccb;
+    out->kind           = name_to_kind(device->name);
+    out->base_vts_lines = 0;
+    out->base_fps       = 0;
+    ESP_LOGI(TAG, "Camera sensor detected: %s (kind=%d)",
+             device->name ? device->name : "?", (int)out->kind);
     return ESP_OK;
+}
+
+const char *camera_sensor_name(const camera_sensor_t *sensor) {
+    if (sensor == NULL || sensor->device == NULL || sensor->device->name == NULL) {
+        return "?";
+    }
+    return sensor->device->name;
 }
 
 void camera_sensor_release(camera_sensor_t *sensor) {
@@ -157,18 +193,49 @@ esp_err_t camera_sensor_set_format_by_name(camera_sensor_t *sensor, const char *
     }
 
     ESP_LOGI(TAG, "Format set: %s (%" PRIu32 "x%" PRIu32 ")", match->name, match->width, match->height);
+    capture_fps_base(sensor, match);
     if (out_fmt) {
         *out_fmt = *match;
     }
     return ESP_OK;
 }
 
+// Pick the format-name string for the requested mode based on which
+// sensor the detect loop bound to. Returns NULL if the mode is not
+// supported on this sensor (caller should surface an error).
+static const char *format_name_for(const camera_sensor_t *sensor, bool video) {
+    if (sensor == NULL) return NULL;
+    switch (sensor->kind) {
+        case CAMERA_SENSOR_OV5647:
+            return video ? VIDEO_FORMAT_OV5647 : PREVIEW_FORMAT_OV5647;
+        case CAMERA_SENSOR_OV5640:
+            // Single shared RGB565 format — OV5640 only ships one MIPI
+            // mode. video / preview return the same string so the
+            // PHOTO↔VIDEO transition is effectively a no-op.
+            return SHARED_FORMAT_OV5640;
+        case CAMERA_SENSOR_OV5645:
+            return SHARED_FORMAT_OV5645;
+        case CAMERA_SENSOR_UNKNOWN:
+        default:
+            // Unknown sensor — fall back to the OV5647 names. If the
+            // detected sensor doesn't actually advertise these formats
+            // the set_format query below will return ESP_ERR_NOT_FOUND
+            // and the caller can surface a "format not supported"
+            // error, which is honest about what's happening.
+            return video ? VIDEO_FORMAT_OV5647 : PREVIEW_FORMAT_OV5647;
+    }
+}
+
 esp_err_t camera_sensor_set_format_preview(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt) {
-    return camera_sensor_set_format_by_name(sensor, PREVIEW_FORMAT_NAME, out_fmt);
+    const char *name = format_name_for(sensor, false);
+    if (name == NULL) return ESP_ERR_NOT_SUPPORTED;
+    return camera_sensor_set_format_by_name(sensor, name, out_fmt);
 }
 
 esp_err_t camera_sensor_set_format_video(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt) {
-    return camera_sensor_set_format_by_name(sensor, VIDEO_FORMAT_NAME, out_fmt);
+    const char *name = format_name_for(sensor, true);
+    if (name == NULL) return ESP_ERR_NOT_SUPPORTED;
+    return camera_sensor_set_format_by_name(sensor, name, out_fmt);
 }
 
 esp_err_t camera_sensor_set_format_photo(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt) {
@@ -209,6 +276,7 @@ esp_err_t camera_sensor_set_format_photo(camera_sensor_t *sensor, esp_cam_sensor
     }
 
     ESP_LOGI(TAG, "Photo format: %s (%" PRIu32 "x%" PRIu32 ")", best->name, best->width, best->height);
+    capture_fps_base(sensor, best);
     if (out_fmt) {
         *out_fmt = *best;
     }
@@ -255,12 +323,29 @@ esp_err_t camera_sensor_write_reg(camera_sensor_t *sensor, uint16_t regaddr, uin
 }
 
 esp_err_t camera_sensor_set_preview_fps(camera_sensor_t *sensor, uint32_t target_fps) {
-    if (sensor == NULL || target_fps == 0 || target_fps > PREVIEW_BASE_FPS) {
+    if (sensor == NULL || target_fps == 0) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (sensor->base_vts_lines == 0 || sensor->base_fps == 0) {
+        // No active format captured yet — caller forgot to call
+        // camera_sensor_set_format_*() first, or the VTS read-back
+        // failed silently inside capture_fps_base().
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (target_fps > sensor->base_fps) {
+        // We can only slow the sensor down by lengthening VTS.
+        // Speeding it up would need a HTS cut or a new format preset.
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (target_fps == sensor->base_fps) {
+        // No-op: target matches native fps. Don't write the register
+        // — that way "cap to 15" on a 14fps sensor (OV5640 RGB565) is
+        // a clean no-op rather than a redundant SCCB write.
+        return ESP_OK;
     }
 
     // new_vts = base_vts * (base_fps / target_fps), rounded.
-    uint32_t vts = (PREVIEW_BASE_VTS_LINES * PREVIEW_BASE_FPS + target_fps / 2u) / target_fps;
+    uint32_t vts = (sensor->base_vts_lines * sensor->base_fps + target_fps / 2u) / target_fps;
     if (vts > 0xFFFFu) vts = 0xFFFFu;
 
     esp_err_t err = camera_sensor_write_reg(sensor, OV_REG_TIMING_VTS_H, (uint8_t)((vts >> 8) & 0xFFu));
@@ -268,6 +353,7 @@ esp_err_t camera_sensor_set_preview_fps(camera_sensor_t *sensor, uint32_t target
     err = camera_sensor_write_reg(sensor, OV_REG_TIMING_VTS_L, (uint8_t)(vts & 0xFFu));
     if (err != ESP_OK) return err;
 
-    ESP_LOGI(TAG, "preview fps override: %" PRIu32 " fps (VTS=%" PRIu32 ")", target_fps, vts);
+    ESP_LOGI(TAG, "preview fps override: %" PRIu32 " fps (VTS=%" PRIu32 ", base=%" PRIu32 "@%" PRIu32 "fps)",
+             target_fps, vts, sensor->base_vts_lines, sensor->base_fps);
     return ESP_OK;
 }

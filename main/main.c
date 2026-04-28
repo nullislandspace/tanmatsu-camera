@@ -45,26 +45,70 @@
 // dropping, no phase beating, and no wasted DMA.
 #define PREVIEW_TARGET_FPS 15u
 
-// Source descriptors for the two pipeline configurations the app
-// swaps between. PHOTO uses the sensor's highest-res MIPI mode so
-// preview and still capture can share a single WYSIWYG frame. VIDEO
-// drops to 800x640 RAW8 so the PPA has enough headroom to do both
-// the preview scale AND the YUV420 recording scale inside a 15 fps
-// frame budget (1920x1080 blew past ~83 ms per PPA op, turning the
-// whole pipeline into a 6-fps slideshow). See camera.md §9 for the
-// bandwidth math.
-static const camera_source_t SRC_PHOTO = {
+// Source descriptors for the OV5647 PHOTO ↔ VIDEO transitions. PHOTO
+// uses the sensor's highest-res MIPI mode so preview and still capture
+// can share a single WYSIWYG frame. VIDEO drops to 800x640 RAW8 so
+// the PPA has enough headroom to do both the preview scale AND the
+// YUV420 recording scale inside a 15 fps frame budget (1920x1080
+// blew past ~83 ms per PPA op, turning the whole pipeline into a
+// 6-fps slideshow). See camera.md §9 for the bandwidth math.
+//
+// OV5640/OV5645 use a single shared RGB565 source for all modes
+// (built dynamically below from the active esp_cam_sensor_format_t)
+// so the PHOTO↔VIDEO transition is a no-op for those sensors.
+static const camera_source_t SRC_OV5647_PHOTO = {
     .width          = 1920,
     .height         = 1080,
-    .is_raw10       = true,
+    .input_format   = CAMERA_INPUT_RAW10,
     .lane_rate_mbps = 500,
 };
-static const camera_source_t SRC_VIDEO = {
+static const camera_source_t SRC_OV5647_VIDEO = {
     .width          = 800,
     .height         = 640,
-    .is_raw10       = false,
+    .input_format   = CAMERA_INPUT_RAW8,
     .lane_rate_mbps = 200,
 };
+
+// Build a camera_source_t from the format the sensor driver just
+// reported back via set_format_*. Used for OV5640/OV5645 where the
+// dimensions and lane rate live entirely on the format struct so
+// there's nothing to hardcode.
+static camera_source_t source_from_format(const esp_cam_sensor_format_t *fmt,
+                                          camera_input_format_t input_format) {
+    camera_source_t src = {
+        .width          = fmt->width,
+        .height         = fmt->height,
+        .input_format   = input_format,
+        // mipi_clk in the format struct is the per-lane bit rate in
+        // Hz; the CSI controller config wants the same value in Mbps.
+        .lane_rate_mbps = fmt->mipi_info.mipi_clk / 1000000u,
+    };
+    return src;
+}
+
+// Pick the camera_source_t matching (sensor_kind, mode). For the
+// OV5647 we return the static SRC_* descriptors; for the YUV-class
+// sensors we synthesise it from the format the driver just bound to.
+// Caller must have run camera_sensor_set_format_*() immediately
+// before so `fmt` reflects the active format.
+static camera_source_t pick_source(camera_sensor_kind_t kind,
+                                   bool is_video_mode,
+                                   const esp_cam_sensor_format_t *fmt) {
+    switch (kind) {
+        case CAMERA_SENSOR_OV5647:
+            return is_video_mode ? SRC_OV5647_VIDEO : SRC_OV5647_PHOTO;
+        case CAMERA_SENSOR_OV5640:
+        case CAMERA_SENSOR_OV5645:
+        default:
+            // Both YUV-class sensors deliver RGB565 in the formats we
+            // pick. Unknown sensors fall through here too — if the
+            // detect loop bound to something we don't know about, we
+            // assume RGB565 input rather than RAW Bayer because the
+            // ISP-bypass path is the safer default (no chance of
+            // demosaicing non-Bayer data into garbage).
+            return source_from_format(fmt, CAMERA_INPUT_RGB565);
+    }
+}
 
 typedef enum {
     MODE_PHOTO = 0,
@@ -297,14 +341,19 @@ static void apply_saved_timezone(void) {
 // Tear the current preview pipeline down, reconfigure the sensor to
 // the format associated with the target mode, and bring the pipeline
 // back up. Used on F1/F2/F3 transitions — PHOTO and VIEW share the
-// 1920x1080 RAW10 source because F1 (viewer) doesn't actually stream
-// from the camera, it just reuses the preview pipeline as a backdrop.
+// preview format because F1 (viewer) doesn't actually stream from
+// the camera, it just reuses the preview pipeline as a backdrop.
+//
+// On OV5647 the PHOTO and VIDEO modes use distinct sensor presets
+// (high-res RAW10 vs low-res RAW8); on OV5640/OV5645 there is a
+// single shared RGB565 format and the rebuild is technically
+// unnecessary, but we still go through the motions so the pipeline
+// state-machine has one path through every transition.
 //
 // Returns ESP_OK if the transition completes; on failure the pipeline
 // is left torn down and the caller is expected to surface an error
 // screen / banner to the user.
 static esp_err_t switch_pipeline_to_source(camera_sensor_t *sensor,
-                                           const camera_source_t *src,
                                            bool is_video_mode,
                                            uint32_t preview_area_w,
                                            uint32_t preview_area_h) {
@@ -313,16 +362,29 @@ static esp_err_t switch_pipeline_to_source(camera_sensor_t *sensor,
     camera_sensor_stream(sensor, false);
     camera_preview_stop();
 
-    // Reconfigure the sensor. For PHOTO we use the 1920x1080 RAW10
-    // preset and then override VTS to land at PREVIEW_TARGET_FPS;
-    // for VIDEO we use the 800x640 RAW8 preset and leave the native
-    // 50 fps alone (the video task only pulls at 15 Hz, the extra
-    // frames are just wasted CSI DMA at <15 MB/s which is free).
+    // Reconfigure the sensor. On OV5647: PHOTO uses 1920x1080 RAW10
+    // capped to PREVIEW_TARGET_FPS via VTS; VIDEO uses 800x640 RAW8
+    // and leaves the native 50 fps alone (the video task only pulls
+    // at 15 Hz, the extra frames are just wasted CSI DMA at <15 MB/s
+    // which is free). On OV5640/OV5645: both modes pick the single
+    // RGB565 preset and we cap to PREVIEW_TARGET_FPS unconditionally
+    // (a no-op when the native rate is already <= 15).
+    esp_cam_sensor_format_t fmt = {0};
     esp_err_t err;
     if (is_video_mode) {
-        err = camera_sensor_set_format_video(sensor, NULL);
+        err = camera_sensor_set_format_video(sensor, &fmt);
+        // OV5640/OV5645: the shared format runs at native 14/30 fps;
+        // 30 fps is way over our PSRAM bandwidth budget, so apply the
+        // cap on the video preset too. OV5647 keeps its native 50 fps
+        // for VIDEO mode (see comment above), so only apply the cap
+        // on RGB565-class sensors.
+        if (err == ESP_OK && sensor->kind != CAMERA_SENSOR_OV5647) {
+            if (camera_sensor_set_preview_fps(sensor, PREVIEW_TARGET_FPS) != ESP_OK) {
+                ESP_LOGW(TAG, "fps cap on video preset failed");
+            }
+        }
     } else {
-        err = camera_sensor_set_format_preview(sensor, NULL);
+        err = camera_sensor_set_format_preview(sensor, &fmt);
         if (err == ESP_OK) {
             if (camera_sensor_set_preview_fps(sensor, PREVIEW_TARGET_FPS) != ESP_OK) {
                 ESP_LOGW(TAG, "fps override failed, continuing at native rate");
@@ -334,7 +396,8 @@ static esp_err_t switch_pipeline_to_source(camera_sensor_t *sensor,
         return err;
     }
 
-    err = camera_preview_start(src, preview_area_w, preview_area_h);
+    camera_source_t src = pick_source(sensor->kind, is_video_mode, &fmt);
+    err = camera_preview_start(&src, preview_area_w, preview_area_h);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "preview start: %d", err);
         return err;
@@ -537,24 +600,29 @@ void app_main(void) {
     // Show the branded splash screen for 2 seconds (non-fatal if missing).
     splash_show(&fb);
 
-    // Detect the OV5647 and configure it for the preview format.
-    // The JPEG splash screen stays visible during detection.
+    // Detect the camera sensor and configure it for the preview format.
+    // The JPEG splash screen stays visible during detection. The detect
+    // loop walks every linker-registered esp_cam_sensor driver, so any
+    // of OV5647/OV5640/OV5645 will bind here depending on what's
+    // physically wired to the I2C bus.
     camera_sensor_t sensor = {0};
     if (camera_sensor_detect(&sensor) != ESP_OK) {
         splash(RED, WHITE, "Camera error", "No sensor detected");
         wait_for_esc();
         return;
     }
-    if (camera_sensor_set_format_preview(&sensor, NULL) != ESP_OK) {
+    esp_cam_sensor_format_t initial_fmt = {0};
+    if (camera_sensor_set_format_preview(&sensor, &initial_fmt) != ESP_OK) {
         splash(RED, WHITE, "Camera error", "Format not supported");
         wait_for_esc();
         return;
     }
-    // set_format wrote the 50 fps default VTS; override it to our
+    // set_format wrote the format's default VTS; override it to our
     // target rate before starting the stream. This has to happen
     // AFTER set_format (which would otherwise overwrite it) and can
     // happen BEFORE the CSI pipeline comes up (SCCB writes are
-    // independent of the stream).
+    // independent of the stream). On sensors whose native rate is
+    // already <= PREVIEW_TARGET_FPS the override is a no-op.
     if (camera_sensor_set_preview_fps(&sensor, PREVIEW_TARGET_FPS) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to lower preview fps, continuing at native rate");
     }
@@ -591,7 +659,8 @@ void app_main(void) {
     const uint32_t hud_area_x      = preview_area_w;             // 600
     const uint32_t hud_area_w      = logical_w - preview_area_w; // 200
 
-    if (camera_preview_start(&SRC_PHOTO, preview_area_w, preview_area_h) != ESP_OK) {
+    camera_source_t initial_src = pick_source(sensor.kind, false, &initial_fmt);
+    if (camera_preview_start(&initial_src, preview_area_w, preview_area_h) != ESP_OK) {
         splash(RED, WHITE, "Camera error", "Pipeline start failed");
         wait_for_esc();
         return;
@@ -772,10 +841,15 @@ void app_main(void) {
                         if (mode == MODE_VIEW) viewer_close();
                         if (mode != MODE_PHOTO) {
                             // Coming back from VIDEO: re-bring the
-                            // pipeline up on the 1920x1080 RAW10
-                            // preset so subsequent photos are sharp.
+                            // pipeline up on the preview format. On
+                            // OV5647 that's the 1920x1080 RAW10 preset
+                            // so subsequent photos are sharp; on
+                            // OV5640/OV5645 it's the same shared RGB565
+                            // format we were already on, so this is a
+                            // pipeline rebuild but no sensor-side
+                            // format change.
                             esp_err_t serr = switch_pipeline_to_source(
-                                &sensor, &SRC_PHOTO, false,
+                                &sensor, false,
                                 preview_area_w, preview_area_h);
                             if (serr != ESP_OK) {
                                 SHOW_BANNER("Mode switch failed (%d)", serr);
@@ -789,11 +863,14 @@ void app_main(void) {
                         if (video_is_recording()) break;  // already in video mode
                         if (mode == MODE_VIEW) viewer_close();
                         if (mode != MODE_VIDEO) {
-                            // Swap to 800x640 RAW8 so the PPA has
-                            // enough headroom for preview + YUV420
+                            // OV5647: swap to 800x640 RAW8 so the PPA
+                            // has enough headroom for preview + YUV420
                             // recording scale inside 15 fps budget.
+                            // OV5640/OV5645: same shared RGB565 format
+                            // as PHOTO mode (those sensors don't have
+                            // a separate low-res video preset).
                             esp_err_t serr = switch_pipeline_to_source(
-                                &sensor, &SRC_VIDEO, true,
+                                &sensor, true,
                                 preview_area_w, preview_area_h);
                             if (serr != ESP_OK) {
                                 SHOW_BANNER("Mode switch failed (%d)", serr);
@@ -1184,6 +1261,13 @@ void app_main(void) {
                                       "UP/DN focus", hud_font);
                 hud_y += hud_line;
             }
+
+            // Sensor model footer at the bottom of the HUD strip.
+            // Pinned to a fixed y rather than appended to hud_y so it
+            // never collides with whatever the variable-height blocks
+            // above it (audio meter, focus readout) push down to.
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, 458,
+                                  camera_sensor_name(&sensor), hud_font);
 
             // Transient banner (e.g. "Saved IMG_xxx.jpg"). Draw it
             // left-aligned over the preview area so long filenames

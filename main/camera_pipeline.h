@@ -16,16 +16,28 @@
 // (main.c handles this on F1/F2/F3 key presses) and rebuilds the
 // pipeline with the appropriate source descriptor.
 
+// What kind of pixel stream the sensor is delivering on the MIPI CSI
+// bus. RAW8/RAW10 (Bayer) flow through the P4 ISP demosaicer to land
+// as RGB565 in PSRAM; RGB565 (OV5640/OV5645 with the on-chip ISP
+// already producing finished pixels) bypasses the demosaicer and the
+// ISP processor runs in pass-through mode. Bytes-per-pixel is always
+// 2 in PSRAM regardless — the buffer holds RGB565 in either case.
+typedef enum {
+    CAMERA_INPUT_RAW8 = 0,
+    CAMERA_INPUT_RAW10,
+    CAMERA_INPUT_RGB565,
+} camera_input_format_t;
+
 // Description of the sensor source currently feeding the pipeline. The
 // caller gets these values from camera_sensor_set_format_*() /
 // esp_cam_sensor_format_t and passes them through here so the CSI
 // controller, ISP processor, and PPA SRM all agree on dimensions and
 // on the raw pixel format.
 typedef struct {
-    uint32_t width;              // sensor active area width in pixels
-    uint32_t height;             // sensor active area height in pixels
-    bool     is_raw10;           // true = 10-bit raw, false = 8-bit raw
-    uint32_t lane_rate_mbps;     // MIPI CSI-2 bit rate per lane, Mbps
+    uint32_t              width;              // sensor active area width in pixels
+    uint32_t              height;             // sensor active area height in pixels
+    camera_input_format_t input_format;       // pixel format the sensor emits on MIPI CSI
+    uint32_t              lane_rate_mbps;     // MIPI CSI-2 bit rate per lane, Mbps
 } camera_source_t;
 
 // Bring up the pipeline. `src` describes the sensor output format the

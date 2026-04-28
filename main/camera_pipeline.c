@@ -33,10 +33,10 @@ static const char *TAG = "camera_pipeline";
 #define BYTES_PER_PIXEL     2     // RGB565 (ISP output, not the RAW input)
 
 // Current source descriptor, filled in by camera_preview_start.
-static uint32_t s_src_w         = 0;
-static uint32_t s_src_h         = 0;
-static bool     s_src_is_raw10  = false;
-static uint32_t s_src_lane_rate = 0;
+static uint32_t              s_src_w            = 0;
+static uint32_t              s_src_h            = 0;
+static camera_input_format_t s_src_input_format = CAMERA_INPUT_RAW8;
+static uint32_t              s_src_lane_rate    = 0;
 
 // The preview pipeline bakes the display's 90° rotation into the PPA
 // output so the main UI can skip per-pixel rotation in software. The
@@ -307,10 +307,10 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
     }
     if (req_w == 0 || req_h == 0) return ESP_ERR_INVALID_ARG;
 
-    s_src_w         = src->width;
-    s_src_h         = src->height;
-    s_src_is_raw10  = src->is_raw10;
-    s_src_lane_rate = src->lane_rate_mbps;
+    s_src_w            = src->width;
+    s_src_h            = src->height;
+    s_src_input_format = src->input_format;
+    s_src_lane_rate    = src->lane_rate_mbps;
 
     // The ESP32-P4 PPA scale register (PPA_SR_SCAL_X_FRAG_V) has only 4
     // fractional bits — scale factor resolution is 1/16. Asking for a scale
@@ -394,13 +394,45 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
     // drawn anything.
     xSemaphoreGive(s_render_ready);
 
+    // Map the source input format onto the CSI / ISP color enums and
+    // decide whether the ISP runs as a Bayer demosaicer (OV5647: RAW
+    // in, RGB565 out) or as a transparent pass-through (OV5640/OV5645:
+    // sensor already delivers RGB565, ISP is in bypass mode so the
+    // CSI bridge still routes data through it but no color processing
+    // happens).
+    bool        bayer_input    = false;
+    cam_ctlr_color_t csi_in_ct = CAM_CTLR_COLOR_RGB565;
+    isp_color_t isp_in_ct      = ISP_COLOR_RGB565;
+    isp_color_t isp_out_ct     = ISP_COLOR_RGB565;
+    switch (s_src_input_format) {
+        case CAMERA_INPUT_RAW10:
+            bayer_input = true;
+            csi_in_ct   = CAM_CTLR_COLOR_RAW10;
+            isp_in_ct   = ISP_COLOR_RAW10;
+            isp_out_ct  = ISP_COLOR_RGB565;
+            break;
+        case CAMERA_INPUT_RAW8:
+            bayer_input = true;
+            csi_in_ct   = CAM_CTLR_COLOR_RAW8;
+            isp_in_ct   = ISP_COLOR_RAW8;
+            isp_out_ct  = ISP_COLOR_RGB565;
+            break;
+        case CAMERA_INPUT_RGB565:
+        default:
+            bayer_input = false;
+            csi_in_ct   = CAM_CTLR_COLOR_RGB565;
+            isp_in_ct   = ISP_COLOR_RGB565;
+            isp_out_ct  = ISP_COLOR_RGB565;
+            break;
+    }
+
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id                = 0,
         .h_res                  = s_src_w,
         .v_res                  = s_src_h,
         .data_lane_num          = PREVIEW_LANE_COUNT,
         .lane_bit_rate_mbps     = s_src_lane_rate,
-        .input_data_color_type  = s_src_is_raw10 ? CAM_CTLR_COLOR_RAW10 : CAM_CTLR_COLOR_RAW8,
+        .input_data_color_type  = csi_in_ct,
         .output_data_color_type = CAM_CTLR_COLOR_RGB565,
         .queue_items            = 1,
         .byte_swap_en           = false,
@@ -423,16 +455,26 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
     // the ISP defaults to BGGR (enum value 0), which demosaics the wrong
     // colour for every pixel and produces the classic green/magenta
     // speckle pattern on coloured regions.
+    //
+    // For RGB565-input sensors (OV5640/OV5645) we still need an ISP
+    // processor — on the ESP32-P4 the CSI receiver shares a bridge
+    // with the ISP and data has to flow through it to reach memory —
+    // but we run it in `flags.bypass_isp` mode where input==output
+    // and no color processing happens. The bayer_order field is
+    // ignored in bypass.
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_hz                 = 80 * 1000 * 1000,
         .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
-        .input_data_color_type  = s_src_is_raw10 ? ISP_COLOR_RAW10 : ISP_COLOR_RAW8,
-        .output_data_color_type = ISP_COLOR_RGB565,
+        .input_data_color_type  = isp_in_ct,
+        .output_data_color_type = isp_out_ct,
         .has_line_start_packet  = false,
         .has_line_end_packet    = false,
         .h_res                  = s_src_w,
         .v_res                  = s_src_h,
         .bayer_order            = COLOR_RAW_ELEMENT_ORDER_GBRG,
+        .flags = {
+            .bypass_isp = !bayer_input,
+        },
     };
     err = esp_isp_new_processor(&isp_cfg, &s_isp);
     if (err != ESP_OK) {
@@ -441,10 +483,16 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
     }
     ESP_ERROR_CHECK(esp_isp_enable(s_isp));
 
-    // Hardware autofocus statistics tap. Failure is non-fatal — the
-    // preview pipeline still works without AF.
-    if (autofocus_init(s_isp, s_src_w, s_src_h) != ESP_OK) {
-        ESP_LOGW(TAG, "autofocus_init failed, AF disabled");
+    // Hardware autofocus statistics tap. Only meaningful when the ISP
+    // is running as a demosaicer — the AF block consumes ISP edge
+    // statistics that don't exist in bypass mode. On RGB565 sensors
+    // we treat the camera as fixed-focus.
+    if (bayer_input) {
+        if (autofocus_init(s_isp, s_src_w, s_src_h) != ESP_OK) {
+            ESP_LOGW(TAG, "autofocus_init failed, AF disabled");
+        }
+    } else {
+        ESP_LOGI(TAG, "AF disabled (RGB565 sensor, ISP in bypass)");
     }
 
     ppa_client_config_t ppa_cfg = {
@@ -581,10 +629,10 @@ void camera_preview_stop(void) {
     s_cam_buf_sz = 0;
     if (s_preview_buffer) { free(s_preview_buffer); s_preview_buffer = NULL; s_preview_buffer_sz = 0; }
 
-    s_src_w         = 0;
-    s_src_h         = 0;
-    s_src_is_raw10  = false;
-    s_src_lane_rate = 0;
+    s_src_w            = 0;
+    s_src_h            = 0;
+    s_src_input_format = CAMERA_INPUT_RAW8;
+    s_src_lane_rate    = 0;
 }
 
 void camera_preview_give_render_ready(void) {
