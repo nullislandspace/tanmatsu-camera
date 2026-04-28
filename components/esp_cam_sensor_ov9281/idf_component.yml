@@ -1,0 +1,12 @@
+description: OmniVision OV9281 (1MP global-shutter monochrome) MIPI CSI-2 camera sensor driver. Plugs into the Espressif esp_cam_sensor framework via ESP_CAM_SENSOR_DETECT_FN auto-detect.
+url: https://github.com/cavac/tanmatsu-camera
+issues: https://github.com/cavac/tanmatsu-camera/issues
+version: 0.1.0
+targets:
+  - esp32p4
+dependencies:
+  idf: '>=5.3'
+  esp_sccb_intf:
+    version: '>=0.0.5'
+  espressif/esp_cam_sensor:
+    version: '>=1.7.0'

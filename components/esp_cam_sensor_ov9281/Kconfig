@@ -1,0 +1,51 @@
+menuconfig CAMERA_OV9281
+    bool "OV9281"
+    default n
+    depends on SOC_MIPI_CSI_SUPPORTED
+    help
+        Enable support for the OmniVision OV9281 1MP global-shutter
+        monochrome MIPI CSI-2 image sensor. Also covers OV9282, which
+        is register-compatible and reports the same chip ID (0x9281).
+
+if CAMERA_OV9281
+    menu "Auto detect OV9281"
+        config CAMERA_OV9281_AUTO_DETECT_MIPI_INTERFACE_SENSOR
+            bool "Detect for MIPI CSI interface sensor"
+            default y
+            help
+                When enabled, the OV9281 sensor will be automatically
+                detected and initialized on the MIPI CSI interface at
+                startup without requiring a manual ov9281_detect() call.
+    endmenu
+
+    choice CAMERA_OV9281_MIPI_DEFAULT_FMT
+        prompt "Default output format for MIPI CSI"
+        default CAMERA_OV9281_MIPI_RAW10_1280X800_30FPS
+        help
+            Default sensor format selected when the driver binds. Can
+            be changed at runtime by calling esp_cam_sensor_set_format
+            while the sensor is in stream-off state.
+
+        config CAMERA_OV9281_MIPI_RAW10_1280X800_30FPS
+            bool "RAW10 1280x800 30fps, MIPI 2-lane, 24M input"
+            help
+                Monochrome RAW10 at 1280x800, 30fps, 2-lane MIPI CSI-2
+                with 24MHz reference clock. Line rate 800 Mbps/lane.
+                Init sequence ported from the Linux mainline ov9282.c
+                driver.
+    endchoice
+
+    config CAMERA_OV9281_MIPI_IF_FORMAT_INDEX_DEFAULT
+        int
+        default 0 if CAMERA_OV9281_MIPI_RAW10_1280X800_30FPS
+        help
+            Index into the format_array of the format selected above.
+
+    config CAMERA_OV9281_CSI_LINESYNC_ENABLE
+        bool "Enable CSI line synchronization"
+        default y
+        help
+            Enable MIPI CSI-2 line synchronization (line short packets).
+            Improves frame sync and timing accuracy. Recommended unless
+            a downstream receiver requires it disabled.
+endif

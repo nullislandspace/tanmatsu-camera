@@ -27,6 +27,10 @@ static const char *TAG = "camera_sensor";
 #define VIDEO_FORMAT_OV5647     "MIPI_2lane_24Minput_RAW8_800x640_50fps"
 #define SHARED_FORMAT_OV5640    "MIPI_2lane_24Minput_RGB565_1280x720_14fps"
 #define SHARED_FORMAT_OV5645    "MIPI_2lane_24Minput_RGB565_1280x960_30fps"
+// OV9281 ships a single MIPI format. Same string is used for preview
+// and video, identical handling to the OV5640/45 RGB565 sensors —
+// PHOTO↔VIDEO is a no-op format-wise.
+#define SHARED_FORMAT_OV9281    "MIPI_2lane_24Minput_RAW10_1280x800_30fps"
 
 // OmniVision Timing Group VTS (vertical total size / frame length in
 // lines) register pair. Identical on OV5640, OV5645 and OV5647 — it is
@@ -55,6 +59,7 @@ static camera_sensor_kind_t name_to_kind(const char *name) {
     if (strcmp(name, "OV5647") == 0) return CAMERA_SENSOR_OV5647;
     if (strcmp(name, "OV5640") == 0) return CAMERA_SENSOR_OV5640;
     if (strcmp(name, "OV5645") == 0) return CAMERA_SENSOR_OV5645;
+    if (strcmp(name, "OV9281") == 0) return CAMERA_SENSOR_OV9281;
     return CAMERA_SENSOR_UNKNOWN;
 }
 
@@ -215,6 +220,10 @@ static const char *format_name_for(const camera_sensor_t *sensor, bool video) {
             return SHARED_FORMAT_OV5640;
         case CAMERA_SENSOR_OV5645:
             return SHARED_FORMAT_OV5645;
+        case CAMERA_SENSOR_OV9281:
+            // Monochrome RAW10 1280x800. Same format string for both
+            // modes — OV9281 has no dedicated low-res video preset.
+            return SHARED_FORMAT_OV9281;
         case CAMERA_SENSOR_UNKNOWN:
         default:
             // Unknown sensor — fall back to the OV5647 names. If the

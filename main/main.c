@@ -87,8 +87,8 @@ static camera_source_t source_from_format(const esp_cam_sensor_format_t *fmt,
 }
 
 // Pick the camera_source_t matching (sensor_kind, mode). For the
-// OV5647 we return the static SRC_* descriptors; for the YUV-class
-// sensors we synthesise it from the format the driver just bound to.
+// OV5647 we return the static SRC_* descriptors; for everything else
+// we synthesise it from the format the driver just bound to.
 // Caller must have run camera_sensor_set_format_*() immediately
 // before so `fmt` reflects the active format.
 static camera_source_t pick_source(camera_sensor_kind_t kind,
@@ -97,15 +97,22 @@ static camera_source_t pick_source(camera_sensor_kind_t kind,
     switch (kind) {
         case CAMERA_SENSOR_OV5647:
             return is_video_mode ? SRC_OV5647_VIDEO : SRC_OV5647_PHOTO;
+        case CAMERA_SENSOR_OV9281:
+            // Monochrome RAW10 — reuse the RAW10 demosaic path. The
+            // P4 ISP will produce roughly grayscale RGB565 because
+            // every input pixel carries the same luminance value
+            // regardless of which Bayer position the demosaicer
+            // assumes, with mild interpolation artifacts at edges.
+            return source_from_format(fmt, CAMERA_INPUT_RAW10);
         case CAMERA_SENSOR_OV5640:
         case CAMERA_SENSOR_OV5645:
         default:
-            // Both YUV-class sensors deliver RGB565 in the formats we
-            // pick. Unknown sensors fall through here too — if the
-            // detect loop bound to something we don't know about, we
-            // assume RGB565 input rather than RAW Bayer because the
-            // ISP-bypass path is the safer default (no chance of
-            // demosaicing non-Bayer data into garbage).
+            // YUV-class sensors deliver RGB565. Unknown sensors fall
+            // through here too — if the detect loop bound to something
+            // we don't recognise we assume RGB565 input rather than
+            // RAW Bayer because the ISP-bypass path is the safer
+            // default (no chance of demosaicing non-Bayer data into
+            // garbage).
             return source_from_format(fmt, CAMERA_INPUT_RGB565);
     }
 }

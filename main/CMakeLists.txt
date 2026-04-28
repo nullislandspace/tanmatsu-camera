@@ -38,6 +38,7 @@ idf_component_register(
 		shine
 		wear_levelling
 		pax-codecs
+		esp_cam_sensor_ov9281
 	INCLUDE_DIRS
 		"."
 		"focus"

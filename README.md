@@ -30,20 +30,32 @@ register wins.
 |--------|-------------------|-------------------------------------|----------------------------------------------------------------|
 | OV5647 | **Tested**        | RAW10 1920×1080 @30fps (capped 15)  | Reference target. Full pipeline: ISP demosaic + autofocus.     |
 | OV5640 | Implemented, untested | RGB565 1280×720 @14fps          | Sensor on-chip ISP delivers RGB565; P4 ISP runs in bypass.     |
-| OV5645 | Implemented, untested | RGB565 1280×960 @30fps (capped 15) | Same path as OV5640. Six MIPI presets exist; we pick RGB565.   |
+| OV5645 | Implemented, untested | RGB565 1280×960 @30fps (capped 15)  | Same path as OV5640. Six MIPI presets exist; we pick RGB565.   |
+| OV9281 | Implemented, untested | RAW10 1280×800 @30fps (capped 15) | Monochrome global-shutter. RAW10 routed through the demosaicer; output is approximately grayscale. |
 
-The OV5640/OV5645 paths were written without access to physical hardware
-and have only been verified to compile. They are designed conservatively
-to stay structurally close to the OV5647 path:
+The OV5640/OV5645/OV9281 paths were written without access to physical
+hardware and have only been verified to compile. They are designed
+conservatively to stay structurally close to the OV5647 path:
 
 - One shared sensor format for preview, photo, and video — no shutter-time
   format switch and no PHOTO↔VIDEO sensor reconfiguration.
-- The P4 ISP runs in `bypass_isp` mode (input==output==RGB565). The CSI
-  bridge still routes data through it because the P4 hardware shares the
-  bridge between CSI and ISP.
-- Autofocus is disabled. The ISP statistics block needed for AF is only
-  active on the demosaic (Bayer) path, so OV5640/OV5645 are treated as
-  fixed-focus.
+- For OV5640/OV5645 (RGB565 sensors): the P4 ISP runs in `bypass_isp`
+  mode (input==output==RGB565). The CSI bridge still routes data through
+  it because the P4 hardware shares the bridge between CSI and ISP.
+- For OV9281 (monochrome RAW10): the existing OV5647-style RAW10 →
+  demosaic → RGB565 path is reused. Because every input pixel carries
+  the same luminance signal regardless of which Bayer position the
+  demosaicer assumes, the output is approximately grayscale (R≈G≈B),
+  with mild interpolation artefacts at edges.
+- Autofocus is disabled on every non-OV5647 sensor. The ISP statistics
+  block needed for AF is meaningful only on a true Bayer pipeline, and
+  the OV9281 modules are mechanically fixed-focus anyway.
+
+OV9281 support ships as a separate component under `components/` rather
+than baked into the host code, so it can be lifted out and published as
+a standalone esp_cam_sensor-compatible driver. The init register sequence
+is ported from the Linux mainline `ov9282.c` driver (OV9281 and OV9282
+are register-compatible and report the same chip ID).
 
 The detected sensor model is shown at the bottom of the right-hand HUD
 strip so you can verify at a glance which path the firmware bound to.

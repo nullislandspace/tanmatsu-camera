@@ -15,6 +15,12 @@ typedef enum {
     CAMERA_SENSOR_OV5647,
     CAMERA_SENSOR_OV5640,
     CAMERA_SENSOR_OV5645,
+    // OV9281: 1MP global-shutter monochrome RAW10. Reuses the OV5647-
+    // class RAW Bayer pipeline; the demosaicer produces approximately
+    // grayscale output because every input pixel carries the same
+    // luminance signal regardless of which Bayer position the
+    // demosaicer assumes.
+    CAMERA_SENSOR_OV9281,
 } camera_sensor_kind_t;
 
 // A single detected camera sensor plus the SCCB handle it was opened with.
