@@ -31,6 +31,7 @@ static const char *TAG = "camera_sensor";
 // and video, identical handling to the OV5640/45 RGB565 sensors —
 // PHOTO↔VIDEO is a no-op format-wise.
 #define SHARED_FORMAT_OV9281 "MIPI_2lane_24Minput_RAW10_1280x800_30fps"
+#define SHARED_FORMAT_TC358743 "MIPI_2lane_27Minput_YUV422_800x480_60fps"
 
 // OmniVision Timing Group VTS (vertical total size / frame length in
 // lines) register pair. Identical on OV5640, OV5645 and OV5647 — it is
@@ -65,6 +66,8 @@ static camera_sensor_kind_t name_to_kind(const char *name) {
     return CAMERA_SENSOR_OV5645;
   if (strcmp(name, "OV9281") == 0)
     return CAMERA_SENSOR_OV9281;
+  if (strcmp(name, "TC358743") == 0)
+    return CAMERA_SENSOR_TC358743;
   return CAMERA_SENSOR_UNKNOWN;
 }
 
@@ -80,6 +83,15 @@ static void capture_fps_base(camera_sensor_t *sensor,
     return;
   sensor->base_fps = fmt->fps;
   sensor->base_vts_lines = 0;
+
+  // OV_REG_TIMING_VTS_H/L (0x380E/0x380F) is an OmniVision-specific
+  // register pair — it means nothing on the TC358743 (an HDMI bridge,
+  // not an OV image sensor with a line-length/VTS timing bank), and
+  // leaving base_vts_lines at 0 makes camera_sensor_set_preview_fps() a
+  // safe no-op for it (see the base_vts_lines==0 guard there) instead of
+  // reading/writing garbage into an unrelated chip register.
+  if (sensor->kind == CAMERA_SENSOR_TC358743)
+    return;
 
   uint8_t vts_h = 0, vts_l = 0;
   if (camera_sensor_read_reg(sensor, OV_REG_TIMING_VTS_H, &vts_h) != ESP_OK)
@@ -199,6 +211,9 @@ esp_err_t camera_sensor_set_format_by_name(camera_sensor_t *sensor,
 
   if (!match) {
     ESP_LOGE(TAG, "Format '%s' not reported by sensor", exact_name);
+    for (uint32_t i = 0; i < fmt_array.count; ++i) {
+      printf("Option: %s\r\n", fmt_array.format_array[i].name);
+    }
     return ESP_ERR_NOT_FOUND;
   }
 
@@ -209,7 +224,6 @@ esp_err_t camera_sensor_set_format_by_name(camera_sensor_t *sensor,
     ESP_LOGE(TAG, "set_format('%s'): %d", exact_name, err);
     return err;
   }
-
   ESP_LOGI(TAG, "Format set: %s (%" PRIu32 "x%" PRIu32 ")", match->name,
            match->width, match->height);
   capture_fps_base(sensor, match);
@@ -239,6 +253,8 @@ static const char *format_name_for(const camera_sensor_t *sensor, bool video) {
     // Monochrome RAW10 1280x800. Same format string for both
     // modes — OV9281 has no dedicated low-res video preset.
     return SHARED_FORMAT_OV9281;
+  case CAMERA_SENSOR_TC358743:
+    return SHARED_FORMAT_TC358743;
   case CAMERA_SENSOR_UNKNOWN:
   default:
     // Unknown sensor — fall back to the OV5647 names. If the
@@ -247,6 +263,8 @@ static const char *format_name_for(const camera_sensor_t *sensor, bool video) {
     // and the caller can surface a "format not supported"
     // error, which is honest about what's happening.
     return video ? VIDEO_FORMAT_OV5647 : PREVIEW_FORMAT_OV5647;
+    return SHARED_FORMAT_TC358743; // video ? VIDEO_FORMAT_OV5647 :
+                                   // PREVIEW_FORMAT_OV5647;
   }
 }
 

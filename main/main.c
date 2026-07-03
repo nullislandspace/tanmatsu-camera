@@ -104,6 +104,11 @@ static camera_source_t pick_source(camera_sensor_kind_t kind,
     // regardless of which Bayer position the demosaicer
     // assumes, with mild interpolation artifacts at edges.
     return source_from_format(fmt, CAMERA_INPUT_RAW10);
+  case CAMERA_SENSOR_TC358743:
+    // HDMI bridge delivers YUV422 (UYVY-packed). The pipeline
+    // runs ISP in bypass mode and does a CPU-side UYVY→RGB565
+    // conversion before the PPA SRM op.
+    return source_from_format(fmt, CAMERA_INPUT_YUV422);
   case CAMERA_SENSOR_OV5640:
   case CAMERA_SENSOR_OV5645:
   default:
@@ -446,7 +451,7 @@ static void wait_for_esc(void) {
 void app_main(void) {
   // Switch the USB PHY out of badgelink mode back into flash/monitor mode.
   // Must run before bsp_device_initialize(). See videoplayer usb_device.c.
-  usb_initialize();
+  // usb_initialize();
 
   // ===== FOR DEVELOPMENT ONLY =====
   // Give the host-side serial monitor time to reconnect after the USB PHY
@@ -567,6 +572,20 @@ void app_main(void) {
     wait_for_esc();
     return;
   }
+
+  gpio_config_t te_pin_cfg = {
+      .pin_bit_mask = BIT64(6),
+      .mode = GPIO_MODE_OUTPUT,
+  };
+  res = gpio_config(&te_pin_cfg);
+  if (res != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to assert camera/radio IO2: %d", res);
+    splash(RED, WHITE, "Camera error", "Cannot power camera");
+    wait_for_esc();
+    return;
+  }
+
+  gpio_set_level(6, true);
 
   // Mount the wear-levelled internal FAT partition (/int) — the
   // launcher stores HUD icons and other shared assets there. Failure

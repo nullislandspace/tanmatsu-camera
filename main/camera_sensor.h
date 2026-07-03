@@ -21,6 +21,7 @@ typedef enum {
   // luminance signal regardless of which Bayer position the
   // demosaicer assumes.
   CAMERA_SENSOR_OV9281,
+  CAMERA_SENSOR_TC358743,
 } camera_sensor_kind_t;
 
 // A single detected camera sensor plus the SCCB handle it was opened with.

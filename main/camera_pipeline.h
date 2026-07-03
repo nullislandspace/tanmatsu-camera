@@ -20,12 +20,15 @@
 // bus. RAW8/RAW10 (Bayer) flow through the P4 ISP demosaicer to land
 // as RGB565 in PSRAM; RGB565 (OV5640/OV5645 with the on-chip ISP
 // already producing finished pixels) bypasses the demosaicer and the
-// ISP processor runs in pass-through mode. Bytes-per-pixel is always
-// 2 in PSRAM regardless — the buffer holds RGB565 in either case.
+// ISP processor runs in pass-through mode. YUV422 (TC358743 HDMI
+// bridge) also bypasses the demosaicer — data arrives as UYVY-packed
+// bytes (2 bytes/pixel, same buffer size as RGB565) and the render
+// path does a CPU-side UYVY→RGB565 conversion before the PPA SRM op.
 typedef enum {
   CAMERA_INPUT_RAW8 = 0,
   CAMERA_INPUT_RAW10,
   CAMERA_INPUT_RGB565,
+  CAMERA_INPUT_YUV422,
 } camera_input_format_t;
 
 // Description of the sensor source currently feeding the pipeline. The

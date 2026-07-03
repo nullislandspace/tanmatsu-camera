@@ -67,7 +67,15 @@ void camera_pipeline_set_rotate_180(bool on) {
 
 static esp_cam_ctlr_handle_t s_csi = NULL;
 static isp_proc_handle_t s_isp = NULL;
+static bool s_isp_enabled = false; // tracks whether esp_isp_enable() was called
 static ppa_client_handle_t s_ppa = NULL;
+
+// Intermediate RGB565 buffer used when the sensor delivers YUV422 (UYVY)
+// data. The ISP runs in bypass mode so s_cam_buf[] holds UYVY bytes;
+// before each PPA op the render/snapshot path converts into this buffer
+// and hands it to the PPA as RGB565. Allocated only for YUV422 input.
+static uint8_t *s_yuv_conv_buf = NULL;
+static size_t s_yuv_conv_buf_sz = 0;
 
 // DOUBLE-BUFFERED CSI TARGETS. The ESP-IDF CSI driver only lets us
 // queue one trans at a time (queue_items=1) and the on_get_new_trans
@@ -117,6 +125,43 @@ static volatile bool s_running = false;
 static DRAM_ATTR volatile uint32_t s_cnt_get_new_trans = 0;
 static DRAM_ATTR volatile uint32_t s_cnt_trans_finished = 0;
 static DRAM_ATTR volatile uint32_t s_cnt_srm_done = 0;
+
+// Convert a UYVY-packed YUV422 frame (BT.601 limited range) to RGB565.
+// n = w * h pixels; output is an array of uint16_t RGB565 values.
+// Coefficients (right-shifted by 8):
+//   Y contribution:  298 ≈ 256 * 1.164
+//   V → R:           409 ≈ 256 * 1.596
+//   U → B:           516 ≈ 256 * 2.017
+//   U → G:           100 ≈ 256 * 0.392   V → G: 208 ≈ 256 * 0.813
+static void yuv422_uyvy_to_rgb565(const uint8_t *yuv, uint8_t *rgb, uint32_t w,
+                                  uint32_t h) {
+  uint32_t n = w * h;
+  const uint8_t *s = yuv;
+  uint16_t *d = (uint16_t *)rgb;
+  for (uint32_t i = 0; i < n; i += 2, s += 4) {
+    int u = (int)s[0] - 128;
+    int y0 = (int)s[1] - 16;
+    int v = (int)s[2] - 128;
+    int y1 = (int)s[3] - 16;
+    int c0 = 298 * y0 + 128;
+    int c1 = 298 * y1 + 128;
+    int rv = 409 * v;
+    int gu = -100 * u;
+    int gv = -208 * v;
+    int bu = 516 * u;
+#define CLAMP8(x) ((unsigned)(x) > 255u ? ((x) < 0 ? 0 : 255) : (x))
+    int r0 = CLAMP8((c0 + rv) >> 8);
+    int g0 = CLAMP8((c0 + gu + gv) >> 8);
+    int b0 = CLAMP8((c0 + bu) >> 8);
+    int r1 = CLAMP8((c1 + rv) >> 8);
+    int g1 = CLAMP8((c1 + gu + gv) >> 8);
+    int b1 = CLAMP8((c1 + bu) >> 8);
+    d[i] = (uint16_t)(((r0 & 0xF8u) << 8) | ((g0 & 0xFCu) << 3) | (b0 >> 3));
+    d[i + 1] =
+        (uint16_t)(((r1 & 0xF8u) << 8) | ((g1 & 0xFCu) << 3) | (b1 >> 3));
+#undef CLAMP8
+  }
+}
 
 // CSI and PPA ISR callbacks must live in IRAM when the CAM CSI ISR is
 // configured cache-safe (CONFIG_CAM_CTLR_MIPI_CSI_ISR_CACHE_SAFE=y), because
@@ -236,6 +281,8 @@ static void render_task(void *arg) {
     }
 
     // Serialise PPA client access against the photo snapshot path.
+    // For YUV422 input the conversion also runs inside this critical
+    // section so s_yuv_conv_buf stays stable for the entire PPA op.
     // ppa_do_scale_rotate_mirror + srm_done wait must happen
     // atomically from the PPA's point of view — max_pending_trans_num
     // is 1 on this client.
@@ -244,6 +291,12 @@ static void render_task(void *arg) {
     int64_t t_mutex_out = esp_timer_get_time();
     // Drain any stale srm_done left behind by a previous op.
     xSemaphoreTake(s_srm_done, 0);
+
+    // YUV422 (UYVY) input: convert to RGB565 before handing to PPA.
+    if (s_src_input_format == CAMERA_INPUT_YUV422 && s_yuv_conv_buf) {
+      yuv422_uyvy_to_rgb565(src, s_yuv_conv_buf, s_src_w, s_src_h);
+      src = s_yuv_conv_buf;
+    }
 
     ppa_srm_oper_config_t srm = {
         .in =
@@ -433,25 +486,39 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w,
   // happens).
   bool bayer_input = false;
   cam_ctlr_color_t csi_in_ct = CAM_CTLR_COLOR_RGB565;
+  cam_ctlr_color_t csi_out_ct = CAM_CTLR_COLOR_RGB565;
   isp_color_t isp_in_ct = ISP_COLOR_RGB565;
   isp_color_t isp_out_ct = ISP_COLOR_RGB565;
   switch (s_src_input_format) {
   case CAMERA_INPUT_RAW10:
     bayer_input = true;
     csi_in_ct = CAM_CTLR_COLOR_RAW10;
+    csi_out_ct = CAM_CTLR_COLOR_RGB565;
     isp_in_ct = ISP_COLOR_RAW10;
     isp_out_ct = ISP_COLOR_RGB565;
     break;
   case CAMERA_INPUT_RAW8:
     bayer_input = true;
     csi_in_ct = CAM_CTLR_COLOR_RAW8;
+    csi_out_ct = CAM_CTLR_COLOR_RGB565;
     isp_in_ct = ISP_COLOR_RAW8;
     isp_out_ct = ISP_COLOR_RGB565;
+    break;
+  case CAMERA_INPUT_YUV422:
+    // ISP runs in bypass mode — input/output must match.
+    // Camera buffers hold UYVY bytes; the render path converts
+    // to RGB565 in s_yuv_conv_buf before each PPA op.
+    bayer_input = false;
+    csi_in_ct = CAM_CTLR_COLOR_YUV422;
+    csi_out_ct = CAM_CTLR_COLOR_YUV422;
+    isp_in_ct = ISP_COLOR_YUV422;
+    isp_out_ct = ISP_COLOR_YUV422;
     break;
   case CAMERA_INPUT_RGB565:
   default:
     bayer_input = false;
     csi_in_ct = CAM_CTLR_COLOR_RGB565;
+    csi_out_ct = CAM_CTLR_COLOR_RGB565;
     isp_in_ct = ISP_COLOR_RGB565;
     isp_out_ct = ISP_COLOR_RGB565;
     break;
@@ -464,7 +531,7 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w,
       .data_lane_num = PREVIEW_LANE_COUNT,
       .lane_bit_rate_mbps = s_src_lane_rate,
       .input_data_color_type = csi_in_ct,
-      .output_data_color_type = CAM_CTLR_COLOR_RGB565,
+      .output_data_color_type = csi_out_ct,
       .queue_items = 1,
       .byte_swap_en = false,
       .bk_buffer_dis = false,
@@ -513,18 +580,37 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w,
     ESP_LOGE(TAG, "esp_isp_new_processor: %d", err);
     goto fail;
   }
-  ESP_ERROR_CHECK(esp_isp_enable(s_isp));
+  // esp_isp_enable() must NOT be called when bypass_isp=true — the
+  // driver explicitly rejects it with ESP_ERR_INVALID_STATE. Only
+  // Bayer-input sensors use the ISP demosaicer path and need enable.
+  s_isp_enabled = false;
+  if (bayer_input) {
+    ESP_ERROR_CHECK(esp_isp_enable(s_isp));
+    s_isp_enabled = true;
+  }
 
   // Hardware autofocus statistics tap. Only meaningful when the ISP
   // is running as a demosaicer — the AF block consumes ISP edge
-  // statistics that don't exist in bypass mode. On RGB565 sensors
-  // we treat the camera as fixed-focus.
+  // statistics that don't exist in bypass mode.
   if (bayer_input) {
     if (autofocus_init(s_isp, s_src_w, s_src_h) != ESP_OK) {
       ESP_LOGW(TAG, "autofocus_init failed, AF disabled");
     }
   } else {
-    ESP_LOGI(TAG, "AF disabled (RGB565 sensor, ISP in bypass)");
+    ESP_LOGI(TAG, "AF disabled (ISP in bypass mode)");
+  }
+
+  // For YUV422 input, allocate an RGB565 staging buffer that the
+  // render/snapshot path uses as PPA source after each UYVY→RGB565
+  // conversion. Same size as a camera buffer (w*h*2 bytes).
+  if (s_src_input_format == CAMERA_INPUT_YUV422) {
+    s_yuv_conv_buf_sz = s_cam_buf_sz;
+    s_yuv_conv_buf = heap_caps_aligned_calloc(
+        cache_line, 1, s_yuv_conv_buf_sz, MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+    if (!s_yuv_conv_buf) {
+      ESP_LOGE(TAG, "yuv_conv_buf alloc failed (%zu bytes)", s_yuv_conv_buf_sz);
+      goto fail;
+    }
   }
 
   ppa_client_config_t ppa_cfg = {
@@ -632,7 +718,10 @@ void camera_preview_stop(void) {
   }
   if (s_isp) {
     autofocus_shutdown();
-    esp_isp_disable(s_isp);
+    if (s_isp_enabled) {
+      esp_isp_disable(s_isp);
+      s_isp_enabled = false;
+    }
     esp_isp_del_processor(s_isp);
     s_isp = NULL;
   }
@@ -681,6 +770,12 @@ void camera_preview_stop(void) {
     free(s_preview_buffer);
     s_preview_buffer = NULL;
     s_preview_buffer_sz = 0;
+  }
+
+  if (s_yuv_conv_buf) {
+    free(s_yuv_conv_buf);
+    s_yuv_conv_buf = NULL;
+    s_yuv_conv_buf_sz = 0;
   }
 
   s_src_w = 0;
@@ -782,6 +877,11 @@ esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w,
     xSemaphoreGive(s_ppa_mutex);
     free(snap);
     return ESP_ERR_INVALID_STATE;
+  }
+
+  if (s_src_input_format == CAMERA_INPUT_YUV422 && s_yuv_conv_buf) {
+    yuv422_uyvy_to_rgb565(src, s_yuv_conv_buf, s_src_w, s_src_h);
+    src = s_yuv_conv_buf;
   }
 
   ppa_srm_oper_config_t srm = {
@@ -902,6 +1002,11 @@ esp_err_t camera_video_snapshot(uint8_t *out_buf, size_t out_buf_sz,
   if (src == NULL) {
     xSemaphoreGive(s_ppa_mutex);
     return ESP_ERR_INVALID_STATE;
+  }
+
+  if (s_src_input_format == CAMERA_INPUT_YUV422 && s_yuv_conv_buf) {
+    yuv422_uyvy_to_rgb565(src, s_yuv_conv_buf, s_src_w, s_src_h);
+    src = s_yuv_conv_buf;
   }
 
   ppa_srm_oper_config_t srm = {

@@ -39,6 +39,7 @@ idf_component_register(
 		wear_levelling
 		pax-codecs
 		esp_cam_sensor_ov9281
+		esp_cam_sensor_tc358743
 	INCLUDE_DIRS
 		"."
 		"focus"
