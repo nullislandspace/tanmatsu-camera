@@ -34,8 +34,8 @@ bool viewer_has_image(void);
 // viewer_get_width(). The pointer stays valid until the next
 // viewer_next/prev/close call.
 const uint8_t *viewer_get_pixels(void);
-uint32_t       viewer_get_width(void);
-uint32_t       viewer_get_height(void);
+uint32_t viewer_get_width(void);
+uint32_t viewer_get_height(void);
 
 // Basename of the current file, e.g. "IMG_20260410_150809.jpg".
 // Returns an empty string if no image is loaded.

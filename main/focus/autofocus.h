@@ -1,9 +1,9 @@
 #pragma once
 
+#include "driver/isp_types.h"
+#include "esp_err.h"
 #include <stdbool.h>
 #include <stdint.h>
-#include "esp_err.h"
-#include "driver/isp_types.h"
 
 // Hardware-assisted autofocus.
 //
@@ -19,12 +19,12 @@
 // is destroyed. Both PHOTO and VIDEO modes recreate the ISP via
 // camera_preview_start/stop, so AF naturally restarts on mode switch.
 
-esp_err_t autofocus_init(isp_proc_handle_t isp,
-                         uint16_t input_w, uint16_t input_h);
-void      autofocus_shutdown(void);
+esp_err_t autofocus_init(isp_proc_handle_t isp, uint16_t input_w,
+                         uint16_t input_h);
+void autofocus_shutdown(void);
 
 // Runtime gates. Cheap, callable from main task.
-void autofocus_set_enabled        (bool enabled);
+void autofocus_set_enabled(bool enabled);
 void autofocus_set_manual_override(bool active);
 
 // Called once per main-loop frame. If AF is enabled, not overridden,
@@ -34,11 +34,11 @@ void autofocus_set_manual_override(bool active);
 void autofocus_tick(uint16_t *focus_pos);
 
 typedef enum {
-    AF_HUD_OFF,       // disabled
-    AF_HUD_SEARCH,    // sweeping coarse / fine
-    AF_HUD_LOCK,      // converged, holding
-    AF_HUD_OVERRIDE,  // user holding UP/DN
+  AF_HUD_OFF,      // disabled
+  AF_HUD_SEARCH,   // sweeping coarse / fine
+  AF_HUD_LOCK,     // converged, holding
+  AF_HUD_OVERRIDE, // user holding UP/DN
 } af_hud_state_t;
 
-af_hud_state_t autofocus_hud_state    (void);
-int            autofocus_hud_sharpness(void);  // last definition[0] sample
+af_hud_state_t autofocus_hud_state(void);
+int autofocus_hud_sharpness(void); // last definition[0] sample

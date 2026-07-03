@@ -16,22 +16,23 @@ static const char *TAG = "focus_sim";
 static uint16_t s_pos = 512;
 
 static esp_err_t sim_probe(void) { return ESP_OK; }
-static esp_err_t sim_init (void) { return ESP_OK; }
+static esp_err_t sim_init(void) { return ESP_OK; }
 
 static esp_err_t sim_set_position(uint16_t pos) {
-    if (pos > 1023) pos = 1023;
-    s_pos = pos;
-    ESP_LOGD(TAG, "pos=%u", (unsigned)pos);
-    return ESP_OK;
+  if (pos > 1023)
+    pos = 1023;
+  s_pos = pos;
+  ESP_LOGD(TAG, "pos=%u", (unsigned)pos);
+  return ESP_OK;
 }
 
 const focus_driver_t focus_drv_simulator = {
-    .name         = "simulator",
+    .name = "simulator",
     .display_name = "Simulator",
-    .probe        = sim_probe,
-    .init         = sim_init,
+    .probe = sim_probe,
+    .init = sim_init,
     .set_position = sim_set_position,
-    .pos_min      = 0,
-    .pos_max      = 1023,
-    .pos_default  = 512,
+    .pos_min = 0,
+    .pos_max = 1023,
+    .pos_default = 512,
 };

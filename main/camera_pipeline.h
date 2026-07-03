@@ -1,8 +1,8 @@
 #pragma once
 
 #include <stdbool.h>
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -23,9 +23,9 @@
 // ISP processor runs in pass-through mode. Bytes-per-pixel is always
 // 2 in PSRAM regardless — the buffer holds RGB565 in either case.
 typedef enum {
-    CAMERA_INPUT_RAW8 = 0,
-    CAMERA_INPUT_RAW10,
-    CAMERA_INPUT_RGB565,
+  CAMERA_INPUT_RAW8 = 0,
+  CAMERA_INPUT_RAW10,
+  CAMERA_INPUT_RGB565,
 } camera_input_format_t;
 
 // Description of the sensor source currently feeding the pipeline. The
@@ -34,10 +34,11 @@ typedef enum {
 // controller, ISP processor, and PPA SRM all agree on dimensions and
 // on the raw pixel format.
 typedef struct {
-    uint32_t              width;              // sensor active area width in pixels
-    uint32_t              height;             // sensor active area height in pixels
-    camera_input_format_t input_format;       // pixel format the sensor emits on MIPI CSI
-    uint32_t              lane_rate_mbps;     // MIPI CSI-2 bit rate per lane, Mbps
+  uint32_t width;  // sensor active area width in pixels
+  uint32_t height; // sensor active area height in pixels
+  camera_input_format_t
+      input_format;        // pixel format the sensor emits on MIPI CSI
+  uint32_t lane_rate_mbps; // MIPI CSI-2 bit rate per lane, Mbps
 } camera_source_t;
 
 // Bring up the pipeline. `src` describes the sensor output format the
@@ -51,8 +52,8 @@ typedef struct {
 // buffer it needs, starts the render task, and begins CSI streaming.
 // The sensor must already be detected and configured to the format
 // described by `src` before this call.
-esp_err_t camera_preview_start(const camera_source_t *src,
-                               uint32_t req_w, uint32_t req_h);
+esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w,
+                               uint32_t req_h);
 
 // Tear down the pipeline and free all buffers.
 void camera_preview_stop(void);
@@ -79,8 +80,8 @@ esp_err_t camera_preview_wait_frame(uint32_t timeout_ms);
 // frame — back-pressure via camera_preview_give_render_ready() prevents the
 // pipeline from overwriting the buffer before the UI is done with it.
 const uint8_t *camera_preview_get_pixels(void);
-uint32_t       camera_preview_get_width(void);
-uint32_t       camera_preview_get_height(void);
+uint32_t camera_preview_get_width(void);
+uint32_t camera_preview_get_height(void);
 
 // Snapshot the current live frame at full sensor resolution
 // (1920x1080 RGB565) for JPEG encoding, applying the preview
@@ -94,8 +95,7 @@ uint32_t       camera_preview_get_height(void);
 // On success *out_buf points to a cache-line-aligned PSRAM buffer the
 // caller owns and must heap_caps_free(). *out_w / *out_h return
 // 1920 / 1080.
-esp_err_t camera_photo_snapshot(uint8_t **out_buf,
-                                uint32_t *out_w,
+esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w,
                                 uint32_t *out_h);
 
 // Snapshot the current live frame scaled down to a caller-provided
@@ -131,12 +131,9 @@ esp_err_t camera_photo_snapshot(uint8_t **out_buf,
 // s_ppa client as render_task / photo_snapshot — serialised via
 // the internal PPA mutex, so it is safe to call from a dedicated
 // recording task in parallel with the UI.
-esp_err_t camera_video_snapshot(uint8_t  *out_buf,
-                                size_t    out_buf_sz,
-                                uint32_t  out_w,
-                                uint32_t  out_h,
-                                uint32_t  stride_w,
-                                uint32_t  stride_h);
+esp_err_t camera_video_snapshot(uint8_t *out_buf, size_t out_buf_sz,
+                                uint32_t out_w, uint32_t out_h,
+                                uint32_t stride_w, uint32_t stride_h);
 
 // Pointer to the full-size 800x640 RGB565 frame that the ISP writes into
 // (pre-PPA, no scale/mirror applied). CSI DMA is continuously overwriting
@@ -144,5 +141,5 @@ esp_err_t camera_video_snapshot(uint8_t  *out_buf,
 // dumps to see what the ISP is producing before the PPA touches it.
 // Dimensions are fixed at 800x640 for the preview format.
 const uint8_t *camera_preview_get_raw_pixels(void);
-uint32_t       camera_preview_get_raw_width(void);
-uint32_t       camera_preview_get_raw_height(void);
+uint32_t camera_preview_get_raw_width(void);
+uint32_t camera_preview_get_raw_height(void);

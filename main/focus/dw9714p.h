@@ -1,7 +1,7 @@
 #pragma once
 
-#include <stdint.h>
 #include "esp_err.h"
+#include <stdint.h>
 
 // Dongwoon DW9714 / DW9714P VCM driver. The trailing "P" is a package
 // variant only; programming is identical to the plain DW9714 as far as
@@ -13,11 +13,11 @@
 // internally so they can be called from the main task without racing
 // camera sensor register access.
 
-#define DW9714P_I2C_ADDR 0x0C  // 7-bit, fixed (no strap)
+#define DW9714P_I2C_ADDR 0x0C // 7-bit, fixed (no strap)
 
-#define DW9714P_POS_MIN  0u
-#define DW9714P_POS_MAX  1023u
-#define DW9714P_POS_MID  512u
+#define DW9714P_POS_MIN 0u
+#define DW9714P_POS_MAX 1023u
+#define DW9714P_POS_MID 512u
 
 // Probe for the chip by attempting a harmless I2C transaction. Must be
 // called before dw9714p_init() / dw9714p_set_position(). Returns
