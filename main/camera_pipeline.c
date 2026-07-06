@@ -70,8 +70,8 @@ static isp_proc_handle_t s_isp = NULL;
 static bool s_isp_enabled = false; // tracks whether esp_isp_enable() was called
 static ppa_client_handle_t s_ppa = NULL;
 
-// Intermediate RGB565 buffer used when the sensor delivers YUV422 (UYVY)
-// data. The ISP runs in bypass mode so s_cam_buf[] holds UYVY bytes;
+// Intermediate RGB565 buffer used when the sensor delivers YUV422 (YUYV)
+// data. The ISP runs in bypass mode so s_cam_buf[] holds YUYV bytes;
 // before each PPA op the render/snapshot path converts into this buffer
 // and hands it to the PPA as RGB565. Allocated only for YUV422 input.
 static uint8_t *s_yuv_conv_buf = NULL;
@@ -126,23 +126,24 @@ static DRAM_ATTR volatile uint32_t s_cnt_get_new_trans = 0;
 static DRAM_ATTR volatile uint32_t s_cnt_trans_finished = 0;
 static DRAM_ATTR volatile uint32_t s_cnt_srm_done = 0;
 
-// Convert a UYVY-packed YUV422 frame (BT.601 limited range) to RGB565.
+// Convert a YVYU-packed YUV422 frame (BT.601 limited range) to RGB565.
+// TC358743 CSI-2 byte order for YCBCRFMT_422_8_BIT: [Y0, Cr, Y1, Cb] = YVYU.
 // n = w * h pixels; output is an array of uint16_t RGB565 values.
 // Coefficients (right-shifted by 8):
 //   Y contribution:  298 ≈ 256 * 1.164
 //   V → R:           409 ≈ 256 * 1.596
 //   U → B:           516 ≈ 256 * 2.017
 //   U → G:           100 ≈ 256 * 0.392   V → G: 208 ≈ 256 * 0.813
-static void yuv422_uyvy_to_rgb565(const uint8_t *yuv, uint8_t *rgb, uint32_t w,
+static void yuv422_yvyu_to_rgb565(const uint8_t *yuv, uint8_t *rgb, uint32_t w,
                                   uint32_t h) {
   uint32_t n = w * h;
   const uint8_t *s = yuv;
   uint16_t *d = (uint16_t *)rgb;
   for (uint32_t i = 0; i < n; i += 2, s += 4) {
-    int u = (int)s[0] - 128;
-    int y0 = (int)s[1] - 16;
-    int v = (int)s[2] - 128;
-    int y1 = (int)s[3] - 16;
+    int y0 = (int)s[0] - 16;
+    int v = (int)s[1] - 128;
+    int y1 = (int)s[2] - 16;
+    int u = (int)s[3] - 128;
     int c0 = 298 * y0 + 128;
     int c1 = 298 * y1 + 128;
     int rv = 409 * v;
@@ -292,9 +293,9 @@ static void render_task(void *arg) {
     // Drain any stale srm_done left behind by a previous op.
     xSemaphoreTake(s_srm_done, 0);
 
-    // YUV422 (UYVY) input: convert to RGB565 before handing to PPA.
+    // YUV422 (YUYV) input: convert to RGB565 before handing to PPA.
     if (s_src_input_format == CAMERA_INPUT_YUV422 && s_yuv_conv_buf) {
-      yuv422_uyvy_to_rgb565(src, s_yuv_conv_buf, s_src_w, s_src_h);
+      yuv422_yvyu_to_rgb565(src, s_yuv_conv_buf, s_src_w, s_src_h);
       src = s_yuv_conv_buf;
     }
 
@@ -506,7 +507,7 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w,
     break;
   case CAMERA_INPUT_YUV422:
     // ISP runs in bypass mode — input/output must match.
-    // Camera buffers hold UYVY bytes; the render path converts
+    // Camera buffers hold YUYV bytes; the render path converts
     // to RGB565 in s_yuv_conv_buf before each PPA op.
     bayer_input = false;
     csi_in_ct = CAM_CTLR_COLOR_YUV422;
@@ -601,7 +602,7 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w,
   }
 
   // For YUV422 input, allocate an RGB565 staging buffer that the
-  // render/snapshot path uses as PPA source after each UYVY→RGB565
+  // render/snapshot path uses as PPA source after each YUYV→RGB565
   // conversion. Same size as a camera buffer (w*h*2 bytes).
   if (s_src_input_format == CAMERA_INPUT_YUV422) {
     s_yuv_conv_buf_sz = s_cam_buf_sz;
@@ -880,7 +881,7 @@ esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w,
   }
 
   if (s_src_input_format == CAMERA_INPUT_YUV422 && s_yuv_conv_buf) {
-    yuv422_uyvy_to_rgb565(src, s_yuv_conv_buf, s_src_w, s_src_h);
+    yuv422_yvyu_to_rgb565(src, s_yuv_conv_buf, s_src_w, s_src_h);
     src = s_yuv_conv_buf;
   }
 
@@ -1005,7 +1006,7 @@ esp_err_t camera_video_snapshot(uint8_t *out_buf, size_t out_buf_sz,
   }
 
   if (s_src_input_format == CAMERA_INPUT_YUV422 && s_yuv_conv_buf) {
-    yuv422_uyvy_to_rgb565(src, s_yuv_conv_buf, s_src_w, s_src_h);
+    yuv422_yvyu_to_rgb565(src, s_yuv_conv_buf, s_src_w, s_src_h);
     src = s_yuv_conv_buf;
   }
 
