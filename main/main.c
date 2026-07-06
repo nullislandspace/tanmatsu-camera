@@ -738,6 +738,12 @@ void app_main(void) {
   // mode == MODE_CONFIG.
   app_mode_t prev_mode = MODE_PHOTO;
 
+  // Stream-loss recovery: counts consecutive milliseconds without a preview
+  // frame; triggers a full pipeline rebuild after 2 s and enforces a 5 s
+  // cooldown between retries so we don't hammer the sensor on permanent loss.
+  uint32_t no_frame_streak_ms = 0;
+  TickType_t stream_recovery_after = 0;
+
 // The mic runs whenever the user is in video mode (actual or
 // via the config menu entered from it) AND the mic_enabled config
 // bit is set. We reconcile declaratively once per loop iteration
@@ -998,13 +1004,34 @@ void app_main(void) {
     if (mode != MODE_VIEW) {
       if (camera_preview_wait_frame(100) == ESP_OK) {
         got_preview_frame = true;
-      } else {
-        // No fresh frame — skip this iteration so we don't redraw
-        // an identical HUD over a stale preview 10 times a second.
-        continue;
       }
+      // No fresh frame: keep looping so the no-signal overlay and HUD
+      // remain visible; camera_preview_wait_frame already blocks 100 ms
+      // so we update at ~10 fps during signal loss.
     }
     int64_t t_after_wait = esp_timer_get_time();
+
+    // Stream-loss auto-recovery: after 2 s without a frame in any camera mode,
+    // rebuild the full pipeline via switch_pipeline_to_source. Skip during
+    // recording (would stop the muxer) and enforce a 5 s cooldown so a
+    // permanently-lost signal doesn't hammer the sensor continuously.
+    if (mode != MODE_VIEW) {
+      if (got_preview_frame) {
+        no_frame_streak_ms = 0;
+      } else {
+        no_frame_streak_ms += 100;
+        if (no_frame_streak_ms >= 4000 &&
+            xTaskGetTickCount() >= stream_recovery_after &&
+            !video_is_recording()) {
+          ESP_LOGW(TAG, "no frames for %u ms — rebuilding pipeline",
+                   no_frame_streak_ms);
+          no_frame_streak_ms = 0;
+          stream_recovery_after = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+          switch_pipeline_to_source(&sensor, mode == MODE_VIDEO, preview_area_w,
+                                    preview_area_h);
+        }
+      }
+    }
 
     // Skip drawing + blit entirely if the display is still DMA-ing
     // the previous frame. With double buffering this means we just
@@ -1082,35 +1109,47 @@ void app_main(void) {
           my += row_h;
         }
       } else if (mode != MODE_VIEW) {
-        // camera_pipeline's PPA produced a 16:9 preview letterboxed
-        // into the 5:4 (600x480) preview area. The PPA output is
-        // stored panel-native: pw columns × ph rows, where pw is
-        // the narrower dimension (337 at 5/16 scale) and ph covers
-        // the full preview-area width in user space (600). Center
-        // it horizontally in the 480-wide panel range, which
-        // corresponds to vertical centring in the user's view.
-        uint32_t pw = camera_preview_get_width();
-        uint32_t ph = camera_preview_get_height();
-        int panel_x_off = ((int)fb.panel_w - (int)pw) / 2;
-        if (panel_x_off < 0)
-          panel_x_off = 0;
-
-        // Clear the top and bottom letterbox bars so stale content
-        // from a previous frame or from view mode doesn't show.
-        int top_bar_h = (int)fb.user_h - (panel_x_off + (int)pw);
-        int bot_bar_y = (int)fb.user_h - panel_x_off;
-        int bot_bar_h = panel_x_off;
-        if (top_bar_h > 0) {
-          fbdraw_fill_rect(&fb, 0, 0, (int)preview_area_w, top_bar_h, BLACK);
-        }
-        if (bot_bar_h > 0) {
-          fbdraw_fill_rect(&fb, 0, bot_bar_y, (int)preview_area_w, bot_bar_h,
+        if (!got_preview_frame) {
+          fbdraw_fill_rect(&fb, 0, 0, (int)preview_area_w, (int)preview_area_h,
                            BLACK);
-        }
+          const int ns_font = 28;
+          const char *ns_text = "NO SIGNAL";
+          int ns_w = fbdraw_hershey_string_width(ns_text, ns_font);
+          int ns_x = ((int)preview_area_w - ns_w) / 2;
+          int ns_y = ((int)preview_area_h - ns_font) / 2;
+          fbdraw_hershey_string(&fb, fbdraw_rgb(96, 96, 96), ns_x, ns_y,
+                                ns_text, ns_font);
+        } else {
+          // camera_pipeline's PPA produced a 16:9 preview letterboxed
+          // into the 5:4 (600x480) preview area. The PPA output is
+          // stored panel-native: pw columns × ph rows, where pw is
+          // the narrower dimension (337 at 5/16 scale) and ph covers
+          // the full preview-area width in user space (600). Center
+          // it horizontally in the 480-wide panel range, which
+          // corresponds to vertical centring in the user's view.
+          uint32_t pw = camera_preview_get_width();
+          uint32_t ph = camera_preview_get_height();
+          int panel_x_off = ((int)fb.panel_w - (int)pw) / 2;
+          if (panel_x_off < 0)
+            panel_x_off = 0;
 
-        fbdraw_blit_panel(&fb, panel_x_off, 0,
-                          (const uint16_t *)camera_preview_get_pixels(), pw,
-                          ph);
+          // Clear the top and bottom letterbox bars so stale content
+          // from a previous frame or from view mode doesn't show.
+          int top_bar_h = (int)fb.user_h - (panel_x_off + (int)pw);
+          int bot_bar_y = (int)fb.user_h - panel_x_off;
+          int bot_bar_h = panel_x_off;
+          if (top_bar_h > 0) {
+            fbdraw_fill_rect(&fb, 0, 0, (int)preview_area_w, top_bar_h, BLACK);
+          }
+          if (bot_bar_h > 0) {
+            fbdraw_fill_rect(&fb, 0, bot_bar_y, (int)preview_area_w, bot_bar_h,
+                             BLACK);
+          }
+
+          fbdraw_blit_panel(&fb, panel_x_off, 0,
+                            (const uint16_t *)camera_preview_get_pixels(), pw,
+                            ph);
+        }
       }
       t_after_image = esp_timer_get_time();
 
