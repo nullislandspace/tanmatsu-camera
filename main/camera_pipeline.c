@@ -127,7 +127,12 @@ static DRAM_ATTR volatile uint32_t s_cnt_trans_finished = 0;
 static DRAM_ATTR volatile uint32_t s_cnt_srm_done = 0;
 
 // Convert a YVYU-packed YUV422 frame (BT.601 limited range) to RGB565.
-// TC358743 CSI-2 byte order for YCBCRFMT_422_8_BIT: [Y0, Cr, Y1, Cb] = YVYU.
+// TC358743 CSI-2 byte order for YCBCRFMT_422_8_BIT: [Y1, Cr, Y0, Cb].
+// Despite the YVYU name implying [Y0,V,Y1,U], the TC358743 places the ODD
+// pixel's luma (Y1, column 2k+1) at byte 0 and the EVEN pixel's luma (Y0,
+// column 2k) at byte 2.  Swapping is confirmed empirically: isolated
+// single-pixel bright features appear one column to the left or right
+// depending on whether their column index is odd or even.
 // n = w * h pixels; output is an array of uint16_t RGB565 values.
 // Coefficients (right-shifted by 8):
 //   Y contribution:  298 ≈ 256 * 1.164
@@ -140,9 +145,9 @@ static void yuv422_yvyu_to_rgb565(const uint8_t *yuv, uint8_t *rgb, uint32_t w,
   const uint8_t *s = yuv;
   uint16_t *d = (uint16_t *)rgb;
   for (uint32_t i = 0; i < n; i += 2, s += 4) {
-    int y0 = (int)s[0] - 16;
+    int y0 = (int)s[2] - 16;  // byte 2 = Y of even column (2k)
     int v = (int)s[1] - 128;
-    int y1 = (int)s[2] - 16;
+    int y1 = (int)s[0] - 16;  // byte 0 = Y of odd column (2k+1)
     int u = (int)s[3] - 128;
     int c0 = 298 * y0 + 128;
     int c1 = 298 * y1 + 128;

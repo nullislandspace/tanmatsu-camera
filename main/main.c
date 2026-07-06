@@ -695,10 +695,10 @@ void app_main(void) {
   // height.
   const uint32_t logical_w = fb.user_w; // 800
   const uint32_t logical_h = fb.user_h; // 480
-  const uint32_t preview_area_w = 600;
-  const uint32_t preview_area_h = logical_h;              // 480
-  const uint32_t hud_area_x = preview_area_w;             // 600
-  const uint32_t hud_area_w = logical_w - preview_area_w; // 200
+  uint32_t preview_area_w = 600;
+  uint32_t preview_area_h = logical_h;
+  uint32_t hud_area_x = 600;
+  uint32_t hud_area_w = logical_w - 600;
 
   camera_source_t initial_src = pick_source(sensor.kind, false, &initial_fmt);
   if (camera_preview_start(&initial_src, preview_area_w, preview_area_h) !=
@@ -737,6 +737,10 @@ void app_main(void) {
   // menu so F4/ESC returns them there. Only meaningful when
   // mode == MODE_CONFIG.
   app_mode_t prev_mode = MODE_PHOTO;
+
+  // When true the preview fills the full 800x480 display and the HUD
+  // is hidden. Toggled by F5 in photo/video mode.
+  bool fullscreen = false;
 
   // Stream-loss recovery: counts consecutive milliseconds without a preview
   // frame; triggers a full pipeline rebuild after 2 s and enforces a 5 s
@@ -839,6 +843,20 @@ void app_main(void) {
             mode = MODE_CONFIG;
             g_cfg_sel = 0;
           }
+          break;
+
+        case BSP_INPUT_NAVIGATION_KEY_F5:
+          if (video_is_recording())
+            break;
+          if (mode == MODE_VIEW || mode == MODE_CONFIG)
+            break;
+          fullscreen = !fullscreen;
+          preview_area_w = fullscreen ? logical_w : 600;
+          preview_area_h = logical_h;
+          hud_area_x = preview_area_w;
+          hud_area_w = logical_w - preview_area_w;
+          switch_pipeline_to_source(&sensor, mode == MODE_VIDEO,
+                                    preview_area_w, preview_area_h);
           break;
 
         case BSP_INPUT_NAVIGATION_KEY_RETURN:
@@ -1186,6 +1204,7 @@ void app_main(void) {
         autofocus_tick(&g_focus_pos);
       }
 
+      if (!fullscreen) {
       // HUD strip on the right. All coordinates are in the 200-pixel
       // wide user-space strip starting at hud_area_x.
       const int hud_pad_x = (int)hud_area_x + 10;
@@ -1387,6 +1406,7 @@ void app_main(void) {
       } else {
         banner_text[0] = 0;
       }
+      } // !fullscreen
       t_after_hud = esp_timer_get_time();
 
       // Submit the completed frame to the display and swap to the
