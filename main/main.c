@@ -1272,7 +1272,8 @@ void app_main(void) {
       if (event.type == INPUT_EVENT_TYPE_KEYBOARD &&
           (event.args_keyboard.ascii == 'p' ||
            event.args_keyboard.ascii == 'P') &&
-          mode == MODE_PHOTO) {
+          (mode == MODE_PHOTO ||
+           (mode == MODE_VIEW && viewer_has_image()))) {
         print_pending = true;
       }
     }
@@ -1600,6 +1601,17 @@ void app_main(void) {
             fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "> older",
                                   hud_font);
             hud_y += hud_line;
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "P print",
+                                  hud_font);
+            hud_y += hud_line;
+
+            bool printer_ready = catprinter_is_ready();
+            const char *printer_line = catprinter_is_busy() ? "Printer: sending"
+                                       : printer_ready      ? "Printer: ready"
+                                                            : "Printer: none";
+            fbdraw_hershey_string(&fb, printer_ready ? WHITE : HUD_SEP,
+                                  hud_pad_x, hud_y, printer_line, hud_font);
+            hud_y += hud_line;
           } else {
             fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "no pics",
                                   hud_font);
@@ -1762,6 +1774,21 @@ void app_main(void) {
         SHOW_BANNER("Printer not connected");
       } else if (catprinter_is_busy()) {
         SHOW_BANNER("Printer busy");
+      } else if (mode == MODE_VIEW) {
+        // Viewer already holds a decoded, pre-scaled RGB565 bitmap of
+        // the on-screen image — no snapshot needed, and the printer
+        // downscales to 384 dots wide anyway so the preview resolution
+        // is plenty.
+        if (viewer_has_image()) {
+          esp_err_t err = catprinter_print_rgb565(
+              (const uint16_t *)viewer_get_pixels(), viewer_get_width(),
+              viewer_get_height());
+          if (err == ESP_OK) {
+            SHOW_BANNER("Printing...");
+          } else {
+            SHOW_BANNER("Print failed (%d)", err);
+          }
+        }
       } else {
         uint8_t *snap = NULL;
         uint32_t snap_w = 0, snap_h = 0;
