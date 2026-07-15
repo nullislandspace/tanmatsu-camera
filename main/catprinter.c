@@ -19,7 +19,8 @@ static const char *TAG = "catprinter";
 #define CATPRINTER_SVC_UUID_ADVERTISED 0xaf30
 #define CATPRINTER_SVC_UUID 0xae30
 #define CATPRINTER_CHR_TX_UUID 0xae01 // characteristic we write commands to
-#define CATPRINTER_CHR_RX_UUID 0xae02 // characteristic we subscribe to for status
+#define CATPRINTER_CHR_RX_UUID                                                 \
+  0xae02 // characteristic we subscribe to for status
 
 // Printer prints a fixed 384-dot-wide line (48 bytes, 1 bit/dot).
 #define PRINTER_WIDTH_PX 384
@@ -68,10 +69,10 @@ void catprinter_on_disc_complete(const struct peer *peer) {
     return; // not a cat printer
   }
 
-  const struct peer_dsc *dsc = peer_dsc_find_uuid(
-      peer, BLE_UUID16_DECLARE(CATPRINTER_SVC_UUID),
-      BLE_UUID16_DECLARE(CATPRINTER_CHR_RX_UUID),
-      BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
+  const struct peer_dsc *dsc =
+      peer_dsc_find_uuid(peer, BLE_UUID16_DECLARE(CATPRINTER_SVC_UUID),
+                         BLE_UUID16_DECLARE(CATPRINTER_CHR_RX_UUID),
+                         BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
   if (dsc == NULL) {
     ESP_LOGE(TAG, "cat printer lacks a CCCD on its RX characteristic");
     return;
@@ -109,8 +110,7 @@ void catprinter_on_notify(uint16_t conn_handle, uint16_t attr_handle,
 
   // Device state response (cmd 0xa3): payload[0] == 1 -> no paper.
   if (len >= 9 && data[0] == 0x51 && data[1] == 0x78 && data[2] == 0xa3) {
-    s_paper_status =
-        data[6] ? CATPRINTER_PAPER_OUT : CATPRINTER_PAPER_PRESENT;
+    s_paper_status = data[6] ? CATPRINTER_PAPER_OUT : CATPRINTER_PAPER_PRESENT;
   }
 }
 
@@ -151,8 +151,8 @@ static void ble_write_raw(uint16_t conn_handle, uint16_t val_handle,
     if (chunk > max_chunk) {
       chunk = max_chunk;
     }
-    int rc = ble_gattc_write_no_rsp_flat(conn_handle, val_handle, &data[pos],
-                                         chunk);
+    int rc =
+        ble_gattc_write_no_rsp_flat(conn_handle, val_handle, &data[pos], chunk);
     if (rc == BLE_HS_ENOMEM) {
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
@@ -170,9 +170,8 @@ static void ble_write_raw(uint16_t conn_handle, uint16_t val_handle,
 // RLE expansion (one run per pixel = PRINTER_WIDTH_PX bytes).
 #define MAX_PAYLOAD_LEN PRINTER_WIDTH_PX
 
-static void write_packet(uint16_t conn_handle, uint16_t val_handle,
-                         uint8_t cmd, const uint8_t *payload,
-                         uint16_t payload_len) {
+static void write_packet(uint16_t conn_handle, uint16_t val_handle, uint8_t cmd,
+                         const uint8_t *payload, uint16_t payload_len) {
   uint8_t buf[8 + MAX_PAYLOAD_LEN];
   if (payload_len > MAX_PAYLOAD_LEN) {
     ESP_LOGE(TAG, "payload too large: %d", payload_len);
@@ -224,14 +223,14 @@ static void write_draw_lattice(uint16_t conn_handle, uint16_t val_handle,
 }
 
 static void write_lattice_start(uint16_t conn_handle, uint16_t val_handle) {
-  static const uint8_t data[] = {0xaa, 0x55, 0x17, 0x38, 0x44,
-                                0x5f, 0x5f, 0x5f, 0x44, 0x38, 0x2c};
+  static const uint8_t data[] = {0xaa, 0x55, 0x17, 0x38, 0x44, 0x5f,
+                                 0x5f, 0x5f, 0x44, 0x38, 0x2c};
   write_draw_lattice(conn_handle, val_handle, data);
 }
 
 static void write_lattice_end(uint16_t conn_handle, uint16_t val_handle) {
-  static const uint8_t data[] = {0xaa, 0x55, 0x17, 0x00, 0x00,
-                                0x00, 0x00, 0x00, 0x00, 0x00, 0x17};
+  static const uint8_t data[] = {0xaa, 0x55, 0x17, 0x00, 0x00, 0x00,
+                                 0x00, 0x00, 0x00, 0x00, 0x17};
   write_draw_lattice(conn_handle, val_handle, data);
 }
 
@@ -347,7 +346,7 @@ esp_err_t catprinter_print_rgb565(const uint16_t *pixels, uint32_t width,
   }
   const struct peer_chr *chr =
       peer_chr_find_uuid(peer, BLE_UUID16_DECLARE(CATPRINTER_SVC_UUID),
-                        BLE_UUID16_DECLARE(CATPRINTER_CHR_TX_UUID));
+                         BLE_UUID16_DECLARE(CATPRINTER_CHR_TX_UUID));
   if (chr == NULL) {
     return ESP_ERR_NOT_FOUND;
   }
@@ -358,8 +357,7 @@ esp_err_t catprinter_print_rgb565(const uint16_t *pixels, uint32_t width,
     out_h = 1;
   }
 
-  uint8_t *bitmap =
-      heap_caps_calloc(out_h, PRINTER_ROW_BYTES, MALLOC_CAP_8BIT);
+  uint8_t *bitmap = heap_caps_calloc(out_h, PRINTER_ROW_BYTES, MALLOC_CAP_8BIT);
   if (bitmap == NULL) {
     return ESP_ERR_NO_MEM;
   }

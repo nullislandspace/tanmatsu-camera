@@ -145,9 +145,9 @@ static void yuv422_yvyu_to_rgb565(const uint8_t *yuv, uint8_t *rgb, uint32_t w,
   const uint8_t *s = yuv;
   uint16_t *d = (uint16_t *)rgb;
   for (uint32_t i = 0; i < n; i += 2, s += 4) {
-    int y0 = (int)s[2] - 16;  // byte 2 = Y of even column (2k)
+    int y0 = (int)s[2] - 16; // byte 2 = Y of even column (2k)
     int v = (int)s[1] - 128;
-    int y1 = (int)s[0] - 16;  // byte 0 = Y of odd column (2k+1)
+    int y1 = (int)s[0] - 16; // byte 0 = Y of odd column (2k+1)
     int u = (int)s[3] - 128;
     int c0 = 298 * y0 + 128;
     int c1 = 298 * y1 + 128;

@@ -1272,8 +1272,7 @@ void app_main(void) {
       if (event.type == INPUT_EVENT_TYPE_KEYBOARD &&
           (event.args_keyboard.ascii == 'p' ||
            event.args_keyboard.ascii == 'P') &&
-          (mode == MODE_PHOTO ||
-           (mode == MODE_VIEW && viewer_has_image()))) {
+          (mode == MODE_PHOTO || (mode == MODE_VIEW && viewer_has_image()))) {
         print_pending = true;
       }
     }
@@ -1780,9 +1779,9 @@ void app_main(void) {
         // downscales to 384 dots wide anyway so the preview resolution
         // is plenty.
         if (viewer_has_image()) {
-          esp_err_t err = catprinter_print_rgb565(
-              (const uint16_t *)viewer_get_pixels(), viewer_get_width(),
-              viewer_get_height());
+          esp_err_t err =
+              catprinter_print_rgb565((const uint16_t *)viewer_get_pixels(),
+                                      viewer_get_width(), viewer_get_height());
           if (err == ESP_OK) {
             SHOW_BANNER("Printing...");
           } else {
