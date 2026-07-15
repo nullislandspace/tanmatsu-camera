@@ -1,3 +1,4 @@
+#include "ble_peer.h"
 #include "bmp_writer.h"
 #include "bsp/device.h"
 #include "bsp/display.h"
@@ -6,8 +7,11 @@
 #include "bsp/power.h"
 #include "camera_pipeline.h"
 #include "camera_sensor.h"
+#include "catprinter.h"
 #include "config.h"
 #include "driver/gpio.h"
+#include "esp_heap_caps.h"
+#include "esp_hosted.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
@@ -19,17 +23,25 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "hal/lcd_types.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
 #include "icons.h"
 #include "intfs.h"
 #include "microphone.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "photo.h"
 #include "sdcard.h"
+#include "services/gap/ble_svc_gap.h"
 #include "splash.h"
 #include "usb_device.h"
 #include "video.h"
 #include "viewer.h"
+#include "wifi_connection.h"
+#include "wifi_remote.h"
+#include <assert.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -448,6 +460,207 @@ static void wait_for_esc(void) {
   }
 }
 
+static int ble_gap_event(struct ble_gap_event *event, void *arg);
+
+// Defined by NimBLE's store/config component (CONFIG_BT_NIMBLE_NVS_PERSIST).
+void ble_store_config_init(void);
+
+static char *ble_addr_str(const void *addr) {
+  static char buf[6 * 2 + 5 + 1];
+  const uint8_t *u8p = addr;
+  sprintf(buf, "%02x:%02x:%02x:%02x:%02x:%02x", u8p[5], u8p[4], u8p[3], u8p[2],
+          u8p[1], u8p[0]);
+  return buf;
+}
+
+static void ble_on_reset(int reason) {
+  ESP_LOGE(TAG, "BLE resetting state: reason=%d", reason);
+}
+
+// Fires once GATT service/characteristic/descriptor discovery on a newly
+// connected peer completes. Dumps the discovered GATT table so it's easy
+// to see what a given peripheral exposes, then hands the peer to any
+// driver (currently just catprinter.c) that wants to look up its own
+// characteristics/descriptors via peer_chr_find_uuid()/peer_dsc_find_uuid().
+static void ble_on_disc_complete(const struct peer *peer, int status,
+                                 void *arg) {
+  if (status != 0) {
+    ESP_LOGE(TAG, "BLE service discovery failed; status=%d conn_handle=%d",
+             status, peer->conn_handle);
+    ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    return;
+  }
+  ESP_LOGI(TAG, "BLE service discovery complete; conn_handle=%d",
+           peer->conn_handle);
+  peer_list_all(peer);
+  catprinter_on_disc_complete(peer);
+}
+
+// Hook for deciding whether a discovered device is worth connecting to.
+// Currently only the cat printer's advertised service UUID is
+// recognised; a future feature adding another peripheral type would
+// extend this check.
+static bool ble_should_connect(const struct ble_gap_disc_desc *disc) {
+  return catprinter_matches_disc(disc);
+}
+
+static void ble_connect_to_device(const ble_addr_t *addr) {
+  uint8_t own_addr_type;
+  int rc = ble_hs_id_infer_auto(0, &own_addr_type);
+  if (rc != 0) {
+    ESP_LOGE(TAG, "error determining address type; rc=%d", rc);
+    return;
+  }
+
+  rc = ble_gap_disc_cancel();
+  if (rc != 0) {
+    ESP_LOGD(TAG, "failed to cancel scan; rc=%d", rc);
+    return;
+  }
+
+  rc = ble_gap_connect(own_addr_type, addr, 30000, NULL, ble_gap_event, NULL);
+  if (rc != 0) {
+    ESP_LOGE(TAG,
+             "failed to connect to BLE device; addr_type=%d addr=%s; rc=%d",
+             addr->type, ble_addr_str(addr->val), rc);
+  }
+}
+
+static int ble_gap_event(struct ble_gap_event *event, void *arg) {
+  struct ble_gap_conn_desc desc;
+  struct ble_hs_adv_fields fields;
+  int rc;
+
+  switch (event->type) {
+  case BLE_GAP_EVENT_DISC:
+    rc = ble_hs_adv_parse_fields(&fields, event->disc.data,
+                                 event->disc.length_data);
+    if (rc != 0)
+      return 0;
+    ESP_LOGI(TAG, "BLE device discovered: addr=%s%s%s",
+             ble_addr_str(event->disc.addr.val),
+             fields.name_len ? " name=" : "",
+             fields.name_len ? (const char *)fields.name : "");
+    if (ble_should_connect(&event->disc)) {
+      ble_connect_to_device(&event->disc.addr);
+    }
+    return 0;
+
+  case BLE_GAP_EVENT_CONNECT:
+    if (event->connect.status == 0) {
+      rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+      if (rc != 0)
+        return 0;
+      ESP_LOGI(TAG, "BLE connected to %s",
+               ble_addr_str(desc.peer_ota_addr.val));
+      rc = peer_add(event->connect.conn_handle);
+      if (rc != 0) {
+        ESP_LOGE(TAG, "failed to add peer; rc=%d", rc);
+        return 0;
+      }
+      rc = ble_gattc_exchange_mtu(event->connect.conn_handle, NULL, NULL);
+      if (rc != 0) {
+        ESP_LOGE(TAG, "failed to negotiate MTU; rc=%d", rc);
+      }
+      rc =
+          peer_disc_all(event->connect.conn_handle, ble_on_disc_complete, NULL);
+      if (rc != 0) {
+        ESP_LOGE(TAG, "failed to discover services; rc=%d", rc);
+      }
+    } else {
+      ESP_LOGE(TAG, "BLE connection failed; status=%d", event->connect.status);
+    }
+    return 0;
+
+  case BLE_GAP_EVENT_DISCONNECT:
+    ESP_LOGI(TAG, "BLE disconnected; reason=%d", event->disconnect.reason);
+    catprinter_on_disconnect(event->disconnect.conn.conn_handle);
+    peer_delete(event->disconnect.conn.conn_handle);
+    return 0;
+
+  case BLE_GAP_EVENT_DISC_COMPLETE:
+    ESP_LOGI(TAG, "BLE discovery complete; reason=%d",
+             event->disc_complete.reason);
+    return 0;
+
+  case BLE_GAP_EVENT_NOTIFY_RX:
+    catprinter_on_notify(event->notify_rx.conn_handle,
+                         event->notify_rx.attr_handle, event->notify_rx.om);
+    return 0;
+
+  case BLE_GAP_EVENT_ENC_CHANGE:
+    rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
+    if (rc != 0)
+      return rc;
+    ESP_LOGI(TAG, "BLE encryption change for %s; status=%d",
+             ble_addr_str(desc.peer_ota_addr.val), event->enc_change.status);
+    return 0;
+
+  case BLE_GAP_EVENT_MTU: {
+    ESP_LOGI(TAG, "BLE MTU update; conn_handle=%d channel=%d mtu=%d",
+             event->mtu.conn_handle, event->mtu.channel_id, event->mtu.value);
+    struct peer *peer = peer_find(event->mtu.conn_handle);
+    if (peer != NULL) {
+      peer->mtu = event->mtu.value;
+    }
+    return 0;
+  }
+
+  case BLE_GAP_EVENT_REPEAT_PAIRING:
+    // We already have a bond with the peer but it's attempting a new
+    // secure link — drop the old bond and accept the new one.
+    rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
+    if (rc != 0)
+      return rc;
+    ble_store_util_delete_peer(&desc.peer_id_addr);
+    return BLE_GAP_REPEAT_PAIRING_RETRY;
+
+  default:
+    return 0;
+  }
+}
+
+static void ble_scan(void) {
+  uint8_t own_addr_type;
+  struct ble_gap_disc_params disc_params = {0};
+
+  int rc = ble_hs_id_infer_auto(0, &own_addr_type);
+  if (rc != 0) {
+    ESP_LOGE(TAG, "error determining address type; rc=%d", rc);
+    return;
+  }
+
+  disc_params.filter_duplicates = 1;
+  disc_params.passive = 1;
+  disc_params.itvl = 0;
+  disc_params.window = 0;
+  disc_params.filter_policy = 0;
+  disc_params.limited = 0;
+
+  rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params, ble_gap_event,
+                    NULL);
+  if (rc != 0) {
+    ESP_LOGE(TAG, "error initiating BLE discovery; rc=%d", rc);
+  }
+}
+
+static void ble_on_sync(void) {
+  int rc = ble_hs_util_ensure_addr(0);
+  if (rc != 0) {
+    ESP_LOGE(TAG, "BLE util ensure addr failed: rc=%d", rc);
+    return;
+  }
+  ESP_LOGI(TAG, "BLE scanning...");
+  ble_scan();
+}
+
+static void ble_host_task(void *param) {
+  ESP_LOGI(TAG, "BLE host task started");
+  // Returns only once nimble_port_stop() is called.
+  nimble_port_run();
+  nimble_port_freertos_deinit();
+}
+
 void app_main(void) {
   // Switch the USB PHY out of badgelink mode back into flash/monitor mode.
   // Must run before bsp_device_initialize(). See videoplayer usb_device.c.
@@ -587,6 +800,49 @@ void app_main(void) {
 
   gpio_set_level(6, true);
 
+  // Bring up WiFi and NimBLE now that the radio (shared with the camera
+  // enable line above) is powered. wifi_remote_initialize() brings up
+  // the esp-hosted transport to the C6 co-processor; the BT controller
+  // side of that same co-processor is then started explicitly before
+  // handing control to the NimBLE host.
+  splash(WHITE, BLACK, "Camera", "Starting radio...");
+  if (wifi_remote_initialize() != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to initialize radio");
+    splash(RED, WHITE, "Radio error", "Radio unavailable");
+    wait_for_esc();
+    return;
+  }
+  wifi_connection_init_stack();
+
+  if (esp_hosted_bt_controller_init() != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to init BT controller");
+  }
+  if (esp_hosted_bt_controller_enable() != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to enable BT controller");
+  }
+
+  res = nimble_port_init();
+  if (res != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to init NimBLE: %d", res);
+    splash(RED, WHITE, "Radio error", "NimBLE init failed");
+    wait_for_esc();
+    return;
+  }
+
+  ble_hs_cfg.reset_cb = ble_on_reset;
+  ble_hs_cfg.sync_cb = ble_on_sync;
+  ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+
+  int ble_rc = peer_init(MYNEWT_VAL(BLE_MAX_CONNECTIONS), 64, 64, 64);
+  assert(ble_rc == 0);
+
+  ble_rc = ble_svc_gap_device_name_set("tanmatsu-camera");
+  assert(ble_rc == 0);
+
+  ble_store_config_init();
+
+  nimble_port_freertos_init(ble_host_task);
+
   // Mount the wear-levelled internal FAT partition (/int) — the
   // launcher stores HUD icons and other shared assets there. Failure
   // is non-fatal; icons_load() falls back to text labels.
@@ -718,6 +974,7 @@ void app_main(void) {
 
   app_mode_t mode = MODE_PHOTO;
   bool space_pending = false;
+  bool print_pending = false;
 
   // Banner state for brief on-screen messages after a save.
   char banner_text[64] = {0};
@@ -855,8 +1112,8 @@ void app_main(void) {
           preview_area_h = logical_h;
           hud_area_x = preview_area_w;
           hud_area_w = logical_w - preview_area_w;
-          switch_pipeline_to_source(&sensor, mode == MODE_VIDEO,
-                                    preview_area_w, preview_area_h);
+          switch_pipeline_to_source(&sensor, mode == MODE_VIDEO, preview_area_w,
+                                    preview_area_h);
           break;
 
         case BSP_INPUT_NAVIGATION_KEY_RETURN:
@@ -1010,6 +1267,13 @@ void app_main(void) {
         } else {
           space_pending = true;
         }
+      }
+
+      if (event.type == INPUT_EVENT_TYPE_KEYBOARD &&
+          (event.args_keyboard.ascii == 'p' ||
+           event.args_keyboard.ascii == 'P') &&
+          mode == MODE_PHOTO) {
+        print_pending = true;
       }
     }
 
@@ -1205,16 +1469,17 @@ void app_main(void) {
       }
 
       if (!fullscreen) {
-      // HUD strip on the right. All coordinates are in the 200-pixel
-      // wide user-space strip starting at hud_area_x.
-      const int hud_pad_x = (int)hud_area_x + 10;
-      const int hud_font = 16;
-      const int hud_line = hud_font + 4;
-      int hud_y = 14;
+        // HUD strip on the right. All coordinates are in the 200-pixel
+        // wide user-space strip starting at hud_area_x.
+        const int hud_pad_x = (int)hud_area_x + 10;
+        const int hud_font = 16;
+        const int hud_line = hud_font + 4;
+        int hud_y = 14;
 
-      // Mode header in a contrasting colour.
-      fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, mode_name(mode), 20);
-      hud_y += 28;
+        // Mode header in a contrasting colour.
+        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, mode_name(mode),
+                              20);
+        hud_y += 28;
 
 // Key hint lines: 32x32 colour icon + label, with the
 // text fallback ("F1", etc.) used when the launcher icon
@@ -1222,190 +1487,204 @@ void app_main(void) {
 #define KEY_ROW_H 32
 #define KEY_ICON_GAP 6
 #define KEY_TEXT_DY ((KEY_ROW_H - hud_font) / 2)
-      const struct {
-        icon_key_t icon;
-        const char *fallback;
-        const char *label;
-      } krows[] = {
-          {ICON_F1, "F1", "view"},   {ICON_F2, "F2", "photo"},
-          {ICON_F3, "F3", "video"},  {ICON_F4, "F4", "Config"},
-          {ICON_ESC, "Esc", "exit"},
-      };
-      for (size_t k = 0; k < sizeof(krows) / sizeof(krows[0]); k++) {
-        int label_x = hud_pad_x;
-        if (icons_get(krows[k].icon)) {
-          icons_blit(&fb, krows[k].icon, hud_pad_x, hud_y);
-          label_x = hud_pad_x + icons_width(krows[k].icon) + KEY_ICON_GAP;
-        } else {
-          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y + KEY_TEXT_DY,
-                                krows[k].fallback, hud_font);
-          label_x = hud_pad_x + 36;
-        }
-        fbdraw_hershey_string(&fb, WHITE, label_x, hud_y + KEY_TEXT_DY,
-                              krows[k].label, hud_font);
-        hud_y += KEY_ROW_H + 2;
-      }
-      hud_y += 4;
-
-      // Mode-specific hint and state.
-      switch (mode) {
-      case MODE_PHOTO:
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE photo",
-                              hud_font);
-        hud_y += hud_line;
-        break;
-      case MODE_VIDEO:
-        if (video_is_recording()) {
-          uint32_t ms = video_recording_duration_ms();
-          uint32_t s = ms / 1000u;
-          char rec_line[32];
-          snprintf(rec_line, sizeof(rec_line), "REC %02u:%02u",
-                   (unsigned)(s / 60u), (unsigned)(s % 60u));
-          fbdraw_hershey_string(&fb, RED, hud_pad_x, hud_y, rec_line, hud_font);
-          hud_y += hud_line;
-          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE stop",
-                                hud_font);
-          hud_y += hud_line;
-        } else {
-          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE rec",
-                                hud_font);
-          hud_y += hud_line;
-        }
-        // Audio level meter. Shown whenever the mic is
-        // actually running so the user can verify at a
-        // glance that sound is reaching the chip — no
-        // need to record, transfer and play back a clip
-        // just to check wiring / enable. Peak value is
-        // [0..32767]; we map it to a bar that fills the
-        // HUD strip width minus the pad on either side.
-        if (microphone_is_running()) {
-          // Digital gain readout. Shown above the peak
-          // bar so the user knows what VOL+/- adjusts
-          // without having to enter the config menu.
-          char gain_line[24];
-          snprintf(gain_line, sizeof(gain_line), "Gain %dx", g_cfg.mic_gain);
-          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, gain_line,
-                                hud_font);
-          hud_y += hud_line;
-
-          uint16_t peak = microphone_peak_level();
-          int bar_x = hud_pad_x;
-          int bar_w = (int)hud_area_w - 20;
-          int bar_h = 8;
-          int fill_w = (int)((uint32_t)peak * (uint32_t)bar_w / 32768u);
-          if (fill_w > bar_w)
-            fill_w = bar_w;
-          // Colour shifts green → yellow → red as the
-          // signal approaches clipping, matching the
-          // convention every audio tool on the planet
-          // uses so the user reads it instantly.
-          uint16_t fill_col = (peak > 26000)   ? RED
-                              : (peak > 16000) ? YELLOW
-                                               : fbdraw_rgb(0, 200, 0);
-          fbdraw_fill_rect(&fb, bar_x, hud_y, bar_w, bar_h, HUD_BG);
-          if (fill_w > 0) {
-            fbdraw_fill_rect(&fb, bar_x, hud_y, fill_w, bar_h, fill_col);
+        const struct {
+          icon_key_t icon;
+          const char *fallback;
+          const char *label;
+        } krows[] = {
+            {ICON_F1, "F1", "view"},   {ICON_F2, "F2", "photo"},
+            {ICON_F3, "F3", "video"},  {ICON_F4, "F4", "Config"},
+            {ICON_ESC, "Esc", "exit"},
+        };
+        for (size_t k = 0; k < sizeof(krows) / sizeof(krows[0]); k++) {
+          int label_x = hud_pad_x;
+          if (icons_get(krows[k].icon)) {
+            icons_blit(&fb, krows[k].icon, hud_pad_x, hud_y);
+            label_x = hud_pad_x + icons_width(krows[k].icon) + KEY_ICON_GAP;
+          } else {
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y + KEY_TEXT_DY,
+                                  krows[k].fallback, hud_font);
+            label_x = hud_pad_x + 36;
           }
-          hud_y += bar_h + 4;
+          fbdraw_hershey_string(&fb, WHITE, label_x, hud_y + KEY_TEXT_DY,
+                                krows[k].label, hud_font);
+          hud_y += KEY_ROW_H + 2;
         }
-        break;
-      case MODE_VIEW:
-        if (viewer_has_image()) {
-          char line[32];
-          snprintf(line, sizeof(line), "%d / %d", viewer_get_index() + 1,
-                   viewer_get_total());
-          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, line, hud_font);
-          hud_y += hud_line;
-          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "< newer",
+        hud_y += 4;
+
+        // Mode-specific hint and state.
+        switch (mode) {
+        case MODE_PHOTO: {
+          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE photo",
                                 hud_font);
           hud_y += hud_line;
-          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "> older",
+          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "P print",
                                 hud_font);
           hud_y += hud_line;
-        } else {
-          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "no pics",
-                                hud_font);
+
+          bool printer_ready = catprinter_is_ready();
+          const char *printer_line = catprinter_is_busy() ? "Printer: sending"
+                                     : printer_ready      ? "Printer: ready"
+                                                          : "Printer: none";
+          fbdraw_hershey_string(&fb, printer_ready ? WHITE : HUD_SEP, hud_pad_x,
+                                hud_y, printer_line, hud_font);
           hud_y += hud_line;
+          break;
         }
-        break;
-      case MODE_CONFIG:
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "UP/DN sel",
-                              hud_font);
-        hud_y += hud_line;
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE tog",
-                              hud_font);
-        hud_y += hud_line;
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F4/Esc back",
-                              hud_font);
-        hud_y += hud_line;
-        break;
-      }
-
-      // Focus readout — visible whenever a focus driver is
-      // active and we're not in the config menu (the menu shows
-      // the state already) or the file viewer. Drawn as its own
-      // block separated from the interaction hints above by a
-      // gap and a thin divider line so it reads as a state
-      // panel rather than another keybinding.
-      if (g_focus_present && mode != MODE_VIEW && mode != MODE_CONFIG) {
-        hud_y += 14; // gap above the focus block
-        fbdraw_fill_rect(&fb, hud_pad_x, hud_y, (int)hud_area_w - 20, 1,
-                         HUD_SEP);
-        hud_y += 8;
-
-        char fl[16];
-        snprintf(fl, sizeof(fl), "Focus %4u", (unsigned)g_focus_pos);
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, fl, hud_font);
-        hud_y += hud_line;
-
-        const char *af_msg = "AF: none";
-        if (g_cfg.autofocus_enabled) {
-          switch (autofocus_hud_state()) {
-          case AF_HUD_SEARCH:
-            af_msg = "AF: searching";
-            break;
-          case AF_HUD_LOCK:
-            af_msg = "AF: locked";
-            break;
-          case AF_HUD_OVERRIDE:
-            af_msg = "AF: manual";
-            break;
-          default:
-            af_msg = "AF: off";
-            break;
+        case MODE_VIDEO:
+          if (video_is_recording()) {
+            uint32_t ms = video_recording_duration_ms();
+            uint32_t s = ms / 1000u;
+            char rec_line[32];
+            snprintf(rec_line, sizeof(rec_line), "REC %02u:%02u",
+                     (unsigned)(s / 60u), (unsigned)(s % 60u));
+            fbdraw_hershey_string(&fb, RED, hud_pad_x, hud_y, rec_line,
+                                  hud_font);
+            hud_y += hud_line;
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE stop",
+                                  hud_font);
+            hud_y += hud_line;
+          } else {
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE rec",
+                                  hud_font);
+            hud_y += hud_line;
           }
+          // Audio level meter. Shown whenever the mic is
+          // actually running so the user can verify at a
+          // glance that sound is reaching the chip — no
+          // need to record, transfer and play back a clip
+          // just to check wiring / enable. Peak value is
+          // [0..32767]; we map it to a bar that fills the
+          // HUD strip width minus the pad on either side.
+          if (microphone_is_running()) {
+            // Digital gain readout. Shown above the peak
+            // bar so the user knows what VOL+/- adjusts
+            // without having to enter the config menu.
+            char gain_line[24];
+            snprintf(gain_line, sizeof(gain_line), "Gain %dx", g_cfg.mic_gain);
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, gain_line,
+                                  hud_font);
+            hud_y += hud_line;
+
+            uint16_t peak = microphone_peak_level();
+            int bar_x = hud_pad_x;
+            int bar_w = (int)hud_area_w - 20;
+            int bar_h = 8;
+            int fill_w = (int)((uint32_t)peak * (uint32_t)bar_w / 32768u);
+            if (fill_w > bar_w)
+              fill_w = bar_w;
+            // Colour shifts green → yellow → red as the
+            // signal approaches clipping, matching the
+            // convention every audio tool on the planet
+            // uses so the user reads it instantly.
+            uint16_t fill_col = (peak > 26000)   ? RED
+                                : (peak > 16000) ? YELLOW
+                                                 : fbdraw_rgb(0, 200, 0);
+            fbdraw_fill_rect(&fb, bar_x, hud_y, bar_w, bar_h, HUD_BG);
+            if (fill_w > 0) {
+              fbdraw_fill_rect(&fb, bar_x, hud_y, fill_w, bar_h, fill_col);
+            }
+            hud_y += bar_h + 4;
+          }
+          break;
+        case MODE_VIEW:
+          if (viewer_has_image()) {
+            char line[32];
+            snprintf(line, sizeof(line), "%d / %d", viewer_get_index() + 1,
+                     viewer_get_total());
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, line, hud_font);
+            hud_y += hud_line;
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "< newer",
+                                  hud_font);
+            hud_y += hud_line;
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "> older",
+                                  hud_font);
+            hud_y += hud_line;
+          } else {
+            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "no pics",
+                                  hud_font);
+            hud_y += hud_line;
+          }
+          break;
+        case MODE_CONFIG:
+          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "UP/DN sel",
+                                hud_font);
+          hud_y += hud_line;
+          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE tog",
+                                hud_font);
+          hud_y += hud_line;
+          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F4/Esc back",
+                                hud_font);
+          hud_y += hud_line;
+          break;
         }
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, af_msg, hud_font);
-        hud_y += hud_line;
 
-        char dl[24];
-        snprintf(dl, sizeof(dl), "DRV: %s", focus_active_name());
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, dl, hud_font);
-        hud_y += hud_line;
+        // Focus readout — visible whenever a focus driver is
+        // active and we're not in the config menu (the menu shows
+        // the state already) or the file viewer. Drawn as its own
+        // block separated from the interaction hints above by a
+        // gap and a thin divider line so it reads as a state
+        // panel rather than another keybinding.
+        if (g_focus_present && mode != MODE_VIEW && mode != MODE_CONFIG) {
+          hud_y += 14; // gap above the focus block
+          fbdraw_fill_rect(&fb, hud_pad_x, hud_y, (int)hud_area_w - 20, 1,
+                           HUD_SEP);
+          hud_y += 8;
 
-        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "UP/DN focus",
-                              hud_font);
-        hud_y += hud_line;
-      }
+          char fl[16];
+          snprintf(fl, sizeof(fl), "Focus %4u", (unsigned)g_focus_pos);
+          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, fl, hud_font);
+          hud_y += hud_line;
 
-      // Sensor model footer at the bottom of the HUD strip.
-      // Pinned to a fixed y rather than appended to hud_y so it
-      // never collides with whatever the variable-height blocks
-      // above it (audio meter, focus readout) push down to.
-      fbdraw_hershey_string(&fb, WHITE, hud_pad_x, 458,
-                            camera_sensor_name(&sensor), hud_font);
+          const char *af_msg = "AF: none";
+          if (g_cfg.autofocus_enabled) {
+            switch (autofocus_hud_state()) {
+            case AF_HUD_SEARCH:
+              af_msg = "AF: searching";
+              break;
+            case AF_HUD_LOCK:
+              af_msg = "AF: locked";
+              break;
+            case AF_HUD_OVERRIDE:
+              af_msg = "AF: manual";
+              break;
+            default:
+              af_msg = "AF: off";
+              break;
+            }
+          }
+          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, af_msg, hud_font);
+          hud_y += hud_line;
 
-      // Transient banner (e.g. "Saved IMG_xxx.jpg"). Draw it
-      // left-aligned over the preview area so long filenames
-      // aren't clipped by the narrow HUD strip.
-      if (banner_text[0] && xTaskGetTickCount() < banner_until) {
-        int banner_y = (int)logical_h - 50;
-        fbdraw_fill_rect(&fb, 0, banner_y, (int)preview_area_w, 40, BANNER_BG);
-        fbdraw_hershey_string(&fb, WHITE, 10, banner_y + 12, banner_text,
-                              hud_font);
-      } else {
-        banner_text[0] = 0;
-      }
+          char dl[24];
+          snprintf(dl, sizeof(dl), "DRV: %s", focus_active_name());
+          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, dl, hud_font);
+          hud_y += hud_line;
+
+          fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "UP/DN focus",
+                                hud_font);
+          hud_y += hud_line;
+        }
+
+        // Sensor model footer at the bottom of the HUD strip.
+        // Pinned to a fixed y rather than appended to hud_y so it
+        // never collides with whatever the variable-height blocks
+        // above it (audio meter, focus readout) push down to.
+        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, 458,
+                              camera_sensor_name(&sensor), hud_font);
+
+        // Transient banner (e.g. "Saved IMG_xxx.jpg"). Draw it
+        // left-aligned over the preview area so long filenames
+        // aren't clipped by the narrow HUD strip.
+        if (banner_text[0] && xTaskGetTickCount() < banner_until) {
+          int banner_y = (int)logical_h - 50;
+          fbdraw_fill_rect(&fb, 0, banner_y, (int)preview_area_w, 40,
+                           BANNER_BG);
+          fbdraw_hershey_string(&fb, WHITE, 10, banner_y + 12, banner_text,
+                                hud_font);
+        } else {
+          banner_text[0] = 0;
+        }
       } // !fullscreen
       t_after_hud = esp_timer_get_time();
 
@@ -1468,6 +1747,35 @@ void app_main(void) {
           } else {
             SHOW_BANNER("Rec start failed (%d)", err);
           }
+        }
+      }
+    }
+
+    // Cat printer: same freeze-the-preview cost as a photo capture
+    // (camera_photo_snapshot does its own stop-stream/snapshot/resume
+    // dance internally), but the dithered bitmap is handed off to a
+    // background task so the multi-second BLE transfer doesn't block
+    // the UI loop.
+    if (print_pending) {
+      print_pending = false;
+      if (!catprinter_is_ready()) {
+        SHOW_BANNER("Printer not connected");
+      } else if (catprinter_is_busy()) {
+        SHOW_BANNER("Printer busy");
+      } else {
+        uint8_t *snap = NULL;
+        uint32_t snap_w = 0, snap_h = 0;
+        esp_err_t err = camera_photo_snapshot(&snap, &snap_w, &snap_h);
+        if (err == ESP_OK && snap != NULL) {
+          err = catprinter_print_rgb565((const uint16_t *)snap, snap_w, snap_h);
+          heap_caps_free(snap);
+          if (err == ESP_OK) {
+            SHOW_BANNER("Printing...");
+          } else {
+            SHOW_BANNER("Print failed (%d)", err);
+          }
+        } else {
+          SHOW_BANNER("Snapshot failed (%d)", err);
         }
       }
     }

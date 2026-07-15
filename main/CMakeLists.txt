@@ -1,6 +1,13 @@
+idf_build_get_property(idf_target IDF_TARGET)
+if("${idf_target}" STREQUAL "esp32p4")
+list(APPEND extra_requires esp-hosted-tanmatsu)
+endif()
+
 idf_component_register(
 	SRCS
 		"main.c"
+		"ble_peer.c"
+		"catprinter.c"
 		"sdcard.c"
 		"fastopen.c"
 		"camera_sensor.c"
@@ -40,6 +47,9 @@ idf_component_register(
 		pax-codecs
 		esp_cam_sensor_ov9281
 		esp_cam_sensor_tc358743
+		bt
+		tanmatsu-wifi
+		${extra_requires}
 	INCLUDE_DIRS
 		"."
 		"focus"
