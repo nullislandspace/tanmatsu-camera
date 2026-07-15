@@ -1,7 +1,7 @@
 #pragma once
 
-#include <stdbool.h>
 #include "esp_err.h"
+#include <stdbool.h>
 
 // Initialize SD card power and mount filesystem at /sd
 esp_err_t sdcard_init(void);

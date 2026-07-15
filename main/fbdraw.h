@@ -36,24 +36,25 @@
 //     panel rows (slow — use only when unavoidable)
 
 typedef struct {
-    uint16_t *pixels;       // current draw target (points to buf[draw_idx])
-    uint16_t *buf[2];       // double-buffered: cache-line aligned, panel_w * panel_h * 2 bytes each
-    int       draw_idx;     // index into buf[] that `pixels` currently points to
-    size_t    pixels_sz;    // size of each buffer in bytes
-    size_t    panel_w;      // 480 on Tanmatsu
-    size_t    panel_h;      // 800
-    size_t    user_w;       // 800 (= panel_h)
-    size_t    user_h;       // 480 (= panel_w)
+  uint16_t *pixels; // current draw target (points to buf[draw_idx])
+  uint16_t *buf[2]; // double-buffered: cache-line aligned, panel_w * panel_h *
+                    // 2 bytes each
+  int draw_idx;     // index into buf[] that `pixels` currently points to
+  size_t pixels_sz; // size of each buffer in bytes
+  size_t panel_w;   // 480 on Tanmatsu
+  size_t panel_h;   // 800
+  size_t user_w;    // 800 (= panel_h)
+  size_t user_h;    // 480 (= panel_w)
 } fbdraw_t;
 
 // Convenience RGB565 colour builder (5/6/5 with R in top bits).
 static inline uint16_t fbdraw_rgb(uint8_t r, uint8_t g, uint8_t b) {
-    return (uint16_t)(((r & 0xF8u) << 8) | ((g & 0xFCu) << 3) | (b >> 3));
+  return (uint16_t)(((r & 0xF8u) << 8) | ((g & 0xFCu) << 3) | (b >> 3));
 }
 
 #define FBDRAW_BLACK ((uint16_t)0x0000u)
 #define FBDRAW_WHITE ((uint16_t)0xFFFFu)
-#define FBDRAW_RED   ((uint16_t)0xF800u)
+#define FBDRAW_RED ((uint16_t)0xF800u)
 
 // Allocate the framebuffer in PSRAM, cache-line aligned (required by
 // bsp_display_blit's DMA path). panel_w / panel_h are the physical
@@ -79,8 +80,8 @@ void fbdraw_put_pixel(fbdraw_t *fb, int user_x, int user_y, uint16_t color);
 
 // Axis-aligned rectangle fill at user coordinates. Clipped to the
 // user-visible area. Inner loop is sequential in panel memory.
-void fbdraw_fill_rect(fbdraw_t *fb, int user_x, int user_y,
-                      int user_w, int user_h, uint16_t color);
+void fbdraw_fill_rect(fbdraw_t *fb, int user_x, int user_y, int user_w,
+                      int user_h, uint16_t color);
 
 // Bresenham line between two user-space endpoints, inclusive.
 void fbdraw_line(fbdraw_t *fb, int x0, int y0, int x1, int y1, uint16_t color);
@@ -91,7 +92,8 @@ void fbdraw_line(fbdraw_t *fb, int x0, int y0, int x1, int y1, uint16_t color);
 // in the correct orientation — each source row becomes one panel row,
 // so the copy is a sequence of row-sized memcpys.
 void fbdraw_blit_panel(fbdraw_t *fb, int panel_x, int panel_y,
-                       const uint16_t *src, size_t src_panel_w, size_t src_panel_h);
+                       const uint16_t *src, size_t src_panel_w,
+                       size_t src_panel_h);
 
 // Copy an unrotated (user-landscape layout) RGB565 image into the fb at
 // user coordinates (dst_x, dst_y). CPU rotation loop — avoid on the hot
@@ -102,8 +104,8 @@ void fbdraw_blit_rotated(fbdraw_t *fb, int dst_x, int dst_y,
 // Draw one Hershey simplex character at user coordinates (x, y is the
 // TOP-LEFT corner of the glyph box). Returns the character's advance
 // width in user pixels.
-int fbdraw_hershey_char(fbdraw_t *fb, uint16_t color, int x, int y,
-                        char c, int font_height);
+int fbdraw_hershey_char(fbdraw_t *fb, uint16_t color, int x, int y, char c,
+                        int font_height);
 
 // Draw a NUL-terminated string, returning the total advance width.
 int fbdraw_hershey_string(fbdraw_t *fb, uint16_t color, int x, int y,

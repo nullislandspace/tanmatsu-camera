@@ -1,7 +1,7 @@
 #pragma once
 
-#include <stdbool.h>
 #include "esp_err.h"
+#include <stdbool.h>
 
 // Plain-text camera configuration stored at /sd/camera.cfg. Readable
 // and editable by the user on any PC — just pull the SD card and open
@@ -37,19 +37,19 @@
 //                            Raise for quiet environments, lower if
 //                            loud speech is clipping.
 
-#define CONFIG_PATH                 "/sd/camera.cfg"
-#define CONFIG_FOCUS_DRIVER_MAXLEN  16
-#define CONFIG_MIC_GAIN_MIN         1
-#define CONFIG_MIC_GAIN_MAX         8
-#define CONFIG_MIC_GAIN_DEFAULT     4
+#define CONFIG_PATH "/sd/camera.cfg"
+#define CONFIG_FOCUS_DRIVER_MAXLEN 16
+#define CONFIG_MIC_GAIN_MIN 1
+#define CONFIG_MIC_GAIN_MAX 8
+#define CONFIG_MIC_GAIN_DEFAULT 4
 
 typedef struct {
-    char focus_driver[CONFIG_FOCUS_DRIVER_MAXLEN];
-    bool focus_enabled;
-    bool autofocus_enabled;
-    bool rotate_180;
-    bool mic_enabled;
-    int  mic_gain;
+  char focus_driver[CONFIG_FOCUS_DRIVER_MAXLEN];
+  bool focus_enabled;
+  bool autofocus_enabled;
+  bool rotate_180;
+  bool mic_enabled;
+  int mic_gain;
 } camera_config_t;
 
 // Populate *out with defaults, then overlay any values found in

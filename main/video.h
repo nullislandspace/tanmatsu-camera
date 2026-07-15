@@ -42,7 +42,8 @@ extern "C" {
 // Expects the microphone subsystem to already be running if the user
 // wants live audio on the track — the mic lifecycle is owned by the
 // main UI loop, which starts/stops it on MODE_VIDEO entry/exit.
-esp_err_t video_record_start(const char *dcim_dir, char *out_path, size_t out_path_sz);
+esp_err_t video_record_start(const char *dcim_dir, char *out_path,
+                             size_t out_path_sz);
 
 // Stop the running recording: signal both tasks to flush + exit,
 // wait for them, write the final idx1 and patch the AVI header

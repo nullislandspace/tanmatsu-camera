@@ -36,10 +36,7 @@
 //
 // On success the full path is copied into out_path; on failure out_path
 // is set to an empty string.
-esp_err_t photo_capture(camera_sensor_t *sensor,
-                        uint32_t         preview_req_w,
-                        uint32_t         preview_req_h,
-                        uint32_t         preview_fps,
-                        const char      *dcim_dir,
-                        char            *out_path,
-                        size_t           out_path_sz);
+esp_err_t photo_capture(camera_sensor_t *sensor, uint32_t preview_req_w,
+                        uint32_t preview_req_h, uint32_t preview_fps,
+                        const char *dcim_dir, char *out_path,
+                        size_t out_path_sz);

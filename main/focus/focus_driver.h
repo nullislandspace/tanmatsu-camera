@@ -1,8 +1,8 @@
 #pragma once
 
+#include "esp_err.h"
 #include <stdbool.h>
 #include <stdint.h>
-#include "esp_err.h"
 
 // Focus driver factory. The application talks only to focus_set_position()
 // and the active-driver helpers below. Each chip lives behind a vtable
@@ -14,24 +14,24 @@
 // the config file, and the config menu can switch drivers at runtime.
 
 typedef struct {
-    const char *name;          // config key, e.g. "dw9714p", "simulator"
-    const char *display_name;  // human-readable, shown in the menu/HUD
+  const char *name;         // config key, e.g. "dw9714p", "simulator"
+  const char *display_name; // human-readable, shown in the menu/HUD
 
-    // Probe the device. Returns ESP_OK if usable, ESP_ERR_NOT_FOUND if
-    // absent, other esp_err_t on bus errors. Must be safe to call
-    // multiple times.
-    esp_err_t (*probe)(void);
+  // Probe the device. Returns ESP_OK if usable, ESP_ERR_NOT_FOUND if
+  // absent, other esp_err_t on bus errors. Must be safe to call
+  // multiple times.
+  esp_err_t (*probe)(void);
 
-    // Optional one-shot setup after probe. NULL means "nothing to do".
-    esp_err_t (*init)(void);
+  // Optional one-shot setup after probe. NULL means "nothing to do".
+  esp_err_t (*init)(void);
 
-    // Move the lens. Position range is [pos_min, pos_max]; the driver
-    // clamps internally so callers don't need to.
-    esp_err_t (*set_position)(uint16_t pos);
+  // Move the lens. Position range is [pos_min, pos_max]; the driver
+  // clamps internally so callers don't need to.
+  esp_err_t (*set_position)(uint16_t pos);
 
-    uint16_t pos_min;
-    uint16_t pos_max;
-    uint16_t pos_default;  // safe mid-range start position
+  uint16_t pos_min;
+  uint16_t pos_max;
+  uint16_t pos_default; // safe mid-range start position
 } focus_driver_t;
 
 // NULL-terminated array of every driver compiled in. The order here is
@@ -39,9 +39,9 @@ typedef struct {
 extern const focus_driver_t *const focus_driver_registry[];
 
 // Lookup helpers — used by the menu cycler and config loader.
-const focus_driver_t *focus_driver_by_name (const char *name);
+const focus_driver_t *focus_driver_by_name(const char *name);
 const focus_driver_t *focus_driver_by_index(int idx);
-int                   focus_driver_count   (void);
+int focus_driver_count(void);
 
 // Activate a driver. NULL or "" deactivates (no driver). On a non-empty
 // name: looks up the driver, runs probe + init + set_position(default).
