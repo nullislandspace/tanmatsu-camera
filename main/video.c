@@ -165,9 +165,9 @@ static void build_filename(const char *dir, char *out, size_t n) {
 
 // --- Video task -------------------------------------------------------------
 
-// Fill `dst` with one Shine frame of audio. If the INMP441 microphone
-// is running (config toggle `mic_enabled` plus MODE_VIDEO is active
-// in the UI), we pull samples from its ring buffer; any shortfall and
+// Fill `dst` with one Shine frame of audio. If the I2S microphone is
+// running (config `mic_type` non-none plus MODE_VIDEO is active in
+// the UI), we pull samples from its ring buffer; any shortfall and
 // the disabled case are both handled by zero-filling. The mic task
 // delivers samples at its actual ~44.8 kHz frame rate which we label
 // as 44.1 kHz here — see the AUDIO_SAMPLE_RATE comment for why.

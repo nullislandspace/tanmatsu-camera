@@ -146,12 +146,14 @@ static int             g_focus_dir     = 0;      // -1, 0, +1
 static int64_t         g_focus_last_us = 0;
 
 // Config menu items. Tagged struct so a single table can hold boolean
-// checkboxes, a string-cycler for the focus driver name, and bounded
-// integer cyclers (e.g. mic gain).
+// checkboxes, a string-cycler for the focus driver name, bounded
+// integer cyclers (e.g. mic gain), and an enum cycler for the
+// microphone type.
 typedef enum {
     CFG_KIND_BOOL,
     CFG_KIND_DRIVER,
     CFG_KIND_INT,
+    CFG_KIND_MIC_TYPE,
 } cfg_kind_t;
 
 typedef struct {
@@ -167,7 +169,7 @@ static cfg_item_t g_cfg_items[] = {
     { "Focus",      CFG_KIND_BOOL,   &g_cfg.focus_enabled,     0, 0 },
     { "Autofocus",  CFG_KIND_BOOL,   &g_cfg.autofocus_enabled, 0, 0 },
     { "Rotate 180", CFG_KIND_BOOL,   &g_cfg.rotate_180,        0, 0 },
-    { "Microphone", CFG_KIND_BOOL,   &g_cfg.mic_enabled,       0, 0 },
+    { "Microphone", CFG_KIND_MIC_TYPE, &g_cfg.mic_type,        0, 0 },
     { "Mic Gain",   CFG_KIND_INT,    &g_cfg.mic_gain,
                     CONFIG_MIC_GAIN_MIN, CONFIG_MIC_GAIN_MAX },
 };
@@ -220,6 +222,19 @@ static cfg_act_result_t cfg_item_activate(int idx) {
         strncpy(target, next->name, CONFIG_FOCUS_DRIVER_MAXLEN - 1);
         target[CONFIG_FOCUS_DRIVER_MAXLEN - 1] = '\0';
         return CFG_ACT_CHANGED;
+    }
+
+    if (it->kind == CFG_KIND_MIC_TYPE) {
+        mic_type_t *mt   = (mic_type_t *)it->target;
+        mic_type_t  prev = *mt;
+        // Cycle: NONE → INMP441 → ICS43434 → NONE
+        switch (prev) {
+            case MIC_TYPE_NONE:     *mt = MIC_TYPE_INMP441;  break;
+            case MIC_TYPE_INMP441:  *mt = MIC_TYPE_ICS43434; break;
+            case MIC_TYPE_ICS43434:
+            default:                *mt = MIC_TYPE_NONE;     break;
+        }
+        return (*mt != prev) ? CFG_ACT_CHANGED : CFG_ACT_NOOP;
     }
 
     if (it->kind == CFG_KIND_INT) {
@@ -704,12 +719,13 @@ void app_main(void) {
     app_mode_t prev_mode = MODE_PHOTO;
 
     // The mic runs whenever the user is in video mode (actual or
-    // via the config menu entered from it) AND the mic_enabled config
-    // bit is set. We reconcile declaratively once per loop iteration
-    // so any combination of mode change + config toggle converges
-    // without each call-site needing its own start/stop plumbing.
+    // via the config menu entered from it) AND mic_type is set to
+    // something other than NONE. We reconcile declaratively once per
+    // loop iteration so any combination of mode change + config
+    // toggle converges without each call-site needing its own
+    // start/stop plumbing.
     #define MIC_SHOULD_RUN(m, pm) ( \
-        g_cfg.mic_enabled && \
+        g_cfg.mic_type != MIC_TYPE_NONE && \
         ((m) == MODE_VIDEO || ((m) == MODE_CONFIG && (pm) == MODE_VIDEO)))
 
     // Helper lambda-ish: a transient banner with a default 2.5s duration.
@@ -727,7 +743,7 @@ void app_main(void) {
         {
             bool want = MIC_SHOULD_RUN(mode, prev_mode);
             if (want && !microphone_is_running()) {
-                microphone_start();
+                microphone_start(g_cfg.mic_type);
             } else if (!want && microphone_is_running()) {
                 microphone_stop();
             }
@@ -1030,6 +1046,10 @@ void app_main(void) {
                         int iv = *(int *)it->target;
                         snprintf(row, sizeof(row), "%-9s < %d >",
                                  it->label, iv);
+                    } else if (it->kind == CFG_KIND_MIC_TYPE) {
+                        mic_type_t mt = *(mic_type_t *)it->target;
+                        snprintf(row, sizeof(row), "%-9s < %s >",
+                                 it->label, mic_type_display_name(mt));
                     } else {
                         bool v = *(bool *)it->target;
                         snprintf(row, sizeof(row), "[%c] %s%s",
@@ -1180,9 +1200,14 @@ void app_main(void) {
                         // Digital gain readout. Shown above the peak
                         // bar so the user knows what VOL+/- adjusts
                         // without having to enter the config menu.
+                        // mic_gain is a step on a ~3 dB ladder, so we
+                        // show the step (what VOL+/- and the config
+                        // menu move) alongside the factor it actually
+                        // applies.
                         char gain_line[24];
                         snprintf(gain_line, sizeof(gain_line),
-                                 "Gain %dx", g_cfg.mic_gain);
+                                 "Gain %d (%dx)", g_cfg.mic_gain,
+                                 microphone_gain_multiplier(g_cfg.mic_gain));
                         fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
                                               gain_line, hud_font);
                         hud_y += hud_line;

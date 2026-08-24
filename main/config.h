@@ -24,18 +24,24 @@
 //                            sensor is physically mounted upside
 //                            down. Does NOT affect viewing of
 //                            already-saved photos.
-//   mic_enabled=<0|1>       enable the INMP441 I2S microphone on
-//                            I2S1 (pins E8/E9/E10). When 1, video
-//                            mode captures live audio and shows a
-//                            HUD level meter; when 0 the recorder
-//                            stays on silent audio (backwards-
-//                            compatible with hardware that has no
-//                            mic wired up).
-//   mic_gain=<1..8>         fixed digital gain multiplier applied
-//                            to mic samples after the 16-bit slot
+//   mic_type=<name>         I2S microphone type wired to I2S1
+//                            (pins E8/E9/E10). One of:
+//                              none      — no mic (silent audio track)
+//                              inmp441   — INMP441 MEMS mic
+//                              ics43434  — ICS43434 MEMS mic
+//                            When not "none", video mode captures
+//                            live audio and shows a HUD level meter.
+//                            For backwards compatibility, the legacy
+//                            `mic_enabled=0|1` key is still parsed
+//                            (1 → inmp441, 0 → none).
+//   mic_gain=<1..8>         digital gain STEP applied during slot
 //                            extraction (before the LPF + resampler).
-//                            Raise for quiet environments, lower if
-//                            loud speech is clipping.
+//                            Not a raw multiplier — each step is
+//                            ~5.7 dB, from 1x at step 1 to 100x at
+//                            step 8 (see MIC_GAIN_MULT in
+//                            microphone.c). Raise for quiet
+//                            environments, lower if loud speech is
+//                            clipping.
 
 #define CONFIG_PATH                 "/sd/camera.cfg"
 #define CONFIG_FOCUS_DRIVER_MAXLEN  16
@@ -43,13 +49,24 @@
 #define CONFIG_MIC_GAIN_MAX         8
 #define CONFIG_MIC_GAIN_DEFAULT     4
 
+typedef enum {
+    MIC_TYPE_NONE = 0,
+    MIC_TYPE_INMP441,
+    MIC_TYPE_ICS43434,
+} mic_type_t;
+
+// Short name suitable for the config file (e.g. "inmp441").
+const char *mic_type_config_name(mic_type_t t);
+// Human-readable label for the config menu (e.g. "INMP441").
+const char *mic_type_display_name(mic_type_t t);
+
 typedef struct {
-    char focus_driver[CONFIG_FOCUS_DRIVER_MAXLEN];
-    bool focus_enabled;
-    bool autofocus_enabled;
-    bool rotate_180;
-    bool mic_enabled;
-    int  mic_gain;
+    char       focus_driver[CONFIG_FOCUS_DRIVER_MAXLEN];
+    bool       focus_enabled;
+    bool       autofocus_enabled;
+    bool       rotate_180;
+    mic_type_t mic_type;
+    int        mic_gain;
 } camera_config_t;
 
 // Populate *out with defaults, then overlay any values found in

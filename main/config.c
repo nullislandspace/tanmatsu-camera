@@ -23,9 +23,47 @@ static const char CFG_HEADER[] =
     "#                     and a working chip).\n"
     "# rotate_180         rotate the camera image 180° (preview + saved\n"
     "#                     files). For sensors mounted upside down.\n"
-    "# mic_enabled        enable the INMP441 I2S microphone. When 1, video\n"
-    "#                     mode captures live audio and shows a level meter.\n"
-    "# mic_gain           digital gain multiplier for mic samples (1..8).\n";
+    "# mic_type           I2S microphone type: none, inmp441, ics43434. When\n"
+    "#                     not 'none', video mode captures live audio and\n"
+    "#                     shows a level meter. The legacy mic_enabled=0|1\n"
+    "#                     key is still parsed (1 = inmp441, 0 = none).\n"
+    "# mic_gain           digital gain step for mic samples (1..8). Each\n"
+    "#                     step is ~5.7 dB: 1x (unity) up to 100x at step 8.\n";
+
+const char *mic_type_config_name(mic_type_t t) {
+    switch (t) {
+        case MIC_TYPE_INMP441:  return "inmp441";
+        case MIC_TYPE_ICS43434: return "ics43434";
+        case MIC_TYPE_NONE:
+        default:                return "none";
+    }
+}
+
+const char *mic_type_display_name(mic_type_t t) {
+    switch (t) {
+        case MIC_TYPE_INMP441:  return "INMP441";
+        case MIC_TYPE_ICS43434: return "ICS43434";
+        case MIC_TYPE_NONE:
+        default:                return "None";
+    }
+}
+
+static bool parse_mic_type(const char *v, mic_type_t *out) {
+    if (strcasecmp(v, "none") == 0 || strcmp(v, "0") == 0 ||
+        strcasecmp(v, "off") == 0  || strcasecmp(v, "false") == 0) {
+        *out = MIC_TYPE_NONE;
+        return true;
+    }
+    if (strcasecmp(v, "inmp441") == 0) {
+        *out = MIC_TYPE_INMP441;
+        return true;
+    }
+    if (strcasecmp(v, "ics43434") == 0) {
+        *out = MIC_TYPE_ICS43434;
+        return true;
+    }
+    return false;
+}
 
 static void defaults(camera_config_t *out) {
     strncpy(out->focus_driver, "simulator", CONFIG_FOCUS_DRIVER_MAXLEN - 1);
@@ -33,7 +71,7 @@ static void defaults(camera_config_t *out) {
     out->focus_enabled     = false;
     out->autofocus_enabled = false;
     out->rotate_180        = false;
-    out->mic_enabled       = false;
+    out->mic_type          = MIC_TYPE_NONE;
     out->mic_gain          = CONFIG_MIC_GAIN_DEFAULT;
 }
 
@@ -78,13 +116,13 @@ esp_err_t config_save(const camera_config_t *cfg) {
     fprintf(f, "focus_enabled=%d\n",     cfg->focus_enabled ? 1 : 0);
     fprintf(f, "autofocus_enabled=%d\n", cfg->autofocus_enabled ? 1 : 0);
     fprintf(f, "rotate_180=%d\n",        cfg->rotate_180 ? 1 : 0);
-    fprintf(f, "mic_enabled=%d\n",       cfg->mic_enabled ? 1 : 0);
+    fprintf(f, "mic_type=%s\n",          mic_type_config_name(cfg->mic_type));
     fprintf(f, "mic_gain=%d\n",          clamp_mic_gain(cfg->mic_gain));
     fclose(f);
-    ESP_LOGI(TAG, "saved %s (driver=%s focus=%d af=%d rot180=%d mic=%d gain=%d)",
+    ESP_LOGI(TAG, "saved %s (driver=%s focus=%d af=%d rot180=%d mic=%s gain=%d)",
              CONFIG_PATH, cfg->focus_driver,
              cfg->focus_enabled, cfg->autofocus_enabled,
-             cfg->rotate_180, cfg->mic_enabled, cfg->mic_gain);
+             cfg->rotate_180, mic_type_config_name(cfg->mic_type), cfg->mic_gain);
     return ESP_OK;
 }
 
@@ -132,8 +170,19 @@ esp_err_t config_load(camera_config_t *out) {
             if (!parse_bool(val, &out->rotate_180)) {
                 ESP_LOGW(TAG, "bad value for rotate_180: '%s'", val);
             }
+        } else if (strcmp(key, "mic_type") == 0) {
+            if (!parse_mic_type(val, &out->mic_type)) {
+                ESP_LOGW(TAG, "bad value for mic_type: '%s'", val);
+            }
         } else if (strcmp(key, "mic_enabled") == 0) {
-            if (!parse_bool(val, &out->mic_enabled)) {
+            // Legacy key. Map 1 → INMP441 (the only mic the old
+            // schema knew about), 0 → none. Newer mic_type lines
+            // win if both appear in the file (parsed in source
+            // order).
+            bool legacy = false;
+            if (parse_bool(val, &legacy)) {
+                out->mic_type = legacy ? MIC_TYPE_INMP441 : MIC_TYPE_NONE;
+            } else {
                 ESP_LOGW(TAG, "bad value for mic_enabled: '%s'", val);
             }
         } else if (strcmp(key, "mic_gain") == 0) {
@@ -149,9 +198,9 @@ esp_err_t config_load(camera_config_t *out) {
         }
     }
     fclose(f);
-    ESP_LOGI(TAG, "loaded %s (driver=%s focus=%d af=%d rot180=%d mic=%d gain=%d)",
+    ESP_LOGI(TAG, "loaded %s (driver=%s focus=%d af=%d rot180=%d mic=%s gain=%d)",
              CONFIG_PATH, out->focus_driver,
              out->focus_enabled, out->autofocus_enabled,
-             out->rotate_180, out->mic_enabled, out->mic_gain);
+             out->rotate_180, mic_type_config_name(out->mic_type), out->mic_gain);
     return ESP_OK;
 }

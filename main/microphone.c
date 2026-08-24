@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -32,15 +33,16 @@ static const char *TAG = "microphone";
 //     a 2:1 decimator instead of a phase-accumulator resampler.
 //     No interpolation, no sub-sample state.
 //
-//   * The MONO slot mask on the P4 RX path does NOT filter the
-//     unused slot — we confirmed experimentally that a MONO+LEFT
-//     config still delivers both slots interleaved in DMA, with
-//     the RIGHT slot showing the floating DIN pin (all 0xFFFFFFFF
-//     because the INMP441 tri-states when L/R=GND makes it drive
-//     LEFT only). So we configure STEREO explicitly and pick the
-//     LEFT samples ourselves; at 44.1 kHz the stream is 88.2 kHz
-//     of interleaved int32 samples, half of which carry the mic
-//     audio.
+//   * We configure STEREO explicitly. Two mics share the bus (one
+//     strapped L/R=GND, one L/R=VDD), so both slots carry audio and
+//     the reader averages them to mono. At 44.1 kHz the DMA stream
+//     is 88.2 kHz of interleaved int32 samples.
+//
+//     STEREO would be the right choice even with a single mic: the
+//     MONO slot mask on the P4 RX path does NOT filter the unused
+//     slot — we confirmed experimentally that a MONO+LEFT config
+//     still delivers both slots interleaved in DMA, with the unused
+//     one showing the floating DIN pin (all 0xFFFFFFFF).
 //
 //   * Trap to avoid: i2s_channel_read() returns ESP_ERR_TIMEOUT
 //     with valid PARTIAL bytes already in the destination buffer
@@ -74,29 +76,97 @@ static const char *TAG = "microphone";
 // so the buffer doesn't drift in either direction over time.
 #define MIC_STREAM_BYTES   32768u
 
-// Digital gain applied after the 16-bit extraction. Normal speech at
-// arm's length produces raw peaks around ±1M (≈±3900 after the >> 8
-// extraction). 4× puts that in the 15k-ish range (≈50 % of int16
-// scale), visible on the meter and audible on playback. Loud shouts
-// (observed raw peak ±13M → ±51k before gain) already exceed int16
-// scale, so they saturate cleanly — acceptable for a voice recorder.
-// Exposed as a runtime setting via microphone_set_gain() so the user
-// can tune it from the config menu / volume buttons.
+// Digital gain. The user-facing setting (config menu, VOL+/-) is a
+// *step* in [1..8], not a raw multiplier — MIC_GAIN_MULT maps it to
+// the actual factor on a ~5 dB ladder spanning +6..+40 dB.
+//
+// Why a ladder and not a plain 1..8 multiplier: after MIC_SLOT_SHIFT
+// (below) a sample is a *correctly scaled* int16, so unity gain is
+// unity, and the useful range for a MEMS mic spans far more than 8:1.
+// A linear 1..8 knob can't cover that; ~5 dB steps can.
+//
+// The ladder values are calibrated against a real raw capture rather
+// than the datasheet, because the two disagree by ~30 dB. In a dump
+// of *quiet* speech into a handheld device, the loudest syllable
+// measured -29 dBFS RMS / -19.4 dBFS peak (300 ms long, 9.9 dB crest,
+// so speech and not a handling transient) against a -65 dBFS room
+// floor. Per the datasheet's -26 dBFS @ 94 dB SPL that would imply
+// ~91 dB SPL, which soft speech is not — near-field pickup at a few
+// cm accounts for the difference. Trust the measurement.
+//
+// So step 1 is unity (0 dB), for someone narrating close to the
+// device: at unity that dump peaks at -19.4 dBFS, leaving ~19 dB for
+// anyone louder than "trying not to annoy co-workers". The top of the
+// ladder is +40 dB for a subject several metres away. Steps are
+// ~5.7 dB apart. Re-measure with microphone_debug_raw_dump() if the
+// mic hardware changes again.
+//
+// The step is what gets stored in camera.cfg, so the range is
+// unchanged from the previous scheme and old config files still load.
 #define MIC_GAIN_MIN       1
 #define MIC_GAIN_MAX       8
-#define MIC_GAIN_DEFAULT   4
+// Step 3 = 4x: the measured quiet-speech dump lands at -7.4 dBFS
+// there, which keeps headroom for a normal speaking voice at the
+// same distance rather than optimising for the quietest case.
+#define MIC_GAIN_DEFAULT   3
 
-// One-pole IIR low-pass filter coefficient in Q16.16. The INMP441
-// produces a noticeable amount of high-frequency self-noise + digital
-// pickup from the ESP32-P4 that our gain stage makes obvious; voice
-// energy is concentrated below ~4 kHz and everything above is
-// effectively noise for a handheld voice recorder. Cutoff of ~4 kHz
-// at the 44.1 kHz frame rate: α = 1 - exp(-2π × 4000 / 44100)
-// ≈ 0.434, Q16 encoded = 28464. We cascade the filter twice
-// (see mic_task_fn) for a -12 dB/oct rolloff, which also serves as
-// the anti-alias filter for the 2:1 decimation (Nyquist at 11.025
-// kHz, well above the cutoff so no aliasing).
-#define MIC_LPF_ALPHA_Q16  28464u
+static const uint16_t MIC_GAIN_MULT[MIC_GAIN_MAX + 1] = {
+    /* unused */ 0,
+    /* 1 */   1, /* 2 */   2, /* 3 */   4, /* 4 */   7,
+    /* 5 */  14, /* 6 */  27, /* 7 */  52, /* 8 */ 100,
+};
+
+// Right-shift that turns a full-scale signed 24-bit slot sample into a
+// full-scale int16, i.e. 0 dB. Gain is applied as
+// (sample24 * MIC_GAIN_MULT[step]) >> MIC_SLOT_SHIFT, so a step whose
+// multiplier is 256 would be exactly the +48 dB that used to be baked
+// into the extraction shift (see mic_task_fn) — nothing on the ladder
+// goes anywhere near that, which is the whole point.
+#define MIC_SLOT_SHIFT     8
+
+// DC-blocking high-pass coefficient, Q30, cascaded twice in
+// mic_task_fn for -12 dB/oct. y[n] = a·(y[n-1] + x[n] - x[n-1]) with
+// a = exp(-2π × 60 / 44100) ≈ 0.991488, i.e. a 60 Hz corner.
+//
+// This is NOT optional polish — a measured raw capture from the
+// stereo pair had 99.6 % of its total power below 20 Hz, sitting
+// ~19 dB ABOVE the voice band, which ate all the headroom the speech
+// needed. It is mechanical, not acoustic: the two mics' sub-20 Hz
+// content is *anti*-correlated (-0.41) while their voice band
+// correlates at +0.986 with a 2-sample inter-mic delay, which is what
+// board flex / handling noise looks like when two bottom-port mics
+// share a PCB. (The L+R average already cancels ~5 dB of it for free,
+// but that is nowhere near enough.)
+//
+// The INMP441's own high-pass does not help: the datasheet puts its
+// corner at -3 dB / 3.7 Hz at 48 kHz (≈3.4 Hz at our 44.1 kHz) and
+// only -0.5 dB at 10.4 Hz, so it passes this range essentially
+// untouched. 60 Hz is a free choice acoustically — it is exactly the
+// -3 dB corner of the INMP441's own MEMS transducer, so nothing the
+// mic reproduces faithfully is being discarded.
+//
+// Q30 rather than the LPF's Q16 because this pole sits very close to
+// 1 and coefficient quantisation there shifts the corner a lot. The
+// arithmetic shift floors rather than rounds, leaving a systematic
+// DC bias below -100 dBFS — far under the part's -87 dBFS noise
+// floor, so it does not undo the DC blocking.
+#define MIC_HPF_A_Q30      ((int64_t)1064602009)
+
+// One-pole IIR low-pass filter coefficient in Q16.16, cascaded twice
+// in mic_task_fn for -12 dB/oct. Its primary job is anti-aliasing for
+// the 2:1 decimation to 22.05 kHz (Nyquist 11.025 kHz); it also trims
+// the mic's HF self-noise and digital pickup from the ESP32-P4.
+//
+// Cutoff of ~6 kHz at the 44.1 kHz frame rate:
+//   α = 1 - exp(-2π × 6000 / 44100) ≈ 0.5747, Q16 encoded = 37661.
+//
+// This used to sit at 4 kHz, which was chosen back when the extraction
+// stage applied +48 dB of unintended gain and the resulting hiss had
+// to be filtered hard. With the gain staging fixed the noise floor is
+// ~30 dB lower, so the filter no longer has to cost us the sibilance
+// band — 6 kHz keeps speech crisp while still being ~0.9 octaves below
+// Nyquist.
+#define MIC_LPF_ALPHA_Q16  37661u
 
 static i2s_chan_handle_t    s_rx_handle  = NULL;
 static TaskHandle_t         s_task       = NULL;
@@ -104,6 +174,7 @@ static StreamBufferHandle_t s_pcm_stream = NULL;
 static volatile bool        s_running    = false;
 static volatile uint16_t    s_peak_level = 0;
 static volatile int         s_gain       = MIC_GAIN_DEFAULT;
+static mic_type_t           s_mic_type   = MIC_TYPE_NONE;
 
 // Counts I2S RX descriptor overflows. The IDF's RX ISR silently
 // discards the oldest queued descriptor (~5.8 ms of audio at 44.1
@@ -139,7 +210,7 @@ static void mic_task_fn(void *arg) {
 
     int32_t *raw = heap_caps_malloc(MIC_DMA_FRAMES * sizeof(int32_t),
                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    // We emit one sample per I2S frame (2 slots → 1 LEFT sample).
+    // We emit one sample per I2S frame (2 slots → 1 mono sample).
     int16_t *pcm = heap_caps_malloc((MIC_DMA_FRAMES / 2) * sizeof(int16_t),
                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!raw || !pcm) {
@@ -176,6 +247,17 @@ static void mic_task_fn(void *arg) {
     int32_t  lpf_prev1   = 0;
     int32_t  lpf_prev2   = 0;
 
+    // DC-blocking high-pass state. Each stage needs both the previous
+    // input and the previous output (y[n] = a·(y[n-1] + x[n] - x[n-1])),
+    // and both must survive across DMA blocks or every block boundary
+    // would re-introduce a step. Runs on the 24-bit sample BEFORE the
+    // gain stage, so the rumble is removed while there is still
+    // headroom to remove it in.
+    int32_t  hpf_x1      = 0;
+    int32_t  hpf_y1      = 0;
+    int32_t  hpf_x2      = 0;
+    int32_t  hpf_y2      = 0;
+
     while (s_running) {
         size_t got_bytes = 0;
         esp_err_t err = i2s_channel_read(s_rx_handle, raw,
@@ -210,32 +292,75 @@ static void mic_task_fn(void *arg) {
             }
         }
 
-        // The DMA stream is I2S STEREO interleaved as L,R,L,R,... In
-        // each pair the LEFT sample carries the mic audio; RIGHT is
-        // the floating DIN pin during the unused slot (reads as
-        // 0xFFFFFFFF since the mic tri-states when its L/R strap is
-        // tied to GND). We iterate stride-2 and only process LEFT.
+        // The DMA stream is I2S STEREO interleaved as L,R,L,R,...
+        // Two mics share SCK/WS/SD; the one with L/R=GND drives the
+        // LEFT slot, the one with L/R=VDD drives the RIGHT slot, each
+        // tri-stating during the other's half-frame. Both slots
+        // therefore carry real audio, and we average them into the
+        // single mono channel the AVI/Shine pipeline expects. The
+        // average is also worth ~3 dB of uncorrelated-noise rejection,
+        // and it makes the recording independent of which mic the user
+        // happens to be talking into.
         //
-        // Verified experimentally (microphone_debug_raw_dump + WAV
-        // spectrum analysis): the ESP32-P4 driver in STEREO mode
-        // delivers the audio in bits [23:8] of the 32-bit slot (top
-        // byte is sign extension, bottom 5 bits are slot-boundary
-        // bleed from the floating RIGHT slot and always read
-        // `11111`). Shifting a signed int32 right by 8 therefore
-        // discards the garbage bits cleanly and leaves the audio in
-        // the low 16 bits of the result. Multiplying by MIC_GAIN
-        // and clamping to int16 saturates loud transients while
-        // lifting normal speech to usable levels.
+        // Slot layout: these are 24-bit MSB-first parts in a 32-bit
+        // slot, so the I2S peripheral hands us the sample LEFT-JUSTIFIED
+        // — bits [31:8] are the signed 24-bit value, bits [7:0] are the
+        // trailing clocks after the mic stops driving. `>> 8` on the
+        // signed int32 therefore recovers the true sample, spanning
+        // ±2^23 at full scale.
+        //
+        // *** This is where the old prototype workaround lived. ***
+        // The previous code did `(raw[i] >> 8) * gain` and then clamped
+        // to int16 — that treats a ±2^23 value as if it were already
+        // int16, i.e. it baked in a fixed 256× (+48 dB) before the
+        // user's gain even applied. On the half-broken prototype mic,
+        // which read roughly 17 dB low, that accidentally landed in a
+        // usable range and looked correct. On healthy mics it clips
+        // ordinary speech by ~11 dB at the lowest gain setting, which
+        // is exactly the "overdriven at minimum gain" symptom. The
+        // scaling is now explicit: multiply by the gain-ladder factor,
+        // then >> MIC_SLOT_SHIFT to land in int16.
         //
         // After the IIR low-pass (which doubles as the anti-alias
-        // filter), a 2:1 decimator emits every other LEFT sample,
-        // bringing the rate from 44.1 kHz down to the 22.05 kHz
-        // that the AVI/Shine pipeline expects. Producer and
-        // consumer rates are exactly matched, so no drift over time.
+        // filter), a 2:1 decimator emits every other frame, bringing
+        // the rate from 44.1 kHz down to the 22.05 kHz that the
+        // AVI/Shine pipeline expects. Producer and consumer rates are
+        // exactly matched, so no drift over time.
+        //
+        // Both supported parts (INMP441, ICS43434) are 24-bit I2S MEMS
+        // mics with identical Philips framing and sensitivity within a
+        // dB of each other, so they share this decode path; s_mic_type
+        // is kept for logging and for any future part that doesn't.
+        const int32_t gain_mult = (int32_t)MIC_GAIN_MULT[s_gain];
         uint16_t peak   = 0;
         size_t   out_ix = 0;
-        for (size_t i = 0; i < n; i += 2) {
-            int32_t s32 = ((int32_t)(raw[i] >> 8)) * (int32_t)s_gain;
+        for (size_t i = 0; i + 1 < n; i += 2) {
+            // Left-justified 24-bit slots → true signed 24-bit samples,
+            // averaged down to mono. Sum of two ±2^23 values still fits
+            // an int32 with 7 bits to spare.
+            int32_t left  = raw[i]     >> 8;
+            int32_t right = raw[i + 1] >> 8;
+            int32_t mono  = (left + right) / 2;
+
+            // Two cascaded DC blockers (see MIC_HPF_A_Q30). Placed
+            // ahead of the gain stage on purpose: the sub-20 Hz
+            // rumble is louder than the audio, so amplifying first
+            // would clip on rumble long before speech got loud.
+            int64_t hacc1 = MIC_HPF_A_Q30 *
+                            (int64_t)(hpf_y1 + mono - hpf_x1);
+            int32_t h1    = (int32_t)(hacc1 >> 30);
+            hpf_x1        = mono;
+            hpf_y1        = h1;
+            int64_t hacc2 = MIC_HPF_A_Q30 *
+                            (int64_t)(hpf_y2 + h1 - hpf_x2);
+            int32_t h2    = (int32_t)(hacc2 >> 30);
+            hpf_x2        = h1;
+            hpf_y2        = h2;
+
+            // Gain + scale to int16. The 64-bit product is deliberate:
+            // |h2| can transiently exceed 2^23 on a high-pass
+            // overshoot, and 2^24 × 100 would overflow int32.
+            int32_t s32 = (int32_t)(((int64_t)h2 * gain_mult) >> MIC_SLOT_SHIFT);
             if (s32 >  INT16_MAX) s32 =  INT16_MAX;
             if (s32 <  INT16_MIN) s32 =  INT16_MIN;
 
@@ -264,7 +389,7 @@ static void mic_task_fn(void *arg) {
             if ((uint32_t)v > peak) peak = (uint16_t)v;
 
             // 2:1 decimator. Peak tracking and IIR run on every
-            // sample (above) — only the emit step is gated.
+            // frame (above) — only the emit step is gated.
             if (decimate_phase == 0) {
                 pcm[out_ix++] = x;
                 decimate_phase = 1;
@@ -307,8 +432,10 @@ static void mic_task_fn(void *arg) {
     vTaskDelete(NULL);
 }
 
-esp_err_t microphone_start(void) {
+esp_err_t microphone_start(mic_type_t type) {
+    if (type == MIC_TYPE_NONE) return ESP_ERR_INVALID_ARG;
     if (s_running) return ESP_OK;
+    s_mic_type = type;
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(MIC_I2S_PORT, I2S_ROLE_MASTER);
     // 16 DMA descriptors × 256 frames at 44.1 kHz stereo = ~93 ms
@@ -355,6 +482,18 @@ esp_err_t microphone_start(void) {
         s_rx_handle = NULL;
         return err;
     }
+
+    // The INMP441 tri-states SD immediately after its LSB, so the
+    // last 8 bit-times of each 32-bit slot are undriven. The datasheet
+    // asks for a 100 kOhm pull-DOWN on the shared SD trace to discharge
+    // the line while every mic on the bus is tri-stated; without one,
+    // those bit-times read back as junk. A raw capture from this board
+    // shows exactly that (low byte reading 0x06/0x07/0x0e/0x0f instead
+    // of zero), so the resistor is missing — enable the internal
+    // pull-down as the software stand-in. Purely hygiene: the `>> 8`
+    // in mic_task_fn discards those bits either way. If a real
+    // pull-down is ever fitted, this line stays harmless.
+    gpio_set_pull_mode(MIC_DIN_GPIO, GPIO_PULLDOWN_ONLY);
 
     // Trigger level = 1152 bytes = 576 int16 mono samples = one MPEG-II
     // Layer III frame at 22.05 kHz. With this, xStreamBufferReceive
@@ -412,8 +551,11 @@ esp_err_t microphone_start(void) {
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "started (I2S%d, %u Hz nominal stereo → LEFT mono, SCK=%d WS=%d DIN=%d)",
-             (int)MIC_I2S_PORT, (unsigned)MIC_I2S_RATE_NOM,
+    const char *type_name = (s_mic_type == MIC_TYPE_INMP441)  ? "INMP441"  :
+                            (s_mic_type == MIC_TYPE_ICS43434) ? "ICS43434" :
+                                                                "?";
+    ESP_LOGI(TAG, "started (%s, I2S%d, %u Hz nominal stereo → L+R mono, SCK=%d WS=%d DIN=%d)",
+             type_name, (int)MIC_I2S_PORT, (unsigned)MIC_I2S_RATE_NOM,
              (int)MIC_BCLK_GPIO, (int)MIC_WS_GPIO, (int)MIC_DIN_GPIO);
     return ESP_OK;
 }
@@ -463,6 +605,12 @@ void microphone_set_gain(int gain) {
     if (gain < MIC_GAIN_MIN) gain = MIC_GAIN_MIN;
     if (gain > MIC_GAIN_MAX) gain = MIC_GAIN_MAX;
     s_gain = gain;
+}
+
+int microphone_gain_multiplier(int gain) {
+    if (gain < MIC_GAIN_MIN) gain = MIC_GAIN_MIN;
+    if (gain > MIC_GAIN_MAX) gain = MIC_GAIN_MAX;
+    return (int)MIC_GAIN_MULT[gain];
 }
 
 int microphone_get_gain(void) {

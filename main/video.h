@@ -11,7 +11,7 @@
 //
 // The audio path runs in its own FreeRTOS task pinned to core 1 so
 // that I²S microphone capture has deterministic timing. When the
-// INMP441 mic is enabled (config.mic_enabled + MODE_VIDEO active),
+// I2S mic is enabled (config.mic_type non-none + MODE_VIDEO active),
 // the audio task pulls samples out of microphone.c's ring buffer;
 // otherwise each frame is filled with silence. Shine encoding and
 // AVI 01wb muxing are unchanged either way.
