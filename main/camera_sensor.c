@@ -49,6 +49,54 @@ static const char *TAG = "camera_sensor";
 #define OV_REG_TIMING_VTS_H     0x380E
 #define OV_REG_TIMING_VTS_L     0x380F
 
+// Standard OmniVision AEC/AGC bank. Exposure is a value in 1/16-line
+// units spread over 0x3500..0x3502 (so the register holds lines << 4,
+// the low nibble being a fractional row); analog gain is "real gain"
+// fixed-point with 4 fractional bits, 0x10 = 1.0x.
+//
+// The gain register WIDTH is the one thing that is not common across
+// these parts, so it is table-driven below rather than assumed: the
+// 5MP sensors carry a 10-bit gain in 0x350A[1:0]:0x350B, while the
+// OV9281 has a single 8-bit gain at 0x3509 and nothing at 0x350A/B.
+// Writing the 5MP layout to an OV9281 would scribble over an unrelated
+// register, which is exactly the kind of bug that presents as "the
+// image is fine but the sensor locks up after a minute".
+#define OV_REG_AEC_MODE         0x3503  // bit0 = AEC manual, bit1 = AGC manual
+#define OV_REG_EXP_H            0x3500
+#define OV_REG_EXP_M            0x3501
+#define OV_REG_EXP_L            0x3502
+#define OV_AEC_MANUAL_BITS      0x03    // AEC + AGC both under host control
+
+// Per-sensor description of that bank.
+typedef struct {
+    bool     has_auto_ae;  // on-chip AE loop that must be switched off first
+    uint16_t gain_reg_h;   // 0 = gain is a single byte at gain_reg_l
+    uint16_t gain_reg_l;
+    uint16_t gain_max_q4;  // largest analog gain the register can express
+    uint16_t exp_margin;   // exposure ceiling is (VTS - this) lines
+} sensor_ae_caps_t;
+
+static sensor_ae_caps_t ae_caps(camera_sensor_kind_t kind) {
+    switch (kind) {
+        case CAMERA_SENSOR_OV9281:
+            // Machine-vision part: no AE loop at all, 8-bit real gain
+            // at 0x3509 (0x10 = 1.0x .. 0xFF = 15.94x). The exposure
+            // ceiling of VTS-12 matches the mainline Linux ov9282
+            // driver's OV9282_EXPOSURE_OFFSET.
+            return (sensor_ae_caps_t){ false, 0x0000, 0x3509, 0x00FF, 12 };
+        case CAMERA_SENSOR_OV5647:
+        case CAMERA_SENSOR_OV5640:
+        case CAMERA_SENSOR_OV5645:
+        case CAMERA_SENSOR_UNKNOWN:
+        default:
+            // 10-bit gain (max 63.9x). Unknown sensors land here too:
+            // the detect loop already proved this chip answers to the
+            // standard OV register bank, and the 5MP layout is the one
+            // every OV part except the OV9281 uses.
+            return (sensor_ae_caps_t){ true, 0x350A, 0x350B, 0x03FF, 4 };
+    }
+}
+
 // Map a driver-supplied sensor name string ("OV5647", "OV5640", ...)
 // onto our enum. Unknown names leave kind=UNKNOWN; the caller treats
 // that as "best-effort OV5647-style RAW pipeline" since the detect
@@ -74,10 +122,25 @@ static void capture_fps_base(camera_sensor_t *sensor, const esp_cam_sensor_forma
     sensor->base_fps        = fmt->fps;
     sensor->base_vts_lines  = 0;
 
+    sensor->cur_vts_lines   = 0;
+    sensor->row_time_ns     = 0;
+
     uint8_t vts_h = 0, vts_l = 0;
     if (camera_sensor_read_reg(sensor, OV_REG_TIMING_VTS_H, &vts_h) != ESP_OK) return;
     if (camera_sensor_read_reg(sensor, OV_REG_TIMING_VTS_L, &vts_l) != ESP_OK) return;
     sensor->base_vts_lines = ((uint32_t)vts_h << 8) | vts_l;
+    sensor->cur_vts_lines  = sensor->base_vts_lines;
+
+    // A frame is base_vts_lines rows long and lasts 1/base_fps seconds,
+    // so one row takes 1e9 / (fps * VTS) ns. Deriving it this way means
+    // we never have to know the PLL tree, the PCLK or HTS for any given
+    // sensor — and it stays correct when a later VTS override stretches
+    // the frame, because that adds blank rows without changing how long
+    // a row takes.
+    if (sensor->base_fps > 0 && sensor->base_vts_lines > 0) {
+        sensor->row_time_ns = (uint32_t)(1000000000ULL /
+            ((uint64_t)sensor->base_fps * (uint64_t)sensor->base_vts_lines));
+    }
 }
 
 esp_err_t camera_sensor_detect(camera_sensor_t *out) {
@@ -350,6 +413,7 @@ esp_err_t camera_sensor_set_preview_fps(camera_sensor_t *sensor, uint32_t target
         // No-op: target matches native fps. Don't write the register
         // — that way "cap to 15" on a 14fps sensor (OV5640 RGB565) is
         // a clean no-op rather than a redundant SCCB write.
+        sensor->cur_vts_lines = sensor->base_vts_lines;
         return ESP_OK;
     }
 
@@ -361,8 +425,184 @@ esp_err_t camera_sensor_set_preview_fps(camera_sensor_t *sensor, uint32_t target
     if (err != ESP_OK) return err;
     err = camera_sensor_write_reg(sensor, OV_REG_TIMING_VTS_L, (uint8_t)(vts & 0xFFu));
     if (err != ESP_OK) return err;
+    sensor->cur_vts_lines = vts;
 
     ESP_LOGI(TAG, "preview fps override: %" PRIu32 " fps (VTS=%" PRIu32 ", base=%" PRIu32 "@%" PRIu32 "fps)",
              target_fps, vts, sensor->base_vts_lines, sensor->base_fps);
     return ESP_OK;
+}
+
+// ---------------------------------------------------------------------
+// Manual exposure / analog gain
+// ---------------------------------------------------------------------
+
+// Darkest rung of the ladder, expressed as a light budget in
+// "microseconds at unity gain". Each step doubles it, so step N costs
+// BRIGHT_BASE_EG_US << (N-1) and the whole ladder spans 2^15.
+#define BRIGHT_BASE_EG_US       30u
+
+static uint32_t bright_eg_us(int step) {
+    if (step < CAMERA_BRIGHT_MIN) step = CAMERA_BRIGHT_MIN;
+    if (step > CAMERA_BRIGHT_MAX) step = CAMERA_BRIGHT_MAX;
+    return BRIGHT_BASE_EG_US << (step - CAMERA_BRIGHT_MIN);
+}
+
+// Longest integration the current frame period allows. Note this reads
+// cur_vts_lines, not base_vts_lines: capping the preview to 15 fps
+// doubles VTS and therefore doubles the exposure headroom, which is the
+// entire reason a slow frame rate is worth having on a sensor with no
+// AE loop of its own.
+static uint32_t exposure_max_lines(const camera_sensor_t *sensor,
+                                   const sensor_ae_caps_t *caps) {
+    uint32_t vts = sensor->cur_vts_lines ? sensor->cur_vts_lines
+                                         : sensor->base_vts_lines;
+    if (vts <= caps->exp_margin) return 1;
+    return vts - caps->exp_margin;
+}
+
+bool camera_sensor_has_auto_exposure(const camera_sensor_t *sensor) {
+    if (sensor == NULL) return false;
+    return ae_caps(sensor->kind).has_auto_ae;
+}
+
+esp_err_t camera_sensor_set_brightness(camera_sensor_t *sensor, int step,
+                                       camera_exposure_t *out) {
+    if (sensor == NULL || sensor->device == NULL) return ESP_ERR_INVALID_ARG;
+    if (sensor->row_time_ns == 0) {
+        // No format bound yet, or the VTS read-back in capture_fps_base
+        // failed. Without a row time we cannot turn microseconds into
+        // register values, and guessing would be worse than refusing.
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const sensor_ae_caps_t caps = ae_caps(sensor->kind);
+    if (step < CAMERA_BRIGHT_MIN) step = CAMERA_BRIGHT_MIN;
+    if (step > CAMERA_BRIGHT_MAX) step = CAMERA_BRIGHT_MAX;
+
+    // Spend the step's light budget on integration time first, because
+    // time is free and gain is not: analog gain amplifies read noise
+    // along with the signal. Only what the frame period cannot absorb
+    // rolls over into gain.
+    const uint32_t eg_us     = bright_eg_us(step);
+    const uint32_t max_lines = exposure_max_lines(sensor, &caps);
+    const uint32_t max_us    = (uint32_t)(((uint64_t)max_lines *
+                                           sensor->row_time_ns) / 1000ULL);
+
+    uint32_t want_us = (eg_us < max_us) ? eg_us : max_us;
+    uint32_t lines   = (uint32_t)(((uint64_t)want_us * 1000ULL +
+                                   sensor->row_time_ns / 2u) / sensor->row_time_ns);
+    if (lines < 1)         lines = 1;
+    if (lines > max_lines) lines = max_lines;
+
+    uint32_t got_us = (uint32_t)(((uint64_t)lines * sensor->row_time_ns) / 1000ULL);
+    if (got_us == 0) got_us = 1;  // sub-microsecond row, avoid /0 below
+
+    uint32_t gain_q4 = (uint32_t)(((uint64_t)eg_us * 16ULL + got_us / 2u) / got_us);
+    if (gain_q4 < 16)                gain_q4 = 16;              // 1.0x floor
+    if (gain_q4 > caps.gain_max_q4)  gain_q4 = caps.gain_max_q4;
+
+    // Take the sensor's AE loop out of the way, remembering exactly what
+    // the driver's init table had left in the mode register so we can
+    // hand control back later without inventing a value. The OV5647 for
+    // example boots at 0x62 (AGC manual, AEC auto) — clearing the whole
+    // register to "auto" would silently turn its AGC on too.
+    if (caps.has_auto_ae) {
+        if (!sensor->ae_mode_valid) {
+            uint8_t mode = 0;
+            if (camera_sensor_read_reg(sensor, OV_REG_AEC_MODE, &mode) == ESP_OK) {
+                sensor->ae_mode_saved = mode;
+                sensor->ae_mode_valid = true;
+            }
+        }
+        uint8_t base = sensor->ae_mode_valid ? sensor->ae_mode_saved : 0x00;
+        esp_err_t merr = camera_sensor_write_reg(sensor, OV_REG_AEC_MODE,
+                                                 (uint8_t)(base | OV_AEC_MANUAL_BITS));
+        if (merr != ESP_OK) return merr;
+    }
+
+    esp_err_t err;
+    if (caps.gain_reg_h != 0) {
+        err = camera_sensor_write_reg(sensor, caps.gain_reg_h,
+                                      (uint8_t)((gain_q4 >> 8) & 0x03u));
+        if (err != ESP_OK) return err;
+    }
+    err = camera_sensor_write_reg(sensor, caps.gain_reg_l, (uint8_t)(gain_q4 & 0xFFu));
+    if (err != ESP_OK) return err;
+
+    // Exposure register holds lines * 16 (the low nibble is a
+    // fractional row we never use).
+    const uint32_t exp_reg = lines << 4;
+    err = camera_sensor_write_reg(sensor, OV_REG_EXP_H, (uint8_t)((exp_reg >> 16) & 0x0Fu));
+    if (err != ESP_OK) return err;
+    err = camera_sensor_write_reg(sensor, OV_REG_EXP_M, (uint8_t)((exp_reg >> 8) & 0xFFu));
+    if (err != ESP_OK) return err;
+    err = camera_sensor_write_reg(sensor, OV_REG_EXP_L, (uint8_t)(exp_reg & 0xFFu));
+    if (err != ESP_OK) return err;
+
+    if (out) {
+        out->exposure_us     = got_us;
+        out->exposure_lines  = lines;
+        out->gain_q4         = (uint16_t)gain_q4;
+        out->exposure_capped = (eg_us > max_us);
+    }
+    ESP_LOGI(TAG, "brightness step %d: %" PRIu32 " us (%" PRIu32 "/%" PRIu32 " lines), gain %u.%02ux%s",
+             step, got_us, lines, max_lines,
+             (unsigned)(gain_q4 / 16u), (unsigned)((gain_q4 % 16u) * 100u / 16u),
+             (eg_us > max_us) ? " [exposure capped]" : "");
+    return ESP_OK;
+}
+
+esp_err_t camera_sensor_read_exposure(camera_sensor_t *sensor, camera_exposure_t *out) {
+    if (sensor == NULL || sensor->device == NULL || out == NULL) return ESP_ERR_INVALID_ARG;
+    const sensor_ae_caps_t caps = ae_caps(sensor->kind);
+
+    uint8_t h = 0, m = 0, l = 0;
+    if (camera_sensor_read_reg(sensor, OV_REG_EXP_H, &h) != ESP_OK) return ESP_FAIL;
+    if (camera_sensor_read_reg(sensor, OV_REG_EXP_M, &m) != ESP_OK) return ESP_FAIL;
+    if (camera_sensor_read_reg(sensor, OV_REG_EXP_L, &l) != ESP_OK) return ESP_FAIL;
+
+    uint16_t gain_q4 = 16;
+    uint8_t  gl = 0, gh = 0;
+    if (camera_sensor_read_reg(sensor, caps.gain_reg_l, &gl) != ESP_OK) return ESP_FAIL;
+    if (caps.gain_reg_h != 0 &&
+        camera_sensor_read_reg(sensor, caps.gain_reg_h, &gh) != ESP_OK) return ESP_FAIL;
+    gain_q4 = (uint16_t)(((uint16_t)(gh & 0x03u) << 8) | gl);
+    if (gain_q4 < 16) gain_q4 = 16;
+
+    const uint32_t lines = (((uint32_t)(h & 0x0Fu) << 16) |
+                            ((uint32_t)m << 8) | (uint32_t)l) >> 4;
+
+    out->exposure_lines  = lines;
+    out->exposure_us     = sensor->row_time_ns
+                             ? (uint32_t)(((uint64_t)lines * sensor->row_time_ns) / 1000ULL)
+                             : 0;
+    out->gain_q4         = gain_q4;
+    out->exposure_capped = false;
+    return ESP_OK;
+}
+
+int camera_sensor_brightness_step_for(const camera_sensor_t *sensor,
+                                      const camera_exposure_t *exp) {
+    if (sensor == NULL || exp == NULL) return CAMERA_BRIGHT_DEFAULT;
+    const uint32_t gain = exp->gain_q4 ? exp->gain_q4 : 16u;
+    const uint64_t eg   = ((uint64_t)exp->exposure_us * gain) / 16ULL;
+    if (eg == 0) return CAMERA_BRIGHT_MIN;
+
+    // Ladder rungs are a stop apart, so the nearest one is found by
+    // comparing against the geometric midpoint between neighbours.
+    // 1.5x stands in for sqrt(2) — within 6% of the true midpoint and
+    // it keeps this integer-only.
+    int best = CAMERA_BRIGHT_MIN;
+    for (int s = CAMERA_BRIGHT_MIN; s < CAMERA_BRIGHT_MAX; s++) {
+        if (eg >= ((uint64_t)bright_eg_us(s) * 3ULL) / 2ULL) best = s + 1;
+    }
+    return best;
+}
+
+esp_err_t camera_sensor_set_auto_exposure(camera_sensor_t *sensor) {
+    if (sensor == NULL || sensor->device == NULL) return ESP_ERR_INVALID_ARG;
+    const sensor_ae_caps_t caps = ae_caps(sensor->kind);
+    if (!caps.has_auto_ae)      return ESP_ERR_NOT_SUPPORTED;
+    if (!sensor->ae_mode_valid) return ESP_OK;  // never took over, nothing to undo
+    return camera_sensor_write_reg(sensor, OV_REG_AEC_MODE, sensor->ae_mode_saved);
 }

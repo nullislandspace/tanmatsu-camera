@@ -51,6 +51,32 @@ conservatively to stay structurally close to the OV5647 path:
   block needed for AF is meaningful only on a true Bayer pipeline, and
   the OV9281 modules are mechanically fixed-focus anyway.
 
+### Exposure
+
+Q and A move a 16-step exposure ladder, one stop per press, shown in the
+HUD in both photo and video mode. Each step is a light budget that is
+spent on integration time first and only rolls over into analog gain
+once the frame period has no more room — time is free, gain amplifies
+read noise. The HUD turns amber at the point where that rollover starts,
+so you can see when further steps are costing you noise.
+
+The two sensor families need this for different reasons:
+
+- **OV5640 / OV5645 / OV5647** run an on-chip AE loop. The app leaves it
+  alone until you actually press Q or A; the first press locks the
+  exposure at whatever the loop had just converged to and trims from
+  there. Stepping below the bottom rung hands control back to the
+  sensor (`Bright AUTO`).
+- **OV9281** has no on-chip AE whatsoever — it is a machine-vision part
+  that expects the host to drive exposure. Without this control it sits
+  at whatever single brightness its init table produces, forever, so
+  manual exposure is always active there and the ladder is the only
+  brightness control that exists.
+
+Capping the preview to 15 fps doubles VTS, and the exposure ceiling is
+`VTS - a few lines`, so the frame-rate cap is what buys the top half of
+the ladder its headroom (~66 ms on the OV9281 versus ~33 ms uncapped).
+
 OV9281 support ships as a separate component under `components/` rather
 than baked into the host code, so it can be lifted out and published as
 a standalone esp_cam_sensor-compatible driver. The init register sequence
@@ -115,7 +141,7 @@ target.
 ## Controls
 
 The Tanmatsu's function keys map to camera modes; the rest of the
-keyboard provides shutter, focus, and gain controls.
+keyboard provides shutter, focus, exposure, and gain controls.
 
 | Key            | Action                                                           |
 |----------------|------------------------------------------------------------------|
@@ -125,6 +151,7 @@ keyboard provides shutter, focus, and gain controls.
 | **F4**         | Open / close the settings menu                                   |
 | **ESC**        | Exit to the launcher (also: close menu, stop recording first)    |
 | **SPACE**      | Shutter (photo) / record start-stop (video)                      |
+| **Q / A**      | Exposure brighter / darker in photo and video mode (1 stop/press) |
 | **UP / DOWN**  | Manual focus near/far (hold to scan); cycle settings in menu     |
 | **LEFT / RIGHT** | Browse newer/older photos in viewer; adjust setting in menu    |
 | **VOL+ / VOL−**| Mic gain trim in video mode                                      |
@@ -144,13 +171,14 @@ across reboots.
 | `rotate_180`    | bool    | Flip the live preview 180° (camera mounted upside-down) |
 | `mic_enabled`   | bool    | Run the I²S mic in video mode                          |
 | `mic_gain`      | int     | Digital gain multiplier for mic samples                |
+| `cam_brightness`| int     | Exposure step 1–16, or 0/`auto` to leave the sensor's own AE in charge |
 
 ## File layout
 
 | Path                       | Purpose                                          |
 |----------------------------|--------------------------------------------------|
 | `main/main.c`              | App entry point, mode loop, HUD render           |
-| `main/camera_sensor.c`     | Sensor detect, format selection, VTS fps cap     |
+| `main/camera_sensor.c`     | Sensor detect, format selection, VTS fps cap, exposure |
 | `main/camera_pipeline.c`   | CSI / ISP / PPA preview pipeline + snapshot path |
 | `main/photo.c`             | JPEG encode + save                               |
 | `main/video.c`             | H.264 encode + AVI muxer                         |

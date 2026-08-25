@@ -34,6 +34,14 @@
 //                            For backwards compatibility, the legacy
 //                            `mic_enabled=0|1` key is still parsed
 //                            (1 → inmp441, 0 → none).
+//   cam_brightness=<0..16>  camera exposure STEP. 0 = leave the sensor's
+//                            own AE loop in charge (OV5640/45/47); on
+//                            a sensor with no AE loop (OV9281) 0 means
+//                            "start at the built-in default step".
+//                            1..16 takes manual control: one step is
+//                            one stop, step 1 is ~30 us at unity gain.
+//                            Adjusted live with Q (brighter) / A
+//                            (darker) in photo and video mode.
 //   mic_gain=<1..8>         digital gain STEP applied during slot
 //                            extraction (before the LPF + resampler).
 //                            Not a raw multiplier — each step is
@@ -48,6 +56,14 @@
 #define CONFIG_MIC_GAIN_MIN         1
 #define CONFIG_MIC_GAIN_MAX         8
 #define CONFIG_MIC_GAIN_DEFAULT     4
+// 0 = auto / sensor default; 1..16 mirror CAMERA_BRIGHT_MIN..MAX in
+// camera_sensor.h. Kept as plain literals here so config.c does not
+// have to pull in the esp_cam_sensor headers; main.c static-asserts
+// that the two agree.
+#define CONFIG_CAM_BRIGHTNESS_AUTO      0
+#define CONFIG_CAM_BRIGHTNESS_MIN       0
+#define CONFIG_CAM_BRIGHTNESS_MAX       16
+#define CONFIG_CAM_BRIGHTNESS_DEFAULT   CONFIG_CAM_BRIGHTNESS_AUTO
 
 typedef enum {
     MIC_TYPE_NONE = 0,
@@ -67,6 +83,7 @@ typedef struct {
     bool       rotate_180;
     mic_type_t mic_type;
     int        mic_gain;
+    int        cam_brightness;
 } camera_config_t;
 
 // Populate *out with defaults, then overlay any values found in

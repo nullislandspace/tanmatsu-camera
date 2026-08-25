@@ -145,6 +145,24 @@ static uint16_t        g_focus_pos     = 512;
 static int             g_focus_dir     = 0;      // -1, 0, +1
 static int64_t         g_focus_last_us = 0;
 
+// Exposure / brightness runtime state. g_bright_manual distinguishes
+// "we are driving the exposure registers" from "the sensor's own AE
+// loop is" — the OV9281 has no AE loop, so it is always manual there,
+// while on the 5MP parts we leave the on-chip loop alone until the
+// user actually presses Q or A. That way adding this control cannot
+// regress the sensor paths that already work.
+static bool              g_bright_manual = false;
+static int               g_bright_step   = CAMERA_BRIGHT_DEFAULT;
+static camera_exposure_t g_bright_now    = {0};
+// Q/A repeat while held, and every press would otherwise rewrite
+// /sd/camera.cfg. Coalesce into one write once the value has been
+// still for a moment.
+static int64_t           g_bright_save_at = 0;
+#define BRIGHT_SAVE_DELAY_US  1500000
+
+_Static_assert(CAMERA_BRIGHT_MAX == CONFIG_CAM_BRIGHTNESS_MAX,
+               "config.h brightness range must match camera_sensor.h");
+
 // Config menu items. Tagged struct so a single table can hold boolean
 // checkboxes, a string-cycler for the focus driver name, bounded
 // integer cyclers (e.g. mic gain), and an enum cycler for the
@@ -360,6 +378,62 @@ static void apply_saved_timezone(void) {
     tzset();
 }
 
+// Push the current brightness step at the sensor. Called after every
+// set_format_*, because set_format replays the driver's whole init
+// register table and that wipes the exposure/gain we wrote. A failure
+// drops us back to whatever the sensor does on its own rather than
+// leaving the HUD advertising a value that isn't actually programmed.
+static void apply_brightness(camera_sensor_t *sensor) {
+    if (!g_bright_manual) return;
+    esp_err_t err = camera_sensor_set_brightness(sensor, g_bright_step, &g_bright_now);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "brightness step %d failed: %d", g_bright_step, err);
+        g_bright_manual = false;
+    }
+}
+
+// Q / A handler. On a sensor with an on-chip AE loop the first press
+// also takes control away from it, seeded with whatever the loop had
+// just converged to — so the picture doesn't jump, and the gesture
+// reads as "lock the exposure, then trim it" the way it would on any
+// real camera. Stepping below the bottom rung hands control back.
+static void adjust_brightness(camera_sensor_t *sensor, int delta) {
+    if (!g_bright_manual) {
+        camera_exposure_t cur = {0};
+        if (camera_sensor_read_exposure(sensor, &cur) == ESP_OK && cur.exposure_us > 0) {
+            g_bright_step = camera_sensor_brightness_step_for(sensor, &cur);
+        } else {
+            g_bright_step = CAMERA_BRIGHT_DEFAULT;
+        }
+        g_bright_manual = true;
+    }
+
+    int next = g_bright_step + delta;
+    if (next < CAMERA_BRIGHT_MIN) {
+        // Below the darkest rung: on a sensor that has an AE loop,
+        // give it back. On one that doesn't (OV9281) there is nowhere
+        // to fall back to, so the bottom rung is simply the bottom.
+        if (camera_sensor_has_auto_exposure(sensor)) {
+            if (camera_sensor_set_auto_exposure(sensor) == ESP_OK) {
+                g_bright_manual     = false;
+                g_cfg.cam_brightness = CONFIG_CAM_BRIGHTNESS_AUTO;
+                g_bright_save_at    = esp_timer_get_time() + BRIGHT_SAVE_DELAY_US;
+            }
+            return;
+        }
+        next = CAMERA_BRIGHT_MIN;
+    }
+    if (next > CAMERA_BRIGHT_MAX) next = CAMERA_BRIGHT_MAX;
+    if (next == g_bright_step && g_cfg.cam_brightness == next) return;
+
+    g_bright_step = next;
+    apply_brightness(sensor);
+    if (g_bright_manual) {
+        g_cfg.cam_brightness = g_bright_step;
+        g_bright_save_at     = esp_timer_get_time() + BRIGHT_SAVE_DELAY_US;
+    }
+}
+
 // Tear the current preview pipeline down, reconfigure the sensor to
 // the format associated with the target mode, and bring the pipeline
 // back up. Used on F1/F2/F3 transitions — PHOTO and VIEW share the
@@ -417,6 +491,12 @@ static esp_err_t switch_pipeline_to_source(camera_sensor_t *sensor,
         ESP_LOGE(TAG, "sensor format switch: %d", err);
         return err;
     }
+
+    // set_format replayed the driver's init table, so the exposure and
+    // gain we had programmed are gone. Put them back before the stream
+    // restarts, otherwise the first seconds of the new mode come up at
+    // the driver's default brightness.
+    apply_brightness(sensor);
 
     camera_source_t src = pick_source(sensor->kind, is_video_mode, &fmt);
     err = camera_preview_start(&src, preview_area_w, preview_area_h);
@@ -648,6 +728,28 @@ void app_main(void) {
     if (camera_sensor_set_preview_fps(&sensor, PREVIEW_TARGET_FPS) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to lower preview fps, continuing at native rate");
     }
+
+    // Exposure. Two different situations share one code path here:
+    //
+    //   - A sensor with no on-chip AE (OV9281) has to be driven
+    //     manually or it stays at whatever single brightness its init
+    //     table happens to produce, forever. Manual is not optional,
+    //     so an unset config means "start at the default step".
+    //   - A sensor with an on-chip AE loop (OV5647/OV5640/OV5645) is
+    //     left alone unless the user has previously saved an explicit
+    //     step, so existing installs behave exactly as before.
+    //
+    // This has to run after the fps override: capping to 15 fps
+    // doubles VTS, and the exposure ceiling is derived from VTS.
+    if (!camera_sensor_has_auto_exposure(&sensor)) {
+        g_bright_step   = (g_cfg.cam_brightness >= CAMERA_BRIGHT_MIN)
+                              ? g_cfg.cam_brightness : CAMERA_BRIGHT_DEFAULT;
+        g_bright_manual = true;
+    } else if (g_cfg.cam_brightness >= CAMERA_BRIGHT_MIN) {
+        g_bright_step   = g_cfg.cam_brightness;
+        g_bright_manual = true;
+    }
+    apply_brightness(&sensor);
     // NOTE: set_format leaves the sensor stream OFF. We bring up the CSI
     // pipeline FIRST so the CSI PHY is listening before the sensor starts
     // transmitting frames — starting the sensor while nothing is listening
@@ -943,18 +1045,28 @@ void app_main(void) {
                         break;
                 }
             }
-            if (event.type == INPUT_EVENT_TYPE_KEYBOARD && event.args_keyboard.ascii == ' ') {
-                if (mode == MODE_CONFIG) {
-                    if (CFG_ITEM_COUNT > 0) {
-                        cfg_act_result_t r = cfg_item_activate(g_cfg_sel);
-                        if (r == CFG_ACT_CHANGED) {
-                            config_save(&g_cfg);
-                        } else if (r == CFG_ACT_PROBE_FAILED) {
-                            SHOW_BANNER("%s not detected", g_cfg.focus_driver);
+            if (event.type == INPUT_EVENT_TYPE_KEYBOARD) {
+                const char kc = (char)event.args_keyboard.ascii;
+                if (kc == ' ') {
+                    if (mode == MODE_CONFIG) {
+                        if (CFG_ITEM_COUNT > 0) {
+                            cfg_act_result_t r = cfg_item_activate(g_cfg_sel);
+                            if (r == CFG_ACT_CHANGED) {
+                                config_save(&g_cfg);
+                            } else if (r == CFG_ACT_PROBE_FAILED) {
+                                SHOW_BANNER("%s not detected", g_cfg.focus_driver);
+                            }
                         }
+                    } else {
+                        space_pending = true;
                     }
-                } else {
-                    space_pending = true;
+                } else if ((kc == 'q' || kc == 'Q' || kc == 'a' || kc == 'A') &&
+                           (mode == MODE_PHOTO || mode == MODE_VIDEO)) {
+                    // Q brighter / A darker. Live in both preview and
+                    // recording — the exposure registers are written
+                    // over SCCB while the sensor streams, which is the
+                    // same thing an on-chip AE loop does every frame.
+                    adjust_brightness(&sensor, (kc == 'q' || kc == 'Q') ? +1 : -1);
                 }
             }
         }
@@ -1130,6 +1242,23 @@ void app_main(void) {
             const int hud_line  = hud_font + 4;
             int hud_y = 14;
 
+            // The strip is a fixed 480 px tall and three of the blocks
+            // below are variable-height (audio meter, exposure, focus),
+            // so recording video with both a mic and a focus driver
+            // active can run them into the sensor-name footer pinned at
+            // y=458. Drop whatever no longer fits instead of
+            // overprinting it — a missing hint line is recoverable, an
+            // unreadable one is not.
+            #define HUD_BOTTOM_Y   440
+            #define HUD_TEXT_LINE(col, str)                                        \
+                do {                                                               \
+                    if (hud_y + hud_font <= HUD_BOTTOM_Y) {                        \
+                        fbdraw_hershey_string(&fb, (col), hud_pad_x, hud_y,        \
+                                              (str), hud_font);                    \
+                        hud_y += hud_line;                                         \
+                    }                                                              \
+                } while (0)
+
             // Mode header in a contrasting colour.
             fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
                                   mode_name(mode), 20);
@@ -1254,6 +1383,51 @@ void app_main(void) {
                     break;
             }
 
+            // Exposure readout. Drawn identically in PHOTO and VIDEO
+            // so the value you trim while framing is visibly the same
+            // value you record with — on a sensor with no on-chip AE
+            // this is the single most important number on the screen.
+            // The step is what Q/A move; the line underneath is what
+            // actually reached the registers, which is what you need
+            // when a frame comes back black and you're deciding
+            // between "wrong exposure" and "wrong wiring".
+            if (mode == MODE_PHOTO || mode == MODE_VIDEO) {
+                hud_y += 10;
+                fbdraw_fill_rect(&fb, hud_pad_x, hud_y,
+                                 (int)hud_area_w - 20, 1, HUD_SEP);
+                hud_y += 8;
+
+                char bl[24];
+                char el[24];
+                uint16_t bcol = WHITE;
+                if (g_bright_manual) {
+                    snprintf(bl, sizeof(bl), "Bright %d/%d",
+                             g_bright_step, CAMERA_BRIGHT_MAX);
+
+                    const uint32_t us = g_bright_now.exposure_us;
+                    const unsigned gi = (unsigned)(g_bright_now.gain_q4 / 16u);
+                    const unsigned gf = (unsigned)(((g_bright_now.gain_q4 % 16u) * 10u) / 16u);
+                    if (us >= 1000u) {
+                        snprintf(el, sizeof(el), "%u.%ums %u.%ux",
+                                 (unsigned)(us / 1000u),
+                                 (unsigned)((us % 1000u) / 100u), gi, gf);
+                    } else {
+                        snprintf(el, sizeof(el), "%uus %u.%ux", (unsigned)us, gi, gf);
+                    }
+                    // Amber once the frame period has run out of room
+                    // and further steps are buying light with analog
+                    // gain instead of time — i.e. from here up you are
+                    // trading noise for brightness.
+                    if (g_bright_now.exposure_capped) bcol = YELLOW;
+                } else {
+                    snprintf(bl, sizeof(bl), "Bright AUTO");
+                    snprintf(el, sizeof(el), "sensor AE");
+                }
+                HUD_TEXT_LINE(bcol, bl);
+                HUD_TEXT_LINE(bcol, el);
+                HUD_TEXT_LINE(WHITE, "Q/A bright");
+            }
+
             // Focus readout — visible whenever a focus driver is
             // active and we're not in the config menu (the menu shows
             // the state already) or the file viewer. Drawn as its own
@@ -1269,8 +1443,7 @@ void app_main(void) {
 
                 char fl[16];
                 snprintf(fl, sizeof(fl), "Focus %4u", (unsigned)g_focus_pos);
-                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, fl, hud_font);
-                hud_y += hud_line;
+                HUD_TEXT_LINE(WHITE, fl);
 
                 const char *af_msg = "AF: none";
                 if (g_cfg.autofocus_enabled) {
@@ -1281,18 +1454,16 @@ void app_main(void) {
                         default:              af_msg = "AF: off";       break;
                     }
                 }
-                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, af_msg, hud_font);
-                hud_y += hud_line;
+                HUD_TEXT_LINE(WHITE, af_msg);
 
                 char dl[24];
                 snprintf(dl, sizeof(dl), "DRV: %s", focus_active_name());
-                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, dl, hud_font);
-                hud_y += hud_line;
+                HUD_TEXT_LINE(WHITE, dl);
 
-                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
-                                      "UP/DN focus", hud_font);
-                hud_y += hud_line;
+                HUD_TEXT_LINE(WHITE, "UP/DN focus");
             }
+            #undef HUD_TEXT_LINE
+            #undef HUD_BOTTOM_Y
 
             // Sensor model footer at the bottom of the HUD strip.
             // Pinned to a fixed y rather than appended to hud_y so it
@@ -1378,6 +1549,14 @@ void app_main(void) {
                     }
                 }
             }
+        }
+
+        // Flush a pending brightness change to the SD card once the
+        // user has stopped tapping Q/A. Held keys repeat, and one card
+        // write per repeat would stall the preview for no reason.
+        if (g_bright_save_at != 0 && esp_timer_get_time() >= g_bright_save_at) {
+            g_bright_save_at = 0;
+            config_save(&g_cfg);
         }
 
         // The UI is done with s_preview_buffer (if we actually consumed
