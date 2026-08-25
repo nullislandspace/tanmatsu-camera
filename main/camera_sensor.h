@@ -174,6 +174,24 @@ bool camera_sensor_has_auto_exposure(const camera_sensor_t *sensor);
 esp_err_t camera_sensor_set_brightness(camera_sensor_t *sensor, int step,
                                        camera_exposure_t *out);
 
+// Program an arbitrary light budget, in "microseconds at unity gain".
+// This is the continuous form of camera_sensor_set_brightness(): the
+// ladder is nothing more than a table of powers of two fed to this
+// function. A closed AE loop needs it, because one-stop granularity is
+// far too coarse to servo against — the picture would visibly pump.
+//
+// The budget is split the same way for both callers: integration time
+// first up to the frame-period ceiling, then analog gain for the
+// remainder.
+esp_err_t camera_sensor_set_exposure_eg(camera_sensor_t *sensor, uint32_t eg_us,
+                                        camera_exposure_t *out);
+
+// Bounds of the light budget on the current format + frame rate, for a
+// control loop to clamp against. Max is (longest integration) x
+// (largest analog gain); min is one row at unity gain.
+uint32_t camera_sensor_eg_min_us(const camera_sensor_t *sensor);
+uint32_t camera_sensor_eg_max_us(const camera_sensor_t *sensor);
+
 // Read the exposure + gain registers back. Used to seed the ladder from
 // whatever an on-chip AE loop had converged to at the moment the user
 // takes manual control, so the picture doesn't jump on the first press.

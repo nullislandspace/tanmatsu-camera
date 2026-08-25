@@ -53,8 +53,12 @@ conservatively to stay structurally close to the OV5647 path:
 
 ### Exposure
 
-Q and A move a 16-step exposure ladder, one stop per press, shown in the
-HUD in both photo and video mode. Each step is a light budget that is
+Exposure is either automatic or a fixed step on a 16-step ladder. The
+mode is the **Auto Exp** checkbox in the F4 menu, and **Q** / **A** move
+the ladder one stop per press — the first press leaves automatic, and
+stepping below step 1 returns to it (the HUD hint changes to `A = auto`
+on the bottom rung so you don't have to know that). Both the mode and
+the step are shown in the HUD in photo and video mode. Each step is a light budget that is
 spent on integration time first and only rolls over into analog gain
 once the frame period has no more room — time is free, gain amplifies
 read noise. The HUD turns amber at the point where that rollover starts,
@@ -68,14 +72,52 @@ The two sensor families need this for different reasons:
   there. Stepping below the bottom rung hands control back to the
   sensor (`Bright AUTO`).
 - **OV9281** has no on-chip AE whatsoever — it is a machine-vision part
-  that expects the host to drive exposure. Without this control it sits
-  at whatever single brightness its init table produces, forever, so
-  manual exposure is always active there and the ladder is the only
-  brightness control that exists.
+  that expects the host to drive exposure. Without a host-side loop it
+  sits at whatever single brightness its init table produces, forever.
+  `AUTO` there means the software AE loop described below.
 
 Capping the preview to 15 fps doubles VTS, and the exposure ceiling is
 `VTS - a few lines`, so the frame-rate cap is what buys the top half of
 the ladder its headroom (~66 ms on the OV9281 versus ~33 ms uncapped).
+
+### Software auto-exposure
+
+For sensors with no AE of their own, `main/autoexposure.c` closes the
+loop in software using the ESP32-P4 ISP's AE statistics block — a 5×5
+grid of 8-bit mean luminances over the frame, produced in hardware every
+frame at no memory-bandwidth cost. Metering is centre-weighted (4:2:1
+from the middle out) so a bright window in shot doesn't black out the
+subject, with an override that forces a step down when more than two
+blocks are clipped — a mean that looks correct while the highlights are
+blown is a mean that can't see the problem.
+
+It is deliberately slow: **one correction every 500 ms** with a **±25%
+deadband**, correcting at most two stops at a time. An exposure write
+lands in the statistics one to two frames later, which at 15 fps is
+66–133 ms of dead time in the feedback path. Sampling four to eight
+times slower than the dead time is what makes the loop stable without a
+damping term — the price is a couple of seconds to walk across a large
+lighting change. It keeps the frame usable; it is not smooth enough to
+film a pan with.
+
+The tunables (`AE_TARGET_LUMA`, `AE_DEADBAND_PCT`, `AE_INTERVAL_MS`)
+are at the top of `main/autoexposure.c`. Every correction logs the
+metered luminance and the budget it moved to, so retuning against a real
+scene is a matter of reading the serial log:
+
+```
+autoexposure: luma 31 (target 64, 0 clipped) -> eg 30976 us = 30715 us x 1.00
+```
+
+The HUD shows `AE hunt 31` / `AE lock 64` / `AE limit 12` with the live
+metered value, so the loop's state is visible without a serial cable.
+`AE limit` means the scene is past what exposure and gain together can
+reach — that is the sensor running out of range, not the loop wedging.
+
+Which loop runs is decided by the pipeline, not a sensor list: the AE
+statistics block meters the demosaicer's output, so it only comes up on
+the RAW sensors, and the RGB565 ones that run the ISP in bypass are
+exactly the ones with on-chip AE that want no software loop.
 
 OV9281 support ships as a separate component under `components/` rather
 than baked into the host code, so it can be lifted out and published as
@@ -151,7 +193,7 @@ keyboard provides shutter, focus, exposure, and gain controls.
 | **F4**         | Open / close the settings menu                                   |
 | **ESC**        | Exit to the launcher (also: close menu, stop recording first)    |
 | **SPACE**      | Shutter (photo) / record start-stop (video)                      |
-| **Q / A**      | Exposure brighter / darker in photo and video mode (1 stop/press) |
+| **Q / A**      | Exposure brighter / darker in photo and video mode (1 stop/press); first press leaves auto, stepping below step 1 returns to it |
 | **UP / DOWN**  | Manual focus near/far (hold to scan); cycle settings in menu     |
 | **LEFT / RIGHT** | Browse newer/older photos in viewer; adjust setting in menu    |
 | **VOL+ / VOL−**| Mic gain trim in video mode                                      |
@@ -171,7 +213,8 @@ across reboots.
 | `rotate_180`    | bool    | Flip the live preview 180° (camera mounted upside-down) |
 | `mic_enabled`   | bool    | Run the I²S mic in video mode                          |
 | `mic_gain`      | int     | Digital gain multiplier for mic samples                |
-| `cam_brightness`| int     | Exposure step 1–16, or 0/`auto` to leave the sensor's own AE in charge |
+| `auto_exposure` | bool    | Choose exposure automatically — the sensor's on-chip AE, or the software loop where it has none |
+| `cam_brightness`| int     | Manual exposure step 1–16, used when `auto_exposure=0`. One stop per step |
 
 ## File layout
 
@@ -183,6 +226,7 @@ across reboots.
 | `main/photo.c`             | JPEG encode + save                               |
 | `main/video.c`             | H.264 encode + AVI muxer                         |
 | `main/microphone.c`        | INMP441 I²S capture                              |
+| `main/autoexposure.c`      | Software AE loop over the ISP luminance statistics |
 | `main/focus/`              | Focus driver framework + autofocus state machine |
 | `main/viewer.c`            | JPEG decoder + browse-on-SD UI                   |
 | `main/avi_mux.c`           | Minimal AVI v1 muxer for the recording path      |

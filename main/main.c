@@ -22,6 +22,7 @@
 #include "bmp_writer.h"
 #include "camera_pipeline.h"
 #include "camera_sensor.h"
+#include "autoexposure.h"
 #include "config.h"
 #include "focus/autofocus.h"
 #include "focus/focus_driver.h"
@@ -140,6 +141,9 @@ static const char *mode_name(app_mode_t m) {
 // (real chip vs. simulator vs. off) is selected via the config menu;
 // see focus_driver.h.
 static camera_config_t g_cfg           = {0};
+// The detected sensor, published so the config menu can act on the
+// Auto Exp toggle. Owned by app_main; NULL until detection succeeds.
+static camera_sensor_t *g_sensor       = NULL;
 static bool            g_focus_present = false;  // active driver probed OK
 static uint16_t        g_focus_pos     = 512;
 static int             g_focus_dir     = 0;      // -1, 0, +1
@@ -160,8 +164,22 @@ static camera_exposure_t g_bright_now    = {0};
 static int64_t           g_bright_save_at = 0;
 #define BRIGHT_SAVE_DELAY_US  1500000
 
-_Static_assert(CAMERA_BRIGHT_MAX == CONFIG_CAM_BRIGHTNESS_MAX,
+_Static_assert(CAMERA_BRIGHT_MAX == CONFIG_CAM_BRIGHTNESS_MAX &&
+               CAMERA_BRIGHT_MIN == CONFIG_CAM_BRIGHTNESS_MIN,
                "config.h brightness range must match camera_sensor.h");
+
+// Defined below with the rest of the exposure plumbing; the config menu
+// needs them to apply the Auto Exp toggle immediately.
+static void apply_brightness(camera_sensor_t *sensor);
+static bool enter_auto_exposure(camera_sensor_t *sensor);
+static void enter_manual_exposure(camera_sensor_t *sensor);
+// True when there is any automatic exposure to switch to at all — an
+// on-chip loop, or ours over the ISP statistics.
+static bool auto_exposure_possible(camera_sensor_t *sensor);
+
+// Defined below with the rest of the exposure plumbing; the config
+// menu needs it to apply the Soft AE toggle immediately.
+static void apply_brightness(camera_sensor_t *sensor);
 
 // Config menu items. Tagged struct so a single table can hold boolean
 // checkboxes, a string-cycler for the focus driver name, bounded
@@ -187,6 +205,9 @@ static cfg_item_t g_cfg_items[] = {
     { "Focus",      CFG_KIND_BOOL,   &g_cfg.focus_enabled,     0, 0 },
     { "Autofocus",  CFG_KIND_BOOL,   &g_cfg.autofocus_enabled, 0, 0 },
     { "Rotate 180", CFG_KIND_BOOL,   &g_cfg.rotate_180,        0, 0 },
+    { "Auto Exp",   CFG_KIND_BOOL,   &g_cfg.auto_exposure,     0, 0 },
+    { "Exp Step",   CFG_KIND_INT,    &g_cfg.cam_brightness,
+                    CONFIG_CAM_BRIGHTNESS_MIN, CONFIG_CAM_BRIGHTNESS_MAX },
     { "Microphone", CFG_KIND_MIC_TYPE, &g_cfg.mic_type,        0, 0 },
     { "Mic Gain",   CFG_KIND_INT,    &g_cfg.mic_gain,
                     CONFIG_MIC_GAIN_MIN, CONFIG_MIC_GAIN_MAX },
@@ -198,6 +219,11 @@ static int g_cfg_sel = 0;
 // a focus driver is currently active (Focus on + chip probed OK).
 static bool cfg_item_enabled(const cfg_item_t *it) {
     if (it->target == &g_cfg.autofocus_enabled) return g_focus_present;
+    // No automatic exposure to offer if the sensor has no AE loop and
+    // the pipeline gives us no luminance statistics to build one from.
+    if (it->target == &g_cfg.auto_exposure)  return auto_exposure_possible(g_sensor);
+    // The manual step does nothing while automatic is driving.
+    if (it->target == &g_cfg.cam_brightness) return !g_cfg.auto_exposure;
     return true;
 }
 
@@ -263,6 +289,9 @@ static cfg_act_result_t cfg_item_activate(int idx) {
         *iv = next;
         if (iv == &g_cfg.mic_gain) {
             microphone_set_gain(*iv);
+        } else if (iv == &g_cfg.cam_brightness && g_sensor) {
+            g_bright_step = *iv;
+            apply_brightness(g_sensor);
         }
         return (*iv != prev) ? CFG_ACT_CHANGED : CFG_ACT_NOOP;
     }
@@ -293,6 +322,24 @@ static cfg_act_result_t cfg_item_activate(int idx) {
         autofocus_set_enabled(g_focus_present && *v);
     } else if (v == &g_cfg.rotate_180) {
         camera_pipeline_set_rotate_180(*v);
+    } else if (v == &g_cfg.auto_exposure) {
+        if (!g_sensor) {
+            *v = prev;
+            return CFG_ACT_NOOP;
+        }
+        if (*v) {
+            if (!enter_auto_exposure(g_sensor)) {
+                *v = prev;  // nothing to hand over to
+                return CFG_ACT_NOOP;
+            }
+        } else {
+            // Seed the manual step from whatever automatic had settled
+            // on, so switching modes holds the picture rather than
+            // jumping to a stored step from another lighting situation.
+            enter_manual_exposure(g_sensor);
+            apply_brightness(g_sensor);
+            g_cfg.cam_brightness = g_bright_step;
+        }
     }
 
     return (*v != prev) ? CFG_ACT_CHANGED : CFG_ACT_NOOP;
@@ -384,6 +431,13 @@ static void apply_saved_timezone(void) {
 // drops us back to whatever the sensor does on its own rather than
 // leaving the HUD advertising a value that isn't actually programmed.
 static void apply_brightness(camera_sensor_t *sensor) {
+    if (autoexposure_is_enabled()) {
+        // The software loop owns the registers; re-arm it with the
+        // budget it had settled on rather than snapping back to a
+        // ladder step it never chose.
+        autoexposure_reapply(sensor);
+        return;
+    }
     if (!g_bright_manual) return;
     esp_err_t err = camera_sensor_set_brightness(sensor, g_bright_step, &g_bright_now);
     if (err != ESP_OK) {
@@ -392,43 +446,77 @@ static void apply_brightness(camera_sensor_t *sensor) {
     }
 }
 
-// Q / A handler. On a sensor with an on-chip AE loop the first press
-// also takes control away from it, seeded with whatever the loop had
-// just converged to — so the picture doesn't jump, and the gesture
+// Is there any automatic exposure available to switch to? Either the
+// sensor's own on-chip loop, or ours over the ISP luminance statistics
+// (which exist only on a demosaicing pipeline).
+static bool auto_exposure_possible(camera_sensor_t *sensor) {
+    if (!sensor) return false;
+    return camera_sensor_has_auto_exposure(sensor) || autoexposure_available();
+}
+
+// Hand exposure to whichever automatic this sensor has. Returns false
+// if it has none, in which case nothing changed.
+static bool enter_auto_exposure(camera_sensor_t *sensor) {
+    if (!sensor) return false;
+    if (camera_sensor_has_auto_exposure(sensor)) {
+        if (camera_sensor_set_auto_exposure(sensor) != ESP_OK) return false;
+        autoexposure_set_enabled(false);
+        g_bright_manual = false;
+        return true;
+    }
+    if (autoexposure_available()) {
+        autoexposure_set_enabled(true);
+        g_bright_manual = false;
+        return true;
+    }
+    return false;
+}
+
+// Take exposure away from automatic, seeding the ladder from whatever
+// it had converged to so the picture doesn't jump. The caller applies.
+static void enter_manual_exposure(camera_sensor_t *sensor) {
+    if (g_bright_manual) return;
+    camera_exposure_t cur = {0};
+    if (autoexposure_is_enabled()) {
+        // Our own loop was driving: take its exact budget rather than
+        // reading the registers back, then stand it down.
+        cur.exposure_us = autoexposure_current_eg_us();
+        cur.gain_q4     = 16;
+        autoexposure_set_enabled(false);
+    } else {
+        // The sensor's on-chip loop was driving; read back what it
+        // converged to.
+        camera_sensor_read_exposure(sensor, &cur);
+    }
+    g_bright_step = (cur.exposure_us > 0)
+                        ? camera_sensor_brightness_step_for(sensor, &cur)
+                        : CAMERA_BRIGHT_DEFAULT;
+    g_bright_manual = true;
+}
+
+// Q / A handler. The first press takes exposure away from whatever
+// automatic was driving, seeded so the picture holds — the gesture
 // reads as "lock the exposure, then trim it" the way it would on any
 // real camera. Stepping below the bottom rung hands control back.
 static void adjust_brightness(camera_sensor_t *sensor, int delta) {
-    if (!g_bright_manual) {
-        camera_exposure_t cur = {0};
-        if (camera_sensor_read_exposure(sensor, &cur) == ESP_OK && cur.exposure_us > 0) {
-            g_bright_step = camera_sensor_brightness_step_for(sensor, &cur);
-        } else {
-            g_bright_step = CAMERA_BRIGHT_DEFAULT;
-        }
-        g_bright_manual = true;
-    }
+    enter_manual_exposure(sensor);
 
     int next = g_bright_step + delta;
     if (next < CAMERA_BRIGHT_MIN) {
-        // Below the darkest rung: on a sensor that has an AE loop,
-        // give it back. On one that doesn't (OV9281) there is nowhere
-        // to fall back to, so the bottom rung is simply the bottom.
-        if (camera_sensor_has_auto_exposure(sensor)) {
-            if (camera_sensor_set_auto_exposure(sensor) == ESP_OK) {
-                g_bright_manual     = false;
-                g_cfg.cam_brightness = CONFIG_CAM_BRIGHTNESS_AUTO;
-                g_bright_save_at    = esp_timer_get_time() + BRIGHT_SAVE_DELAY_US;
-            }
+        if (enter_auto_exposure(sensor)) {
+            g_cfg.auto_exposure = true;
+            g_bright_save_at    = esp_timer_get_time() + BRIGHT_SAVE_DELAY_US;
             return;
         }
-        next = CAMERA_BRIGHT_MIN;
+        next = CAMERA_BRIGHT_MIN;  // nothing to hand back to
     }
     if (next > CAMERA_BRIGHT_MAX) next = CAMERA_BRIGHT_MAX;
-    if (next == g_bright_step && g_cfg.cam_brightness == next) return;
 
     g_bright_step = next;
     apply_brightness(sensor);
-    if (g_bright_manual) {
+    if (g_bright_manual &&
+        (g_cfg.cam_brightness != g_bright_step || g_cfg.auto_exposure)) {
+        g_cfg.auto_exposure  = false;
         g_cfg.cam_brightness = g_bright_step;
         g_bright_save_at     = esp_timer_get_time() + BRIGHT_SAVE_DELAY_US;
     }
@@ -713,6 +801,7 @@ void app_main(void) {
         wait_for_esc();
         return;
     }
+    g_sensor = &sensor;
     esp_cam_sensor_format_t initial_fmt = {0};
     if (camera_sensor_set_format_preview(&sensor, &initial_fmt) != ESP_OK) {
         splash(RED, WHITE, "Camera error", "Format not supported");
@@ -741,15 +830,31 @@ void app_main(void) {
     //
     // This has to run after the fps override: capping to 15 fps
     // doubles VTS, and the exposure ceiling is derived from VTS.
-    if (!camera_sensor_has_auto_exposure(&sensor)) {
-        g_bright_step   = (g_cfg.cam_brightness >= CAMERA_BRIGHT_MIN)
-                              ? g_cfg.cam_brightness : CAMERA_BRIGHT_DEFAULT;
+    g_bright_step = g_cfg.cam_brightness;
+    if (g_cfg.auto_exposure && camera_sensor_has_auto_exposure(&sensor)) {
+        // The sensor's own loop is already running and is what "auto"
+        // means here. Touching the exposure registers would switch it
+        // off, so don't.
+        g_bright_manual = false;
+    } else {
+        // Everything else starts by programming a real exposure. That
+        // includes the auto case on a sensor without an on-chip loop:
+        // the software loop only starts once the ISP exists and needs a
+        // second or two to converge, and the driver's init-table
+        // default is what you would be staring at until then.
         g_bright_manual = true;
-    } else if (g_cfg.cam_brightness >= CAMERA_BRIGHT_MIN) {
-        g_bright_step   = g_cfg.cam_brightness;
-        g_bright_manual = true;
+        apply_brightness(&sensor);
+        if (g_cfg.auto_exposure) {
+            // Arm the software loop; it picks the flag up when
+            // camera_preview_start brings the ISP (and with it the AE
+            // statistics block) into existence, and seeds itself from
+            // the exposure just written above. If this pipeline turns
+            // out to have no statistics block the loop simply never
+            // runs and we stay on the step written above.
+            g_bright_manual = false;
+            autoexposure_set_enabled(true);
+        }
     }
-    apply_brightness(&sensor);
     // NOTE: set_format leaves the sensor stream OFF. We bring up the CSI
     // pipeline FIRST so the CSI PHY is listening before the sensor starts
     // transmitting frames — starting the sensor while nothing is listening
@@ -1163,10 +1268,21 @@ void app_main(void) {
                         snprintf(row, sizeof(row), "%-9s < %s >",
                                  it->label, mic_type_display_name(mt));
                     } else {
+                        // Greyed-out items say WHY. The reason is
+                        // per-item: it used to be hardcoded to
+                        // "(needs Focus)", which was fine while
+                        // Autofocus was the only item that could be
+                        // unavailable and became wrong the moment
+                        // Auto Exp joined it.
+                        const char *why = "";
+                        if (!avail) {
+                            why = (it->target == &g_cfg.auto_exposure)
+                                      ? " (no AE on this sensor)"
+                                      : " (needs Focus)";
+                        }
                         bool v = *(bool *)it->target;
                         snprintf(row, sizeof(row), "[%c] %s%s",
-                                 v ? 'x' : ' ', it->label,
-                                 avail ? "" : " (needs Focus)");
+                                 v ? 'x' : ' ', it->label, why);
                     }
                     fbdraw_hershey_string(&fb, col, mx, my, row, 18);
                     my += row_h;
@@ -1184,6 +1300,18 @@ void app_main(void) {
                 int panel_x_off = ((int)fb.panel_w - (int)pw) / 2;
                 if (panel_x_off < 0) panel_x_off = 0;
 
+                // ph is the preview's extent along user-x (panel_y ==
+                // user_x). It only fills the preview area exactly when
+                // the PPA's k/16 scale happens to divide evenly: the
+                // OV5647's 1920 wide at 5/16 gives exactly 600, but the
+                // OV9281's 1280 at 7/16 gives 560, leaving 40 user
+                // columns this branch never writes. Centre the image
+                // and clear both pillars, or that strip keeps whatever
+                // each of the two buffers last had in it — which is the
+                // splash screen, alternating, i.e. a flashing bar.
+                int panel_y_off = ((int)preview_area_w - (int)ph) / 2;
+                if (panel_y_off < 0) panel_y_off = 0;
+
                 // Clear the top and bottom letterbox bars so stale content
                 // from a previous frame or from view mode doesn't show.
                 int top_bar_h = (int)fb.user_h - (panel_x_off + (int)pw);
@@ -1197,8 +1325,22 @@ void app_main(void) {
                     fbdraw_fill_rect(&fb, 0, bot_bar_y,
                                      (int)preview_area_w, bot_bar_h, BLACK);
                 }
+                // ... and the left/right pillars, in user-x. Tested
+                // independently: an odd shortfall centres to an
+                // uneven split, so the right pillar can exist when the
+                // left one has been rounded away.
+                const int right_x = panel_y_off + (int)ph;
+                if (panel_y_off > 0) {
+                    fbdraw_fill_rect(&fb, 0, 0,
+                                     panel_y_off, (int)preview_area_h, BLACK);
+                }
+                if (right_x < (int)preview_area_w) {
+                    fbdraw_fill_rect(&fb, right_x, 0,
+                                     (int)preview_area_w - right_x,
+                                     (int)preview_area_h, BLACK);
+                }
 
-                fbdraw_blit_panel(&fb, panel_x_off, 0,
+                fbdraw_blit_panel(&fb, panel_x_off, panel_y_off,
                                   (const uint16_t *)camera_preview_get_pixels(),
                                   pw, ph);
             }
@@ -1226,6 +1368,14 @@ void app_main(void) {
                     g_focus_last_us = now;
                 }
             }
+
+            // Software auto-exposure tick. Self-gating and internally
+            // rate-limited, so calling it every frame is correct and
+            // costs a timestamp compare when it has nothing to do. Run
+            // in every mode: the sensor keeps streaming behind the
+            // viewer and the config menu, and coming back to a
+            // correctly exposed frame beats coming back to a dark one.
+            autoexposure_tick(&sensor);
 
             // Hardware autofocus tick. Skipped entirely when AF is
             // disabled (autofocus_tick is a no-op in that case, but
@@ -1397,16 +1547,53 @@ void app_main(void) {
                                  (int)hud_area_w - 20, 1, HUD_SEP);
                 hud_y += 8;
 
+                // Three states share this block, and the first line
+                // says which one is driving: our software AE loop, the
+                // sensor's own on-chip loop, or the user.
                 char bl[24];
                 char el[24];
                 uint16_t bcol = WHITE;
-                if (g_bright_manual) {
+                camera_exposure_t shown = g_bright_now;
+
+                if (autoexposure_is_enabled() && autoexposure_available()) {
+                    autoexposure_last_exposure(&shown);
+                    switch (autoexposure_hud_state()) {
+                        case AE_HUD_LOCKED:
+                            snprintf(bl, sizeof(bl), "AE lock %d",
+                                     autoexposure_hud_luma());
+                            break;
+                        case AE_HUD_LIMIT:
+                            // Out of sensor range — the scene is beyond
+                            // what exposure and gain together can reach.
+                            // Worth saying so, or a stuck-looking loop
+                            // reads as a bug.
+                            snprintf(bl, sizeof(bl), "AE limit %d",
+                                     autoexposure_hud_luma());
+                            bcol = YELLOW;
+                            break;
+                        case AE_HUD_HUNTING:
+                            snprintf(bl, sizeof(bl), "AE hunt %d",
+                                     autoexposure_hud_luma());
+                            break;
+                        case AE_HUD_OFF:
+                        default:
+                            // Unreachable while the statistics block is
+                            // up — kept so a future state doesn't fall
+                            // through to a stale label.
+                            snprintf(bl, sizeof(bl), "AE ...");
+                            break;
+                    }
+                } else if (g_bright_manual) {
                     snprintf(bl, sizeof(bl), "Bright %d/%d",
                              g_bright_step, CAMERA_BRIGHT_MAX);
+                } else {
+                    snprintf(bl, sizeof(bl), "Bright AUTO");
+                }
 
-                    const uint32_t us = g_bright_now.exposure_us;
-                    const unsigned gi = (unsigned)(g_bright_now.gain_q4 / 16u);
-                    const unsigned gf = (unsigned)(((g_bright_now.gain_q4 % 16u) * 10u) / 16u);
+                if (shown.exposure_us > 0) {
+                    const uint32_t us = shown.exposure_us;
+                    const unsigned gi = (unsigned)(shown.gain_q4 / 16u);
+                    const unsigned gf = (unsigned)(((shown.gain_q4 % 16u) * 10u) / 16u);
                     if (us >= 1000u) {
                         snprintf(el, sizeof(el), "%u.%ums %u.%ux",
                                  (unsigned)(us / 1000u),
@@ -1415,17 +1602,32 @@ void app_main(void) {
                         snprintf(el, sizeof(el), "%uus %u.%ux", (unsigned)us, gi, gf);
                     }
                     // Amber once the frame period has run out of room
-                    // and further steps are buying light with analog
+                    // and further light is being bought with analog
                     // gain instead of time — i.e. from here up you are
                     // trading noise for brightness.
-                    if (g_bright_now.exposure_capped) bcol = YELLOW;
+                    if (shown.exposure_capped && bcol == WHITE) bcol = YELLOW;
                 } else {
-                    snprintf(bl, sizeof(bl), "Bright AUTO");
+                    // Nothing has written the registers: the sensor's
+                    // own AE loop is in charge and we never asked it
+                    // what it settled on.
                     snprintf(el, sizeof(el), "sensor AE");
                 }
+
+                // The hint says what the keys do from HERE, not in
+                // general. "Step below the bottom rung to get back to
+                // automatic" is not a thing anyone guesses, so the
+                // bottom rung says it out loud.
+                const char *hint = "Q/A bright";
+                if (!g_bright_manual) {
+                    hint = "Q/A manual";
+                } else if (g_bright_step == CAMERA_BRIGHT_MIN &&
+                           auto_exposure_possible(&sensor)) {
+                    hint = "A = auto";
+                }
+
                 HUD_TEXT_LINE(bcol, bl);
                 HUD_TEXT_LINE(bcol, el);
-                HUD_TEXT_LINE(WHITE, "Q/A bright");
+                HUD_TEXT_LINE(WHITE, hint);
             }
 
             // Focus readout — visible whenever a focus driver is

@@ -17,6 +17,7 @@ idf_component_register(
 		"focus/focus_driver.c"
 		"focus/focus_simulator.c"
 		"focus/autofocus.c"
+		"autoexposure.c"
 		"config.c"
 		"intfs.c"
 		"icons.c"

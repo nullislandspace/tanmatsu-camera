@@ -1,5 +1,6 @@
 #include "camera_pipeline.h"
 
+#include "autoexposure.h"
 #include "focus/autofocus.h"
 
 #include <inttypes.h>
@@ -491,8 +492,16 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
         if (autofocus_init(s_isp, s_src_w, s_src_h) != ESP_OK) {
             ESP_LOGW(TAG, "autofocus_init failed, AF disabled");
         }
+        // Same gate, same reason: the AE statistics block meters the
+        // demosaicer's output, so it has nothing to look at in bypass.
+        // That is also exactly the right split — the sensors that run
+        // in bypass (OV5640/OV5645) have on-chip AE of their own and
+        // want no software loop.
+        if (autoexposure_init(s_isp, s_src_w, s_src_h) != ESP_OK) {
+            ESP_LOGW(TAG, "autoexposure_init failed, software AE disabled");
+        }
     } else {
-        ESP_LOGI(TAG, "AF disabled (RGB565 sensor, ISP in bypass)");
+        ESP_LOGI(TAG, "AF + software AE disabled (RGB565 sensor, ISP in bypass)");
     }
 
     ppa_client_config_t ppa_cfg = {
@@ -600,6 +609,7 @@ void camera_preview_stop(void) {
     }
     if (s_isp) {
         autofocus_shutdown();
+        autoexposure_shutdown();
         esp_isp_disable(s_isp);
         esp_isp_del_processor(s_isp);
         s_isp = NULL;

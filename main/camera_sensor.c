@@ -465,8 +465,24 @@ bool camera_sensor_has_auto_exposure(const camera_sensor_t *sensor) {
     return ae_caps(sensor->kind).has_auto_ae;
 }
 
-esp_err_t camera_sensor_set_brightness(camera_sensor_t *sensor, int step,
-                                       camera_exposure_t *out) {
+uint32_t camera_sensor_eg_min_us(const camera_sensor_t *sensor) {
+    if (sensor == NULL || sensor->row_time_ns == 0) return 1;
+    // One row at unity gain is the shortest thing we can express.
+    uint32_t us = sensor->row_time_ns / 1000u;
+    return us ? us : 1u;
+}
+
+uint32_t camera_sensor_eg_max_us(const camera_sensor_t *sensor) {
+    if (sensor == NULL || sensor->row_time_ns == 0) return 1;
+    const sensor_ae_caps_t caps = ae_caps(sensor->kind);
+    const uint32_t max_lines = exposure_max_lines(sensor, &caps);
+    const uint64_t max_us    = ((uint64_t)max_lines * sensor->row_time_ns) / 1000ULL;
+    const uint64_t eg        = (max_us * caps.gain_max_q4) / 16ULL;
+    return (eg > UINT32_MAX) ? UINT32_MAX : (uint32_t)eg;
+}
+
+esp_err_t camera_sensor_set_exposure_eg(camera_sensor_t *sensor, uint32_t eg_us,
+                                        camera_exposure_t *out) {
     if (sensor == NULL || sensor->device == NULL) return ESP_ERR_INVALID_ARG;
     if (sensor->row_time_ns == 0) {
         // No format bound yet, or the VTS read-back in capture_fps_base
@@ -474,16 +490,14 @@ esp_err_t camera_sensor_set_brightness(camera_sensor_t *sensor, int step,
         // register values, and guessing would be worse than refusing.
         return ESP_ERR_INVALID_STATE;
     }
+    if (eg_us == 0) eg_us = 1;
 
     const sensor_ae_caps_t caps = ae_caps(sensor->kind);
-    if (step < CAMERA_BRIGHT_MIN) step = CAMERA_BRIGHT_MIN;
-    if (step > CAMERA_BRIGHT_MAX) step = CAMERA_BRIGHT_MAX;
 
-    // Spend the step's light budget on integration time first, because
-    // time is free and gain is not: analog gain amplifies read noise
-    // along with the signal. Only what the frame period cannot absorb
-    // rolls over into gain.
-    const uint32_t eg_us     = bright_eg_us(step);
+    // Spend the light budget on integration time first, because time is
+    // free and gain is not: analog gain amplifies read noise along with
+    // the signal. Only what the frame period cannot absorb rolls over
+    // into gain.
     const uint32_t max_lines = exposure_max_lines(sensor, &caps);
     const uint32_t max_us    = (uint32_t)(((uint64_t)max_lines *
                                            sensor->row_time_ns) / 1000ULL);
@@ -545,10 +559,27 @@ esp_err_t camera_sensor_set_brightness(camera_sensor_t *sensor, int step,
         out->gain_q4         = (uint16_t)gain_q4;
         out->exposure_capped = (eg_us > max_us);
     }
-    ESP_LOGI(TAG, "brightness step %d: %" PRIu32 " us (%" PRIu32 "/%" PRIu32 " lines), gain %u.%02ux%s",
-             step, got_us, lines, max_lines,
+    ESP_LOGD(TAG, "exposure %" PRIu32 " us (%" PRIu32 "/%" PRIu32 " lines), gain %u.%02ux%s",
+             got_us, lines, max_lines,
              (unsigned)(gain_q4 / 16u), (unsigned)((gain_q4 % 16u) * 100u / 16u),
              (eg_us > max_us) ? " [exposure capped]" : "");
+    return ESP_OK;
+}
+
+esp_err_t camera_sensor_set_brightness(camera_sensor_t *sensor, int step,
+                                       camera_exposure_t *out) {
+    if (step < CAMERA_BRIGHT_MIN) step = CAMERA_BRIGHT_MIN;
+    if (step > CAMERA_BRIGHT_MAX) step = CAMERA_BRIGHT_MAX;
+
+    camera_exposure_t got = {0};
+    esp_err_t err = camera_sensor_set_exposure_eg(sensor, bright_eg_us(step), &got);
+    if (err != ESP_OK) return err;
+
+    ESP_LOGI(TAG, "brightness step %d: %" PRIu32 " us (%" PRIu32 " lines), gain %u.%02ux%s",
+             step, got.exposure_us, got.exposure_lines,
+             (unsigned)(got.gain_q4 / 16u), (unsigned)((got.gain_q4 % 16u) * 100u / 16u),
+             got.exposure_capped ? " [exposure capped]" : "");
+    if (out) *out = got;
     return ESP_OK;
 }
 

@@ -29,9 +29,10 @@ static const char CFG_HEADER[] =
     "#                     key is still parsed (1 = inmp441, 0 = none).\n"
     "# mic_gain           digital gain step for mic samples (1..8). Each\n"
     "#                     step is ~5.7 dB: 1x (unity) up to 100x at step 8.\n"
-    "# cam_brightness     camera exposure step (0..16). 0 leaves the sensor's\n"
-    "#                     own auto-exposure in charge where it has one; 1..16\n"
-    "#                     is manual, one stop per step. Q/A adjust it live.\n";
+    "# auto_exposure      choose the exposure automatically (the sensor's own\n"
+    "#                     AE loop, or the software one where it has none).\n"
+    "# cam_brightness     manual exposure step (1..16) used when auto_exposure=0.\n"
+    "#                     One stop per step. Q/A adjust it live.\n";
 
 const char *mic_type_config_name(mic_type_t t) {
     switch (t) {
@@ -76,6 +77,7 @@ static void defaults(camera_config_t *out) {
     out->rotate_180        = false;
     out->mic_type          = MIC_TYPE_NONE;
     out->mic_gain          = CONFIG_MIC_GAIN_DEFAULT;
+    out->auto_exposure     = CONFIG_AUTO_EXPOSURE_DEFAULT;
     out->cam_brightness    = CONFIG_CAM_BRIGHTNESS_DEFAULT;
 }
 
@@ -128,13 +130,14 @@ esp_err_t config_save(const camera_config_t *cfg) {
     fprintf(f, "rotate_180=%d\n",        cfg->rotate_180 ? 1 : 0);
     fprintf(f, "mic_type=%s\n",          mic_type_config_name(cfg->mic_type));
     fprintf(f, "mic_gain=%d\n",          clamp_mic_gain(cfg->mic_gain));
+    fprintf(f, "auto_exposure=%d\n",    cfg->auto_exposure ? 1 : 0);
     fprintf(f, "cam_brightness=%d\n",   clamp_cam_brightness(cfg->cam_brightness));
     fclose(f);
-    ESP_LOGI(TAG, "saved %s (driver=%s focus=%d af=%d rot180=%d mic=%s gain=%d bright=%d)",
+    ESP_LOGI(TAG, "saved %s (driver=%s focus=%d af=%d rot180=%d mic=%s gain=%d ae=%d bright=%d)",
              CONFIG_PATH, cfg->focus_driver,
              cfg->focus_enabled, cfg->autofocus_enabled,
              cfg->rotate_180, mic_type_config_name(cfg->mic_type), cfg->mic_gain,
-             cfg->cam_brightness);
+             cfg->auto_exposure, cfg->cam_brightness);
     return ESP_OK;
 }
 
@@ -205,12 +208,17 @@ esp_err_t config_load(camera_config_t *out) {
             } else {
                 ESP_LOGW(TAG, "bad value for mic_gain: '%s'", val);
             }
+        } else if (strcmp(key, "auto_exposure") == 0) {
+            if (!parse_bool(val, &out->auto_exposure)) {
+                ESP_LOGW(TAG, "bad value for auto_exposure: '%s'", val);
+            }
         } else if (strcmp(key, "cam_brightness") == 0) {
-            // "auto" is accepted as a friendlier spelling of 0 — the
-            // value is exposed in the HUD as AUTO, so the file should
-            // round-trip what the user sees.
-            if (strcasecmp(val, "auto") == 0) {
-                out->cam_brightness = CONFIG_CAM_BRIGHTNESS_AUTO;
+            // 0 used to mean "auto" before auto_exposure existed; accept
+            // it (and the word) so an older config file still lands in
+            // automatic rather than at the darkest step.
+            if (strcasecmp(val, "auto") == 0 || strcmp(val, "0") == 0) {
+                out->auto_exposure  = true;
+                out->cam_brightness = CONFIG_CAM_BRIGHTNESS_DEFAULT;
             } else {
                 char *endp = NULL;
                 long  n    = strtol(val, &endp, 10);
@@ -225,10 +233,10 @@ esp_err_t config_load(camera_config_t *out) {
         }
     }
     fclose(f);
-    ESP_LOGI(TAG, "loaded %s (driver=%s focus=%d af=%d rot180=%d mic=%s gain=%d bright=%d)",
+    ESP_LOGI(TAG, "loaded %s (driver=%s focus=%d af=%d rot180=%d mic=%s gain=%d ae=%d bright=%d)",
              CONFIG_PATH, out->focus_driver,
              out->focus_enabled, out->autofocus_enabled,
              out->rotate_180, mic_type_config_name(out->mic_type), out->mic_gain,
-             out->cam_brightness);
+             out->auto_exposure, out->cam_brightness);
     return ESP_OK;
 }
