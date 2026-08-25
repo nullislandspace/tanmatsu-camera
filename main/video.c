@@ -59,12 +59,27 @@ static const char *TAG = "video";
 //     Rate-wise the ESP32-P4 I2S still runs at 48 kHz nominal
 //     (actual ~44.8 kHz — PLL_F160M is 2^11 × 5^7, no factor of 3)
 //     and we resample 44.8 → 22.05 in microphone.c.
-#define VIDEO_W                400u
-#define VIDEO_H                320u
-#define VIDEO_W_PADDED         400u                 // already mult-of-16
-#define VIDEO_H_PADDED         320u                 // already mult-of-16
+// Recording dimensions are DERIVED from the sensor's source frame at
+// record start, not fixed. 400x320 was the exact 8/16 PPA scale of the
+// OV5647's 800x640 video preset and worked only because that was the
+// only sensor: camera_video_snapshot() insists the requested size be an
+// exact k/16 scale of the source, so asking for 400x320 against the
+// OV9281's 1280x800 (which scales to 400x250 at k=5) failed every
+// single frame with INVALID_ARG. The recording still opened, audio
+// still flowed, and the result was a few kB of AVI with no video in it.
+//
+// These stay as the REFERENCE point: the bitrate below is scaled from
+// them so bits-per-pixel is constant whatever geometry we end up with.
+#define VIDEO_REF_W            400u
+#define VIDEO_REF_H            320u
+#define VIDEO_REF_BITRATE      400000u
+
+// Ceiling on the encoded frame. Bounds PPA output, encoder load and SD
+// write rate together; 640x480 leaves the OV9281's 640x400 comfortably
+// inside while refusing to try 1280x800 on some future sensor.
+#define VIDEO_MAX_PIXELS       (640u * 480u)
+
 #define VIDEO_FPS              15u
-#define VIDEO_BITRATE          400000u
 #define VIDEO_GOP              15u
 
 #define AUDIO_SAMPLE_RATE      22050u
@@ -75,7 +90,7 @@ static const char *TAG = "video";
 // YUV420 "packed" (O_UYY_E_VYY) buffer size at padded stride — this
 // is the exact size h264_enc expects when width/height are rounded
 // up to the nearest multiple of 16 internally.
-#define YUV_BUF_SIZE           ((size_t)VIDEO_W_PADDED * VIDEO_H_PADDED * 3u / 2u)
+#define YUV_BUF_BYTES(w, h)    ((size_t)(w) * (size_t)(h) * 3u / 2u)
 
 // H.264 output bitstream buffer. The encoder rejects the call
 // up-front if out.raw_data.len is smaller than the input buffer
@@ -85,7 +100,7 @@ static const char *TAG = "video";
 // 192000 bytes, so we round up to 256 KB with lots of headroom for
 // any pathological keyframe that might blow through a tighter
 // allocation.
-#define H264_OUTBUF_SIZE       (256 * 1024)
+#define H264_OUTBUF_MIN        (256 * 1024)
 
 // --- Recorder state ---------------------------------------------------------
 
@@ -110,6 +125,17 @@ typedef struct {
     esp_h264_enc_handle_t enc;
     uint8_t  *yuv_buf;                    // PPA scratch, cache-line-aligned PSRAM
     uint8_t  *bs_buf;                     // encoder output bitstream
+
+    // Geometry for this recording, chosen by pick_video_dims() from the
+    // active sensor's source frame. *_pad are the mult-of-16 strides the
+    // H.264 encoder's macroblock grid needs; they equal the unpadded
+    // dimensions whenever an exact scale to a multiple of 16 exists,
+    // which it does for both OV5647 (400x320) and OV9281 (640x400).
+    uint32_t vid_w, vid_h;
+    uint32_t vid_w_pad, vid_h_pad;
+    uint32_t vid_bitrate;
+    size_t   yuv_sz;
+    size_t   bs_sz;
 
     // Shine MP3 encoder (runs on core 1 via the audio task).
     shine_t   shine;
@@ -331,9 +357,9 @@ static void video_task_fn(void *arg) {
 
         int64_t t0 = esp_timer_get_time();
 
-        esp_err_t err = camera_video_snapshot(s_rec.yuv_buf, YUV_BUF_SIZE,
-                                              VIDEO_W, VIDEO_H,
-                                              VIDEO_W_PADDED, VIDEO_H_PADDED);
+        esp_err_t err = camera_video_snapshot(s_rec.yuv_buf, s_rec.yuv_sz,
+                                              s_rec.vid_w, s_rec.vid_h,
+                                              s_rec.vid_w_pad, s_rec.vid_h_pad);
         int64_t t1 = esp_timer_get_time();
         if (err != ESP_OK) {
             if (err != ESP_ERR_INVALID_STATE) {
@@ -343,11 +369,11 @@ static void video_task_fn(void *arg) {
         }
 
         esp_h264_enc_in_frame_t  in  = {
-            .raw_data = { .buffer = s_rec.yuv_buf, .len = YUV_BUF_SIZE },
+            .raw_data = { .buffer = s_rec.yuv_buf, .len = s_rec.yuv_sz },
             .pts      = (uint32_t)((t0 - s_rec.start_us) / 1000),
         };
         esp_h264_enc_out_frame_t out = {
-            .raw_data = { .buffer = s_rec.bs_buf, .len = H264_OUTBUF_SIZE },
+            .raw_data = { .buffer = s_rec.bs_buf, .len = s_rec.bs_sz },
         };
         esp_h264_err_t herr = esp_h264_enc_process(s_rec.enc, &in, &out);
         int64_t t2 = esp_timer_get_time();
@@ -550,14 +576,100 @@ static void audio_task_fn(void *arg) {
 
 // --- Setup helpers ---------------------------------------------------------
 
+// Choose the encoded frame size for a given sensor source frame.
+//
+// Two hard constraints, both from camera_video_snapshot(): the output
+// must be an exact k/16 scale of the source (that is all the PPA's
+// fixed-point scale register can express, and the snapshot rejects
+// anything else rather than silently rounding), and YUV420 needs even
+// dimensions.
+//
+// One soft one: the H.264 encoder rounds each dimension up to a
+// multiple of 16 internally. When the scale happens to land on a
+// multiple of 16 in both axes there is no padding at all, which is the
+// path the OV5647 has always taken and the only one with real mileage
+// on it. So we look for that first and only fall back to a padded
+// stride if no such scale exists for this source.
+//
+// Largest wins, subject to VIDEO_MAX_PIXELS.
+static bool pick_video_dims(uint32_t src_w, uint32_t src_h,
+                            uint32_t *out_w, uint32_t *out_h) {
+    if (src_w == 0 || src_h == 0) return false;
+
+    // Pass 1: exact scale AND both dimensions a multiple of 16, i.e.
+    // src * k divisible by 16*16.
+    for (uint32_t k = 16; k >= 1; k--) {
+        if ((src_w * k) % 256u || (src_h * k) % 256u) continue;
+        uint32_t w = src_w * k / 16u;
+        uint32_t h = src_h * k / 16u;
+        if (w == 0 || h == 0 || w * h > VIDEO_MAX_PIXELS) continue;
+        *out_w = w; *out_h = h;
+        return true;
+    }
+    // Pass 2: exact scale, even dimensions, encoder pads the rest.
+    for (uint32_t k = 16; k >= 1; k--) {
+        if ((src_w * k) % 16u || (src_h * k) % 16u) continue;
+        uint32_t w = src_w * k / 16u;
+        uint32_t h = src_h * k / 16u;
+        if (w == 0 || h == 0 || (w & 1u) || (h & 1u)) continue;
+        if (w * h > VIDEO_MAX_PIXELS) continue;
+        *out_w = w; *out_h = h;
+        return true;
+    }
+    return false;
+}
+
+// Fill in s_rec's geometry from the live pipeline. Fails if no
+// representable scale exists, which is better than opening a file that
+// can only ever contain audio.
+static esp_err_t setup_video_geometry(void) {
+    const uint32_t src_w = camera_preview_get_raw_width();
+    const uint32_t src_h = camera_preview_get_raw_height();
+
+    uint32_t w = 0, h = 0;
+    if (!pick_video_dims(src_w, src_h, &w, &h)) {
+        ESP_LOGE(TAG, "no representable video scale for %" PRIu32 "x%" PRIu32
+                      " source", src_w, src_h);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    s_rec.vid_w     = w;
+    s_rec.vid_h     = h;
+    s_rec.vid_w_pad = (w + 15u) & ~15u;
+    s_rec.vid_h_pad = (h + 15u) & ~15u;
+    s_rec.yuv_sz    = YUV_BUF_BYTES(s_rec.vid_w_pad, s_rec.vid_h_pad);
+
+    // Hold bits-per-pixel constant against the reference geometry, so a
+    // bigger frame doesn't come out visibly softer than the OV5647's.
+    uint64_t br = (uint64_t)VIDEO_REF_BITRATE * w * h /
+                  ((uint64_t)VIDEO_REF_W * VIDEO_REF_H);
+    s_rec.vid_bitrate = (uint32_t)br;
+
+    // The encoder rejects the call up front unless the output buffer is
+    // at least as long as the input, however small the compressed frame
+    // actually turns out to be. At 640x400 the YUV input alone is
+    // 384 kB, which overruns the old fixed 256 kB allocation.
+    s_rec.bs_sz = (s_rec.yuv_sz > (size_t)H264_OUTBUF_MIN)
+                      ? s_rec.yuv_sz : (size_t)H264_OUTBUF_MIN;
+
+    ESP_LOGI(TAG, "video geometry: %" PRIu32 "x%" PRIu32 " from %" PRIu32
+                  "x%" PRIu32 " source (stride %" PRIu32 "x%" PRIu32
+                  "%s), %" PRIu32 " bps",
+             w, h, src_w, src_h, s_rec.vid_w_pad, s_rec.vid_h_pad,
+             (s_rec.vid_w_pad == w && s_rec.vid_h_pad == h) ? "" : ", padded",
+             s_rec.vid_bitrate);
+    return ESP_OK;
+}
+
 static esp_err_t setup_h264_encoder(void) {
     esp_h264_enc_cfg_hw_t cfg = {
         .pic_type = ESP_H264_RAW_FMT_O_UYY_E_VYY,  // universal — works on all P4 silicon revs
         .gop      = (uint8_t)VIDEO_GOP,
         .fps      = (uint8_t)VIDEO_FPS,
-        .res      = { .width = (uint16_t)VIDEO_W, .height = (uint16_t)VIDEO_H },
+        .res      = { .width  = (uint16_t)s_rec.vid_w,
+                      .height = (uint16_t)s_rec.vid_h },
         .rc       = {
-            .bitrate = VIDEO_BITRATE,
+            .bitrate = s_rec.vid_bitrate,
             .qp_min  = 16,
             .qp_max  = 40,
         },
@@ -576,8 +688,8 @@ static esp_err_t setup_h264_encoder(void) {
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "h264 encoder ready: %ux%u @ %u fps, %u bps, GOP %u",
-             (unsigned)VIDEO_W, (unsigned)VIDEO_H, (unsigned)VIDEO_FPS,
-             (unsigned)VIDEO_BITRATE, (unsigned)VIDEO_GOP);
+             (unsigned)s_rec.vid_w, (unsigned)s_rec.vid_h, (unsigned)VIDEO_FPS,
+             (unsigned)s_rec.vid_bitrate, (unsigned)VIDEO_GOP);
     return ESP_OK;
 }
 
@@ -675,14 +787,18 @@ esp_err_t video_record_start(const char *dcim_dir, char *out_path, size_t out_pa
 
     memset(&s_rec, 0, sizeof(s_rec));
 
+    // 0. Geometry — everything below is sized from it.
+    esp_err_t gerr = setup_video_geometry();
+    if (gerr != ESP_OK) return gerr;
+
     // 1. Buffers.
-    s_rec.yuv_buf = heap_caps_aligned_calloc(64, 1, YUV_BUF_SIZE,
+    s_rec.yuv_buf = heap_caps_aligned_calloc(64, 1, s_rec.yuv_sz,
                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
     if (!s_rec.yuv_buf) {
-        ESP_LOGE(TAG, "yuv_buf alloc failed (%zu bytes)", (size_t)YUV_BUF_SIZE);
+        ESP_LOGE(TAG, "yuv_buf alloc failed (%zu bytes)", s_rec.yuv_sz);
         return ESP_ERR_NO_MEM;
     }
-    s_rec.bs_buf = heap_caps_aligned_calloc(16, 1, H264_OUTBUF_SIZE,
+    s_rec.bs_buf = heap_caps_aligned_calloc(16, 1, s_rec.bs_sz,
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
     if (!s_rec.bs_buf) {
         ESP_LOGE(TAG, "bs_buf alloc failed");
@@ -710,7 +826,7 @@ esp_err_t video_record_start(const char *dcim_dir, char *out_path, size_t out_pa
     // 3. File + AVI headers.
     build_filename(dcim_dir, s_rec.path, sizeof(s_rec.path));
     err = avi_mux_open(&s_rec.mux, s_rec.path,
-                       VIDEO_W, VIDEO_H, VIDEO_FPS,
+                       s_rec.vid_w, s_rec.vid_h, VIDEO_FPS,
                        AUDIO_SAMPLE_RATE, (uint16_t)AUDIO_CHANNELS,
                        AUDIO_AVG_BYTES_PER_S,
                        (uint16_t)s_rec.shine_samples_per_frame);

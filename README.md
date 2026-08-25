@@ -11,7 +11,11 @@ SD card, and provides a built-in viewer for browsing saved photos.
   ESP32-P4 PPA (Pixel Processing Accelerator).
 - Still capture: JPEG-encoded via the P4 hardware JPEG encoder, written to
   `/sd/DCIM/IMG_YYYYMMDD_HHMMSS.jpg`.
-- Video capture: H.264 in an AVI container with synchronised mono audio
+- Video capture: H.264 in an AVI container with synchronised mono audio.
+  The encoded size is derived from the sensor's source frame at record
+  start (400x320 on the OV5647, 640x400 on the OV9281) — the PPA can
+  only express exact k/16 scales, so a fixed size works for one sensor
+  and fails every frame on the others
   from an INMP441 microphone, written to `/sd/DCIM/VID_YYYYMMDD_HHMMSS.avi`.
 - Built-in photo viewer for reviewing JPEGs already on the SD card.
 - Manual focus and ISP-statistics-based autofocus on supported camera
