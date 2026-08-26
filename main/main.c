@@ -925,6 +925,17 @@ void app_main(void) {
     // mode == MODE_CONFIG.
     app_mode_t prev_mode = MODE_PHOTO;
 
+    // The preview blit lands in the middle of the preview area; the
+    // letterbox bars and pillars around it are black and, for a given
+    // sensor geometry, never change. Repainting them every frame is
+    // four fills over the widest part of the screen for no visible
+    // benefit, so instead we repaint only when something could have
+    // disturbed them and count the repaint down across BOTH buffers —
+    // one drawn frame per buffer, since every blit swaps.
+    int      preview_bars_dirty = 2;
+    uint32_t preview_bars_pw    = 0;  // geometry the bars were painted for
+    uint32_t preview_bars_ph    = 0;
+
     // The mic runs whenever the user is in video mode (actual or
     // via the config menu entered from it) AND mic_type is set to
     // something other than NONE. We reconcile declaratively once per
@@ -1218,6 +1229,7 @@ void app_main(void) {
                 // the letterbox margins around the decoded JPEG.
                 fbdraw_fill_rect(&fb, 0, 0,
                                  (int)preview_area_w, (int)preview_area_h, BLACK);
+                preview_bars_dirty = 2;  // this frame's image overwrote them
                 int img_x = ((int)preview_area_w - (int)viewer_get_width())  / 2;
                 int img_y = ((int)preview_area_h - (int)viewer_get_height()) / 2;
                 // Viewer still emits landscape-oriented RGB565 via PAX —
@@ -1231,6 +1243,7 @@ void app_main(void) {
                 // the camera-preview branch so we skip that branch here.
                 fbdraw_fill_rect(&fb, 0, 0,
                                  (int)preview_area_w, (int)preview_area_h, BLACK);
+                preview_bars_dirty = 2;  // menu text sits where they were
                 int mx = 20;
                 int my = 30;
                 fbdraw_hershey_string(&fb, WHITE, mx, my, "Configuration", 22);
@@ -1312,32 +1325,50 @@ void app_main(void) {
                 int panel_y_off = ((int)preview_area_w - (int)ph) / 2;
                 if (panel_y_off < 0) panel_y_off = 0;
 
-                // Clear the top and bottom letterbox bars so stale content
-                // from a previous frame or from view mode doesn't show.
-                int top_bar_h = (int)fb.user_h - (panel_x_off + (int)pw);
-                int bot_bar_y = (int)fb.user_h - panel_x_off;
-                int bot_bar_h = panel_x_off;
-                if (top_bar_h > 0) {
-                    fbdraw_fill_rect(&fb, 0, 0,
-                                     (int)preview_area_w, top_bar_h, BLACK);
+                // A format switch (PHOTO<->VIDEO on the OV5647, or the
+                // teardown/rebuild around a photo capture) moves the
+                // margins, which leaves the old ones painted where the
+                // new image doesn't reach.
+                if (pw != preview_bars_pw || ph != preview_bars_ph) {
+                    preview_bars_pw    = pw;
+                    preview_bars_ph    = ph;
+                    preview_bars_dirty = 2;
                 }
-                if (bot_bar_h > 0) {
-                    fbdraw_fill_rect(&fb, 0, bot_bar_y,
-                                     (int)preview_area_w, bot_bar_h, BLACK);
-                }
-                // ... and the left/right pillars, in user-x. Tested
-                // independently: an odd shortfall centres to an
-                // uneven split, so the right pillar can exist when the
-                // left one has been rounded away.
-                const int right_x = panel_y_off + (int)ph;
-                if (panel_y_off > 0) {
-                    fbdraw_fill_rect(&fb, 0, 0,
-                                     panel_y_off, (int)preview_area_h, BLACK);
-                }
-                if (right_x < (int)preview_area_w) {
-                    fbdraw_fill_rect(&fb, right_x, 0,
-                                     (int)preview_area_w - right_x,
-                                     (int)preview_area_h, BLACK);
+
+                // Nothing writes into the margins between repaints — the
+                // blit covers the middle and the HUD stays in its own
+                // strip — so this runs on a mode change, a geometry
+                // change, or after the banner has drawn over them, and
+                // costs nothing on the frames in between.
+                if (preview_bars_dirty > 0) {
+                    preview_bars_dirty--;
+
+                    // Top and bottom letterbox bars.
+                    int top_bar_h = (int)fb.user_h - (panel_x_off + (int)pw);
+                    int bot_bar_y = (int)fb.user_h - panel_x_off;
+                    int bot_bar_h = panel_x_off;
+                    if (top_bar_h > 0) {
+                        fbdraw_fill_rect(&fb, 0, 0,
+                                         (int)preview_area_w, top_bar_h, BLACK);
+                    }
+                    if (bot_bar_h > 0) {
+                        fbdraw_fill_rect(&fb, 0, bot_bar_y,
+                                         (int)preview_area_w, bot_bar_h, BLACK);
+                    }
+                    // ... and the left/right pillars, in user-x. Tested
+                    // independently: an odd shortfall centres to an
+                    // uneven split, so the right pillar can exist when the
+                    // left one has been rounded away.
+                    const int right_x = panel_y_off + (int)ph;
+                    if (panel_y_off > 0) {
+                        fbdraw_fill_rect(&fb, 0, 0,
+                                         panel_y_off, (int)preview_area_h, BLACK);
+                    }
+                    if (right_x < (int)preview_area_w) {
+                        fbdraw_fill_rect(&fb, right_x, 0,
+                                         (int)preview_area_w - right_x,
+                                         (int)preview_area_h, BLACK);
+                    }
                 }
 
                 fbdraw_blit_panel(&fb, panel_x_off, panel_y_off,
@@ -1683,6 +1714,11 @@ void app_main(void) {
                                  (int)preview_area_w, 40, BANNER_BG);
                 fbdraw_hershey_string(&fb, WHITE, 10, banner_y + 12,
                                       banner_text, hud_font);
+                // The banner strip spans the full preview width, so it
+                // sits on top of the bottom letterbox bar and both
+                // pillars. Keep them marked dirty for as long as it is
+                // up, which also covers the two frames after it goes.
+                preview_bars_dirty = 2;
             } else {
                 banner_text[0] = 0;
             }
