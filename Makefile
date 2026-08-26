@@ -62,13 +62,27 @@ badgelink:
 	git clone https:///github.com/nullislandspace/esp32-component-badgelink.git badgelink
 	cd badgelink/tools; ./install.sh
 
+# AppFS identity. The slug is the KEY under which the app is stored on
+# the badge -- uploading two different apps under the same slug replaces
+# one with the other, which is exactly what happened while every project
+# generated from this Makefile shipped the literal slug "application".
+# The title is only what the launcher displays and does not
+# disambiguate.
+#
+# The slug is deliberately the same name the app repository publishes
+# under (APP_SLUG_NAME, defined further down): a dev upload should
+# replace the installed copy of THIS app rather than sit beside it as a
+# duplicate, and reusing one name keeps the two from drifting apart.
+APPFS_SLUG  ?= $(APP_SLUG_NAME)
+APPFS_TITLE ?= Camera
+
 .PHONY: install
 install: build
-	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) appfs upload application "camera" 0 ../../$(BUILD)/application.bin
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) appfs upload $(APPFS_SLUG) "$(APPFS_TITLE)" 0 ../../$(BUILD)/application.bin
 
 .PHONY: run
 run:
-	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) start application
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) start $(APPFS_SLUG)
 
 # App repository
 
@@ -197,6 +211,27 @@ erase:
 .PHONY: monitor
 monitor:
 	source "$(IDF_PATH)/export.sh" && idf.py $(IDF_PARAMS) monitor -p $(PORT)
+
+# Ask the launcher (running in USB_DEBUG / flash-monitor mode) to switch its
+# USB into BadgeLink (USB_DEVICE) mode, which is what `make install` needs to
+# talk to. The launcher's listener reacts to the token "BADGELINK\n" on the
+# USB-serial/JTAG peripheral.
+#
+# PORT accepts either a local device path (e.g. /dev/ttyACM0) or an
+# rfc2217:// URL pointing at a serial forwarder.
+#
+# Ported from ../tanmatsu-launcher/Makefile.
+.PHONY: mode_badgelink
+mode_badgelink:
+	source "$(IDF_PATH)/export.sh" >/dev/null && \
+	python3 -c "import serial, sys; s=serial.serial_for_url('$(PORT)', timeout=1); s.write(b'BADGELINK\n'); s.flush(); sys.stdout.write(s.read(128).decode(errors='replace')); s.close()"
+
+# The reverse: ask the launcher (in BadgeLink mode) to hand its USB back to
+# flash/monitor (USB_DEBUG), so `make monitor` can see the serial log again.
+# Goes over BadgeLink itself rather than the serial port, for obvious reasons.
+.PHONY: mode_debug
+mode_debug:
+	cd badgelink/tools; ./badgelink.sh $(BADGELINK_CONN) mode debug
 
 .PHONY: openocd
 openocd:
