@@ -95,19 +95,41 @@ subject, with an override that forces a step down when more than two
 blocks are clipped — a mean that looks correct while the highlights are
 blown is a mean that can't see the problem.
 
-It is deliberately slow: **one correction every 500 ms** with a **±25%
-deadband**, correcting at most two stops at a time. An exposure write
-lands in the statistics one to two frames later, which at 15 fps is
-66–133 ms of dead time in the feedback path. Sampling four to eight
-times slower than the dead time is what makes the loop stable without a
-damping term — the price is a couple of seconds to walk across a large
-lighting change. It keeps the frame usable; it is not smooth enough to
-film a pan with.
+The loop corrects **once per frame**. An exposure write lands in the
+statistics one to two frames later, so rather than sampling slower than
+that dead time, the loop models it: it remembers which light budget each
+in-flight frame was shot under and computes every correction against
+that one, so a correction already sent but not yet visible is never
+counted twice. That is what stops it chasing its own output at frame
+rate.
 
-The tunables (`AE_TARGET_LUMA`, `AE_DEADBAND_PCT`, `AE_INTERVAL_MS`)
-are at the top of `main/autoexposure.c`. Every correction logs the
-metered luminance and the budget it moved to, so retuning against a real
-scene is a matter of reading the serial log:
+The modelled latency is deliberately one frame longer than the expected
+one. The two directions are not symmetric: over-estimating costs a frame
+of convergence speed, while under-estimating makes the loop credit
+itself for a correction that has not landed yet — the one mistake that
+makes it ring.
+
+Damping is done in the log domain, so steps are proportional to the
+error the eye actually perceives. Fine tracking closes **three eighths
+of the remaining error in stops per frame**, which tapers the correction
+off as it arrives instead of stopping dead. Once the scene is more than
+3× off it has changed outright, so the loop closes three quarters of the
+error in one step and then waits for that to show up before deciding
+again, rather than stacking large steps on a measurement that cannot yet
+reflect the first one. In simulation a 10× lighting change is usable
+after a single catch-up step and fully settled inside about a second,
+monotonically and without overshoot, for any true latency from one to
+four frames.
+
+A **±6% convergence band** (widening to ±12% once locked) stops it
+dithering on sensor noise, and corrections under 2% are dropped rather
+than spent on an I²C round trip.
+
+The tunables (`AE_TARGET_LUMA`, `AE_LOCK_PCT`, `AE_LATENCY_FRAMES`,
+`AE_FAST_RATIO`) are at the top of `main/autoexposure.c`. Corrections
+log the metered luminance and the budget they moved to — at most one
+line a second, since the loop now runs at frame rate — so retuning
+against a real scene is a matter of reading the serial log:
 
 ```
 autoexposure: luma 31 (target 64, 0 clipped) -> eg 30976 us = 30715 us x 1.00

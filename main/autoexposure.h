@@ -28,13 +28,20 @@
 // is actually demosaicing, and the RGB565 sensors run it in bypass, so
 // autoexposure_init() is simply never called for them.
 //
-// This is a deliberately SLOW loop — one correction every
-// AE_INTERVAL_MS with a wide deadband. Exposure writes take one to two
-// frames to appear in the statistics, and at 15 fps that is 66-133 ms
-// of dead time in the feedback path; sampling far slower than the dead
-// time is what makes the loop trivially stable without needing careful
-// damping. It is meant to keep the frame usable, not to be smooth
-// enough to film with. Tightening it needs hardware and a tuning pass.
+// The loop corrects once per statistics frame. Exposure writes take one
+// to two frames to appear in the statistics, so the loop models that
+// delay explicitly: it remembers which budget each in-flight frame was
+// shot under and computes every correction against that, which means a
+// correction already sent but not yet visible is never counted twice.
+// Without the model, running at frame rate would make it chase its own
+// output; with it, the only thing left to choose is damping.
+//
+// Damping is done in the log domain — each correction closes half the
+// remaining error in stops (three quarters when the scene has changed
+// outright). Steps are therefore proportional to the error the eye
+// actually perceives: a lighting change ramps across in a few frames,
+// and a small drift barely moves. A narrow convergence band with
+// hysteresis stops it dithering on sensor noise.
 //
 // Lifecycle mirrors autofocus: camera_pipeline calls
 // autoexposure_init() after the ISP processor is enabled and
