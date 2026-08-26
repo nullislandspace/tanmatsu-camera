@@ -74,10 +74,24 @@ static const char *TAG = "video";
 #define VIDEO_REF_H            320u
 #define VIDEO_REF_BITRATE      400000u
 
-// Ceiling on the encoded frame. Bounds PPA output, encoder load and SD
-// write rate together; 640x480 leaves the OV9281's 640x400 comfortably
-// inside while refusing to try 1280x800 on some future sensor.
-#define VIDEO_MAX_PIXELS       (640u * 480u)
+// Ceiling on the encoded frame. The binding constraint is NOT the
+// encoder, the PPA or the SD card -- it is the player at the other end,
+// which decodes H.264 in software with no hardware assist. Measured on
+// a Tanmatsu playing a 640x400 recording: 95 ms to decode a frame plus
+// 14 ms to get it on screen, against the 66 ms that 15 fps allows. It
+// runs 21% slow and starves its own audio. The same player handles the
+// OV5647's 400x320 at a solid 15 fps, and that is half the pixels.
+//
+// So the ceiling is the reference geometry itself. That leaves the
+// OV5647 exactly where it was (800x640 source, k=8, 400x320 = the cap
+// exactly) and drops the OV9281 from 640x400 to 400x250 -- its 1280x800
+// has no k/16 scale between the two, since k=8 lands on 640x400 and the
+// next one down, k=5, lands on 400x250. 100k pixels puts decode near
+// 43 ms, comfortably inside the frame budget.
+//
+// Photo capture is unaffected: camera_photo_snapshot() works off the
+// full sensor frame and never consults this.
+#define VIDEO_MAX_PIXELS       (VIDEO_REF_W * VIDEO_REF_H)
 
 #define VIDEO_FPS              15u
 #define VIDEO_GOP              15u
@@ -319,7 +333,8 @@ static void writer_task_fn(void *arg) {
         mux_chunk_t item;
         if (pick_v) {
             xQueueReceive(s_rec.video_q, &item, 0);
-            esp_err_t werr = avi_mux_write_video(&s_rec.mux, item.data, item.size, item.keyframe);
+            esp_err_t werr = avi_mux_write_video(&s_rec.mux, item.data, item.size, item.keyframe,
+                                                 item.ts_us);
             if (werr != ESP_OK) ESP_LOGE(TAG, "writer: avi video: %d", werr);
         } else {
             xQueueReceive(s_rec.audio_q, &item, 0);

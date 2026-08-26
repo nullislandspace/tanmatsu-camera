@@ -125,7 +125,10 @@ static esp_err_t write_headers(avi_mux_t *mux) {
     // avih <56> <MainAVIHeader>
     if (wr_fcc(f, FCC_AVIH)) return ESP_FAIL;
     if (wr_u32(f, 56)) return ESP_FAIL;
-    uint32_t us_per_frame = mux->video_fps ? 1000000u / mux->video_fps : 66666u;
+    // The timeline grid, not the capture rate — see the timing model
+    // note in avi_mux.h. Both this and the video strh's dwScale/dwRate
+    // below are final at open time; nothing patches them at close.
+    uint32_t us_per_frame = 1000000u / mux->timeline_fps;
     if (wr_u32(f, us_per_frame)) return ESP_FAIL;                // dwMicroSecPerFrame
     mux->avih_max_bytes_per_sec_pos = cur_pos(f);
     if (wr_u32(f, 0)) return ESP_FAIL;                            // dwMaxBytesPerSec (patched)
@@ -155,7 +158,7 @@ static esp_err_t write_headers(avi_mux_t *mux) {
     if (wr_u16(f, 0)) return ESP_FAIL;                            // wLanguage
     if (wr_u32(f, 0)) return ESP_FAIL;                            // dwInitialFrames
     if (wr_u32(f, 1)) return ESP_FAIL;                            // dwScale
-    if (wr_u32(f, mux->video_fps)) return ESP_FAIL;               // dwRate
+    if (wr_u32(f, mux->timeline_fps)) return ESP_FAIL;            // dwRate
     if (wr_u32(f, 0)) return ESP_FAIL;                            // dwStart
     mux->vids_length_pos = cur_pos(f);
     if (wr_u32(f, 0)) return ESP_FAIL;                            // dwLength (patched)
@@ -275,6 +278,7 @@ esp_err_t avi_mux_open(avi_mux_t *mux, const char *path,
     mux->video_width             = video_width;
     mux->video_height            = video_height;
     mux->video_fps               = video_fps;
+    mux->timeline_fps            = AVI_TIMELINE_FPS;
     mux->audio_sample_rate       = audio_sample_rate;
     mux->audio_channels          = audio_channels;
     mux->audio_bits_per_sample   = 0;           // MP3 convention
@@ -295,8 +299,9 @@ esp_err_t avi_mux_open(avi_mux_t *mux, const char *path,
         return err;
     }
     mux->is_open = true;
-    ESP_LOGI(TAG, "opened %s  video %" PRIu32 "x%" PRIu32 " @%" PRIu32 " fps  audio %" PRIu32 " Hz x%u",
-             path, video_width, video_height, video_fps,
+    ESP_LOGI(TAG, "opened %s  video %" PRIu32 "x%" PRIu32 " capture @%" PRIu32
+                  " fps on a %" PRIu32 " fps timeline  audio %" PRIu32 " Hz x%u",
+             path, video_width, video_height, video_fps, mux->timeline_fps,
              audio_sample_rate, (unsigned)audio_channels);
     return ESP_OK;
 }
@@ -322,15 +327,18 @@ static esp_err_t write_chunk(avi_mux_t *mux, uint32_t fourcc, const void *data, 
     return ESP_OK;
 }
 
-esp_err_t avi_mux_write_video(avi_mux_t *mux, const void *data, size_t size, bool keyframe) {
-    if (!mux || !mux->is_open) return ESP_ERR_INVALID_STATE;
-
+// Emit one video chunk into the movi list and index it. `size == 0`
+// produces a null frame — the "keep showing the previous picture"
+// chunk that carries the timeline forward without asking the decoder
+// for anything. Null frames are deliberately NOT flagged as
+// keyframes: a seek that landed on one would have nothing to decode
+// and would show whatever was on screen before the seek.
+static esp_err_t emit_video_chunk(avi_mux_t *mux, const void *data, size_t size, bool keyframe) {
     // Capture the chunk's absolute file offset (of the chunk HEADER,
     // not the data). idx1 offsets are relative to movi_data_start so
     // subtract that before storing.
     size_t chunk_hdr_off = cur_pos(mux->f);
-    size_t data_off = 0;
-    esp_err_t err = write_chunk(mux, FCC_00DC, data, size, &data_off);
+    esp_err_t err = write_chunk(mux, FCC_00DC, data, size, NULL);
     if (err != ESP_OK) return err;
 
     uint32_t rel = (uint32_t)(chunk_hdr_off - mux->movi_data_start);
@@ -339,6 +347,45 @@ esp_err_t avi_mux_write_video(avi_mux_t *mux, const void *data, size_t size, boo
 
     mux->video_frames_written++;
     mux->video_bytes_written += (uint32_t)size;
+    return ESP_OK;
+}
+
+// Pad the video timeline with null frames up to (but not including)
+// grid slot `target_slot`.
+static esp_err_t pad_video_to_slot(avi_mux_t *mux, uint32_t target_slot) {
+    while (mux->video_frames_written < target_slot) {
+        esp_err_t err = emit_video_chunk(mux, NULL, 0, false);
+        if (err != ESP_OK) return err;
+        mux->video_null_frames_written++;
+    }
+    return ESP_OK;
+}
+
+esp_err_t avi_mux_write_video(avi_mux_t *mux, const void *data, size_t size, bool keyframe,
+                              int64_t ts_us) {
+    if (!mux || !mux->is_open) return ESP_ERR_INVALID_STATE;
+
+    if (mux->video_real_frames_written == 0) mux->video_first_ts_us = ts_us;
+    mux->video_last_ts_us = ts_us;
+
+    // Which grid slot does this capture time fall in? Rounding rather
+    // than truncating halves the worst-case error: a frame is placed
+    // at the NEAREST slot, so it is off by at most half a grid period
+    // in either direction instead of up to a full period late.
+    //
+    // The slot can never move backwards. It would take a
+    // non-monotonic capture timestamp to ask for that, but if one ever
+    // arrives, appending at the current position keeps the file valid
+    // and merely puts that frame one slot late.
+    int64_t rel_us = ts_us > 0 ? ts_us : 0;
+    uint32_t slot = (uint32_t)(((uint64_t)rel_us * mux->timeline_fps + 500000ULL) / 1000000ULL);
+    esp_err_t err = pad_video_to_slot(mux, slot);
+    if (err != ESP_OK) return err;
+
+    err = emit_video_chunk(mux, data, size, keyframe);
+    if (err != ESP_OK) return err;
+
+    mux->video_real_frames_written++;
     return ESP_OK;
 }
 
@@ -369,6 +416,32 @@ esp_err_t avi_mux_write_audio(avi_mux_t *mux, const void *data, size_t size,
 esp_err_t avi_mux_close(avi_mux_t *mux) {
     if (!mux || !mux->is_open) return ESP_ERR_INVALID_STATE;
     FILE *f = mux->f;
+
+    // Extend the video timeline to cover the audio. The recording
+    // stops on a whole audio buffer, typically some way past the last
+    // frame the encoder managed to finish, and a video stream that
+    // declares a shorter duration than the audio is exactly what makes
+    // players report a growing A-V drift and give up. Null frames cost
+    // 24 bytes each and no decode work, so squaring the two durations
+    // up is nearly free.
+    //
+    // Capped at two seconds of padding: a larger gap than that means
+    // video died long before the recording ended, and inventing
+    // hundreds of frames to paper over it would hide the failure.
+    if (mux->audio_sample_rate > 0 && mux->video_real_frames_written > 0) {
+        uint64_t audio_us = ((uint64_t)mux->audio_samples_written * 1000000ULL) /
+                            mux->audio_sample_rate;
+        uint32_t audio_slots = (uint32_t)((audio_us * mux->timeline_fps) / 1000000ULL);
+        uint32_t max_slots   = mux->video_frames_written + mux->timeline_fps * 2u;
+        if (audio_slots > max_slots) {
+            ESP_LOGW(TAG, "video timeline %" PRIu32 " slots vs audio %" PRIu32
+                          " -- capping tail padding",
+                     mux->video_frames_written, audio_slots);
+            audio_slots = max_slots;
+        }
+        esp_err_t perr = pad_video_to_slot(mux, audio_slots);
+        if (perr != ESP_OK) return perr;
+    }
 
     // Record the position right after the last movi chunk; that
     // becomes the END of the movi LIST. Everything written BEFORE
@@ -406,8 +479,9 @@ esp_err_t avi_mux_close(avi_mux_t *mux) {
     if (fseek(f, (long)mux->avih_total_frames_pos, SEEK_SET)) return ESP_FAIL;
     if (wr_u32(f, mux->video_frames_written)) return ESP_FAIL;
     // Rough max bytes/sec estimate: video_bytes + audio_bytes divided
-    // by duration in seconds. Guard against zero fps / zero frames.
-    uint32_t dur_s = mux->video_fps ? (mux->video_frames_written / mux->video_fps) : 0u;
+    // by duration in seconds. The timeline rate is fixed and the slot
+    // count is exact, so the duration follows directly.
+    uint32_t dur_s = mux->video_frames_written / mux->timeline_fps;
     uint32_t total_bps = 0;
     if (dur_s > 0) {
         total_bps = (mux->video_bytes_written + mux->audio_bytes_written) / dur_s;
@@ -437,8 +511,25 @@ esp_err_t avi_mux_close(avi_mux_t *mux) {
     mux->idx_count = 0;
     mux->idx_capacity = 0;
 
-    ESP_LOGI(TAG, "closed: %" PRIu32 " video frames, %" PRIu32 " audio samples, %zu B total",
-             mux->video_frames_written, mux->audio_samples_written, riff_end);
+    // The sustained rate no longer decides anything in the file, but it
+    // is the number to look at when playback stutters: if it is far
+    // under the capture target, the encoder is the bottleneck.
+    uint32_t sustained_milli = 0;
+    if (mux->video_real_frames_written >= 2) {
+        int64_t span_us = mux->video_last_ts_us - mux->video_first_ts_us;
+        if (span_us > 0) {
+            sustained_milli = (uint32_t)(((uint64_t)(mux->video_real_frames_written - 1u) *
+                                          1000000000ULL + (uint64_t)span_us / 2u) /
+                                         (uint64_t)span_us);
+        }
+    }
+    ESP_LOGI(TAG, "closed: %" PRIu32 " grid slots @%" PRIu32 " fps (%" PRIu32 " real + %" PRIu32
+                  " null), encoder sustained %" PRIu32 ".%03" PRIu32 " fps, %" PRIu32
+                  " audio samples, %zu B total",
+             mux->video_frames_written, mux->timeline_fps,
+             mux->video_real_frames_written, mux->video_null_frames_written,
+             sustained_milli / 1000u, sustained_milli % 1000u,
+             mux->audio_samples_written, riff_end);
     return ESP_OK;
 }
 
