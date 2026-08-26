@@ -173,6 +173,11 @@ static bool IRAM_ATTR on_srm_done(ppa_client_handle_t ppa_handle, ppa_event_data
 static void render_task(void *arg) {
     uint32_t n_frames = 0;
     uint32_t n_timeouts = 0;
+    // Measured throughput. The nominal frame rate comes from register
+    // arithmetic (HTS/VTS against the MIPI pixel rate) that has proven
+    // unreliable on the OV9281, so also report what actually arrives.
+    int64_t  t_fps_mark = esp_timer_get_time();
+    uint32_t n_fps_mark = 0;
     while (s_running) {
         // Short timeout so the task wakes up every 100 ms and can
         // observe s_running being cleared by camera_preview_stop.
@@ -283,6 +288,20 @@ static void render_task(void *arg) {
         xSemaphoreGive(s_ppa_mutex);
         xSemaphoreGive(s_frame_ready);
         n_frames++;
+
+        if ((n_frames - n_fps_mark) >= 60) {
+            int64_t  now  = esp_timer_get_time();
+            uint32_t got  = n_frames - n_fps_mark;
+            // x100 in integer math: ESP-IDF's default nano printf has
+            // no %f, so a float here would print as garbage.
+            uint32_t fx100 = (uint32_t)(((int64_t)got * 100000000LL) / (now - t_fps_mark));
+            ESP_LOGI(TAG, "preview %" PRIu32 ".%02" PRIu32 " fps (%" PRIu32
+                          " frames in %lld ms)",
+                     fx100 / 100, fx100 % 100, got,
+                     (long long)((now - t_fps_mark) / 1000));
+            t_fps_mark = now;
+            n_fps_mark = n_frames;
+        }
         /*
         if (n_frames <= 3 || (n_frames % 30) == 0) {
             ESP_LOGI(TAG, "frame %" PRIu32 "  ISR get=%" PRIu32 " fin=%" PRIu32

@@ -25,8 +25,12 @@
  *   - ov9281_init_RAW10_1280x800_30fps : full init for monochrome
  *                                    RAW10 at 1280x800 with 2-lane
  *                                    MIPI CSI-2 and a 24 MHz xclk.
- *                                    Line rate 800 Mbps/lane, native
- *                                    fps capped at 30 via VTS=3644.
+ *                                    Native rate is 15 fps at
+ *                                    VTS=3644, measured on hardware --
+ *                                    the "30fps" in the symbol name is
+ *                                    inherited from the upstream blob
+ *                                    and is wrong. See
+ *                                    OV9281_NATIVE_FPS_1280x800.
  */
 
 #pragma once
@@ -46,11 +50,30 @@ extern "C" {
 // expects the line rate in Hz, so we report the doubled value.
 #define OV9281_MIPI_LINE_RATE_1280x800_30FPS  (800ULL * 1000 * 1000)
 
-// Native frame rate of ov9281_init_RAW10_1280x800_30fps. With
-// pixel_rate = 160 MP/s, HTS = 1456, VTS = 3644 →
-// 160e6 / (1456 * 3644) = 30.06 fps. The host-side VTS-cap mechanism
-// scales relative to this rate.
-#define OV9281_NATIVE_FPS_1280x800            30
+// Native frame rate of ov9281_init_RAW10_1280x800_30fps, MEASURED on
+// hardware rather than derived: with the VTS cap in place at 7288
+// lines the pipeline reported a steady 7.53 fps, so the uncapped rate
+// at VTS = 3644 is 15.07.
+//
+// This used to claim 30, from the arithmetic 160e6 / (1456 * 3644).
+// Both factors in that are uncertain and they cancel out: either the
+// pixel rate is 160 MP/s and the HTS register holds HALF the line
+// length (Linux writes it as `(hblank + width) >> 1` in ov9282.c, so
+// 0x05b0 = a 2912-pixel line), or HTS is the plain 1456-pixel line and
+// the PLL is actually delivering 400 Mbps/lane for 80 MP/s. Both give
+// 15.07 fps, and hardware says 15.07, so the rate is settled even
+// though which half is wrong is not. Do not "correct" this back to 30
+// on the strength of the register math — halving the HTS register to
+// chase 30 fps produces a single garbage frame and then a dead stream.
+//
+// This constant is not cosmetic. The host reads VTS back after
+// set_format and uses it with this value for two things: scaling VTS
+// to hit PREVIEW_TARGET_FPS, and deriving row_time_ns as
+// 1/(fps * VTS). Claiming 30 made the 15 fps preview cap double VTS
+// instead of leaving it alone (hence 7.5 fps), and made every exposure
+// time the AE loop computed and the HUD displayed exactly 2x too
+// short.
+#define OV9281_NATIVE_FPS_1280x800            15
 
 // Pre-init: park stream off, software-reset, brief settle. Used at
 // the very start of every set_format sequence so the chip starts from
