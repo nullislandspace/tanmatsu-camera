@@ -32,7 +32,43 @@ static const char CFG_HEADER[] =
     "# auto_exposure      choose the exposure automatically (the sensor's own\n"
     "#                     AE loop, or the software one where it has none).\n"
     "# cam_brightness     manual exposure step (1..16) used when auto_exposure=0.\n"
-    "#                     One stop per step. Q/A adjust it live.\n";
+    "#                     One stop per step. Q/A adjust it live.\n"
+    "# hdmi_probe         look for a TC358743 HDMI-to-CSI bridge when no\n"
+    "#                     ordinary camera answered. Off by default: the\n"
+    "#                     probe drives GPIO6, which is the camera LED line\n"
+    "#                     and is also expansion pin E2 (see camera.md).\n"
+    "# hdmi_color_path    TC358743 only. yuv420 (cheap, full colour) or\n"
+    "#                     rgb565 (slower, coarser, but a better-trodden\n"
+    "#                     path through the PPA).\n"
+    "# hdmi_yuv_order     TC358743 only. Byte order in each 4-byte YUV422\n"
+    "#                     group, 0..7. Change only if colours are wrong or\n"
+    "#                     vertical edges show a one-pixel comb.\n";
+
+const char *hdmi_color_path_config_name(hdmi_color_path_t p) {
+    return (p == HDMI_COLOR_PATH_RGB565) ? "rgb565" : "yuv420";
+}
+
+const char *hdmi_color_path_display_name(hdmi_color_path_t p) {
+    return (p == HDMI_COLOR_PATH_RGB565) ? "RGB565" : "YUV420";
+}
+
+static bool parse_hdmi_color_path(const char *v, hdmi_color_path_t *out) {
+    if (strcasecmp(v, "yuv420") == 0 || strcmp(v, "0") == 0) {
+        *out = HDMI_COLOR_PATH_YUV420;
+        return true;
+    }
+    if (strcasecmp(v, "rgb565") == 0 || strcmp(v, "1") == 0) {
+        *out = HDMI_COLOR_PATH_RGB565;
+        return true;
+    }
+    return false;
+}
+
+static int clamp_hdmi_yuv_order(int v) {
+    if (v < CONFIG_HDMI_YUV_ORDER_MIN) return CONFIG_HDMI_YUV_ORDER_DEFAULT;
+    if (v > CONFIG_HDMI_YUV_ORDER_MAX) return CONFIG_HDMI_YUV_ORDER_DEFAULT;
+    return v;
+}
 
 const char *mic_type_config_name(mic_type_t t) {
     switch (t) {
@@ -79,6 +115,9 @@ static void defaults(camera_config_t *out) {
     out->mic_gain          = CONFIG_MIC_GAIN_DEFAULT;
     out->auto_exposure     = CONFIG_AUTO_EXPOSURE_DEFAULT;
     out->cam_brightness    = CONFIG_CAM_BRIGHTNESS_DEFAULT;
+    out->hdmi_probe        = CONFIG_HDMI_PROBE_DEFAULT;
+    out->hdmi_color_path   = HDMI_COLOR_PATH_YUV420;
+    out->hdmi_yuv_order    = CONFIG_HDMI_YUV_ORDER_DEFAULT;
 }
 
 static int clamp_mic_gain(int v) {
@@ -132,6 +171,9 @@ esp_err_t config_save(const camera_config_t *cfg) {
     fprintf(f, "mic_gain=%d\n",          clamp_mic_gain(cfg->mic_gain));
     fprintf(f, "auto_exposure=%d\n",    cfg->auto_exposure ? 1 : 0);
     fprintf(f, "cam_brightness=%d\n",   clamp_cam_brightness(cfg->cam_brightness));
+    fprintf(f, "hdmi_probe=%d\n",       cfg->hdmi_probe ? 1 : 0);
+    fprintf(f, "hdmi_color_path=%s\n",  hdmi_color_path_config_name(cfg->hdmi_color_path));
+    fprintf(f, "hdmi_yuv_order=%d\n",   clamp_hdmi_yuv_order(cfg->hdmi_yuv_order));
     fclose(f);
     ESP_LOGI(TAG, "saved %s (driver=%s focus=%d af=%d rot180=%d mic=%s gain=%d ae=%d bright=%d)",
              CONFIG_PATH, cfg->focus_driver,
@@ -227,6 +269,22 @@ esp_err_t config_load(camera_config_t *out) {
                 } else {
                     ESP_LOGW(TAG, "bad value for cam_brightness: '%s'", val);
                 }
+            }
+        } else if (strcmp(key, "hdmi_probe") == 0) {
+            if (!parse_bool(val, &out->hdmi_probe)) {
+                ESP_LOGW(TAG, "bad value for hdmi_probe: '%s'", val);
+            }
+        } else if (strcmp(key, "hdmi_color_path") == 0) {
+            if (!parse_hdmi_color_path(val, &out->hdmi_color_path)) {
+                ESP_LOGW(TAG, "bad value for hdmi_color_path: '%s'", val);
+            }
+        } else if (strcmp(key, "hdmi_yuv_order") == 0) {
+            char *endp = NULL;
+            long  n    = strtol(val, &endp, 10);
+            if (endp && endp != val && *endp == '\0') {
+                out->hdmi_yuv_order = clamp_hdmi_yuv_order((int)n);
+            } else {
+                ESP_LOGW(TAG, "bad value for hdmi_yuv_order: '%s'", val);
             }
         } else {
             ESP_LOGW(TAG, "unknown key '%s'", key);

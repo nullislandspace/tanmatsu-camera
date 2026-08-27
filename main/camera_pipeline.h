@@ -20,13 +20,33 @@
 // bus. RAW8/RAW10 (Bayer) flow through the P4 ISP demosaicer to land
 // as RGB565 in PSRAM; RGB565 (OV5640/OV5645 with the on-chip ISP
 // already producing finished pixels) bypasses the demosaicer and the
-// ISP processor runs in pass-through mode. Bytes-per-pixel is always
-// 2 in PSRAM regardless — the buffer holds RGB565 in either case.
+// ISP processor runs in pass-through mode. YUV422 (the TC358743 HDMI
+// bridge) also bypasses it, but unlike RGB565 the result is not
+// something the PPA can read, so the CPU unpacks each frame first —
+// see yuv_convert.h. Bytes-per-pixel in the camera buffer is 2 in all
+// three cases.
 typedef enum {
     CAMERA_INPUT_RAW8 = 0,
     CAMERA_INPUT_RAW10,
     CAMERA_INPUT_RGB565,
+    CAMERA_INPUT_YUV422,
 } camera_input_format_t;
+
+// What the CPU unpacks CAMERA_INPUT_YUV422 frames into before the PPA
+// sees them. Ignored for every other input format.
+//
+// YUV420 is the one to want: the unpack is pure byte selection, the
+// PPA converts to RGB565 for the preview in hardware, and the video
+// path stays in YUV all the way to the encoder with full chroma. It
+// is also the path nobody has been able to test, because it needs
+// PPA YUV420-input, which this application has never used. RGB565
+// costs roughly ten times as much CPU per frame and quantises colour
+// on the way through, but every PPA call it makes is one the OV5640 /
+// OV5645 path already makes, so it is the known-good retreat.
+typedef enum {
+    CAMERA_YUV_PATH_YUV420 = 0,
+    CAMERA_YUV_PATH_RGB565,
+} camera_yuv_path_t;
 
 // Description of the sensor source currently feeding the pipeline. The
 // caller gets these values from camera_sensor_set_format_*() /
@@ -38,6 +58,7 @@ typedef struct {
     uint32_t              height;             // sensor active area height in pixels
     camera_input_format_t input_format;       // pixel format the sensor emits on MIPI CSI
     uint32_t              lane_rate_mbps;     // MIPI CSI-2 bit rate per lane, Mbps
+    camera_yuv_path_t     yuv_path;           // CAMERA_INPUT_YUV422 only; see above
 } camera_source_t;
 
 // Bring up the pipeline. `src` describes the sensor output format the
@@ -56,6 +77,14 @@ esp_err_t camera_preview_start(const camera_source_t *src,
 
 // Tear down the pipeline and free all buffers.
 void camera_preview_stop(void);
+
+// Byte order the CPU assumes within each 4-byte YUV422 macropixel,
+// as an index into YUV422_ORDERS (yuv_convert.h). Only meaningful
+// while the input format is CAMERA_INPUT_YUV422. Safe to change at
+// any time — the conversion reads it once per frame, so no pipeline
+// rebuild is needed.
+void camera_pipeline_set_yuv_order(int index);
+int  camera_pipeline_get_yuv_order(void);
 
 // Toggle a 180° rotation applied to all live capture paths (preview,
 // photo, video). Default false. Implemented as a pair of mirror_x /
@@ -138,11 +167,15 @@ esp_err_t camera_video_snapshot(uint8_t  *out_buf,
                                 uint32_t  stride_w,
                                 uint32_t  stride_h);
 
-// Pointer to the full-size 800x640 RGB565 frame that the ISP writes into
-// (pre-PPA, no scale/mirror applied). CSI DMA is continuously overwriting
-// this buffer — reads are inherently racy — but it's useful for diagnostic
-// dumps to see what the ISP is producing before the PPA touches it.
-// Dimensions are fixed at 800x640 for the preview format.
+// Pointer to the full-size frame the CSI/ISP writes into (pre-PPA, no
+// scale/mirror applied), camera_preview_get_raw_width() x _height() at
+// 2 bytes per pixel. CSI DMA is continuously overwriting this buffer —
+// reads are inherently racy — but it's useful for diagnostic dumps to
+// see what arrives before the PPA touches it.
+//
+// The contents are RGB565 for every Bayer or RGB565 source, but packed
+// YUV422 when the input format is CAMERA_INPUT_YUV422: that path runs
+// the ISP in bypass, so what lands here is whatever the sensor sent.
 const uint8_t *camera_preview_get_raw_pixels(void);
 uint32_t       camera_preview_get_raw_width(void);
 uint32_t       camera_preview_get_raw_height(void);

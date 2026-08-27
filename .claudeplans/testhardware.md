@@ -10,7 +10,7 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 1, step 1.5 (1.1-1.4 done, awaiting hardware confirmation)
+CURRENT POSITION: Phase 1, step 1.7 (1.1-1.6 done, awaiting hardware confirmation)
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
@@ -171,7 +171,7 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
   (`~:1589-1607`) skipped. `auto_exposure_possible` needs no change — `autoexposure_init`
   only runs under `if (bayer_input)` (`camera_pipeline.c:519`), so it is already NULL.
 
-- `[ ]` **1.5 — YUV422 pipeline support (still unreachable).**
+- `[x]` **1.5 — YUV422 pipeline support (still unreachable).**
   - **5a** New `main/yuv_convert.{c,h}`, added to `SRCS` with
     `set_source_files_properties(yuv_convert.c PROPERTIES COMPILE_OPTIONS "-O2")`. A
     separate TU is the only way to raise the optimization level for the hot loop without
@@ -224,7 +224,7 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
   - **5d** `main.c` `pick_source` (`:95`): new case before the OV5640/OV5645/`default`
     group, taking `yuv_path` from `g_cfg`.
 
-- `[ ]` **1.6 — Config keys and settings rows.** The config file is plain `key=value` text
+- `[x]` **1.6 — Config keys and settings rows.** The config file is plain `key=value` text
   on the SD card (`config.c:127-134` writes, `:168-219` parses). Three new keys, all
   persisted, all defaulted so existing files keep working:
 

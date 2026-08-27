@@ -1,4 +1,5 @@
 #include "camera_pipeline.h"
+#include "yuv_convert.h"
 
 #include "autoexposure.h"
 #include "focus/autofocus.h"
@@ -79,6 +80,17 @@ static ppa_client_handle_t   s_ppa      = NULL;
 // enabled. So the enable/disable pair has to be tracked rather than
 // assumed, and only the demosaicer path gets it.
 static bool                  s_isp_enabled = false;
+
+// CAMERA_INPUT_YUV422 only. The CSI/ISP bypass path leaves packed
+// YUV422 in s_cam_buf, which the PPA cannot read, so every consumer
+// goes through maybe_convert() into this staging buffer first. Sized
+// and interpreted according to s_yuv_path.
+static uint8_t              *s_yuv_conv_buf    = NULL;
+static size_t                s_yuv_conv_buf_sz = 0;
+static camera_yuv_path_t     s_yuv_path        = CAMERA_YUV_PATH_YUV420;
+// Index into YUV422_ORDERS. Read once per frame, so it can be changed
+// from the UI without rebuilding anything.
+static volatile int          s_yuv_order       = YUV422_ORDER_DEFAULT;
 
 // DOUBLE-BUFFERED CSI TARGETS. The ESP-IDF CSI driver only lets us
 // queue one trans at a time (queue_items=1) and the on_get_new_trans
@@ -180,6 +192,66 @@ static bool IRAM_ATTR on_srm_done(ppa_client_handle_t ppa_handle, ppa_event_data
 // from camera_preview_start() and let on_get_new_trans handle every
 // subsequent frame's buffer selection.
 
+void camera_pipeline_set_yuv_order(int index) {
+    s_yuv_order = yuv422_order_clamp(index);
+}
+
+int camera_pipeline_get_yuv_order(void) {
+    return s_yuv_order;
+}
+
+// Colour mode the PPA should read its input as. Everything except the
+// YUV420 leg of the YUV422 path hands it RGB565.
+static inline ppa_srm_color_mode_t ppa_input_color_mode(void) {
+    if (s_src_input_format == CAMERA_INPUT_YUV422 &&
+        s_yuv_path == CAMERA_YUV_PATH_YUV420) {
+        return PPA_SRM_COLOR_MODE_YUV420;
+    }
+    return PPA_SRM_COLOR_MODE_RGB565;
+}
+
+// Unpack one YUV422 frame into s_yuv_conv_buf and return that instead;
+// a no-op returning `src` unchanged for every other input format.
+//
+// Every caller holds s_ppa_mutex, which is what makes a single shared
+// staging buffer safe across render_task, the photo snapshot and the
+// video snapshot.
+static const uint8_t *maybe_convert(const uint8_t *src) {
+    if (s_src_input_format != CAMERA_INPUT_YUV422 || s_yuv_conv_buf == NULL) {
+        return src;
+    }
+
+    // s_cam_buf is written by CSI DMA and, until this path existed,
+    // was only ever read by PPA DMA — so nothing in the pipeline
+    // invalidates it, and the PPA driver's own msync only covers the
+    // buffers it is handed. Reading it from the CPU without this is a
+    // stale-cache bug waiting on a cache size that happens to be
+    // smaller than a frame. Base address and length are both
+    // cache-line aligned at allocation, so no UNALIGNED flag needed.
+    esp_cache_msync((void *)src, s_cam_buf_sz, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+
+    const yuv422_lanes_t lanes = YUV422_ORDERS[yuv422_order_clamp(s_yuv_order)];
+    const int64_t t0 = esp_timer_get_time();
+    if (s_yuv_path == CAMERA_YUV_PATH_YUV420) {
+        yuv422_to_yuv420(src, s_yuv_conv_buf, s_src_w, s_src_h, lanes);
+    } else {
+        yuv422_to_rgb565(src, s_yuv_conv_buf, s_src_w, s_src_h, lanes);
+    }
+    const int64_t t1 = esp_timer_get_time();
+
+    // No cache writeback needed on the way out: ppa_do_scale_rotate_mirror
+    // does a C2M msync over its whole input window before starting.
+    static uint32_t conv_n = 0;
+    if (++conv_n >= 60u) {
+        conv_n = 0;
+        ESP_LOGI(TAG, "yuv422->%s: %lld us/frame (%" PRIu32 "x%" PRIu32 ", order %s)",
+                 (s_yuv_path == CAMERA_YUV_PATH_YUV420) ? "yuv420" : "rgb565",
+                 (long long)(t1 - t0), s_src_w, s_src_h,
+                 YUV422_ORDER_NAMES[yuv422_order_clamp(s_yuv_order)]);
+    }
+    return s_yuv_conv_buf;
+}
+
 static void render_task(void *arg) {
     uint32_t n_frames = 0;
     uint32_t n_timeouts = 0;
@@ -243,6 +315,10 @@ static void render_task(void *arg) {
         // Drain any stale srm_done left behind by a previous op.
         xSemaphoreTake(s_srm_done, 0);
 
+        // No-op unless the source is YUV422. Inside the mutex, so the
+        // shared staging buffer stays ours for the whole PPA op.
+        src = maybe_convert(src);
+
         ppa_srm_oper_config_t srm = {
             .in = {
                 .buffer         = (void *)src,
@@ -252,7 +328,12 @@ static void render_task(void *arg) {
                 .block_h        = s_src_h,
                 .block_offset_x = 0,
                 .block_offset_y = 0,
-                .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+                .srm_cm         = ppa_input_color_mode(),
+                // Ignored unless srm_cm names a YUV space. The
+                // TC358743 is programmed for BT.601 limited range
+                // (MASK_VOUT_COLOR_601_YCBCR_LIMITED).
+                .yuv_range      = PPA_COLOR_RANGE_LIMIT,
+                .yuv_std        = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
             },
             .out = {
                 .buffer         = s_preview_buffer,
@@ -341,6 +422,7 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
     s_src_h            = src->height;
     s_src_input_format = src->input_format;
     s_src_lane_rate    = src->lane_rate_mbps;
+    s_yuv_path         = src->yuv_path;
 
     // The ESP32-P4 PPA scale register (PPA_SR_SCAL_X_FRAG_V) has only 4
     // fractional bits — scale factor resolution is 1/16. Asking for a scale
@@ -398,6 +480,28 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
     s_cam_stable     = NULL;  // nothing stable yet; render_task bails until first frame
     s_photo_lock     = false;
 
+    // Staging buffer for the YUV422 unpack. Allocated here rather than
+    // further down so the existing goto-fail ordering still frees
+    // everything in the order it was taken.
+    s_yuv_conv_buf    = NULL;
+    s_yuv_conv_buf_sz = 0;
+    if (s_src_input_format == CAMERA_INPUT_YUV422) {
+        // YUV420 is 12 bits/px, RGB565 is 16.
+        s_yuv_conv_buf_sz = (s_yuv_path == CAMERA_YUV_PATH_YUV420)
+                                ? ((size_t)s_src_w * s_src_h * 3u / 2u)
+                                : ((size_t)s_src_w * s_src_h * 2u);
+        s_yuv_conv_buf_sz = (s_yuv_conv_buf_sz + cache_line - 1u) & ~((size_t)cache_line - 1u);
+        s_yuv_conv_buf = heap_caps_aligned_calloc(cache_line, 1, s_yuv_conv_buf_sz,
+                                                  MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+        if (!s_yuv_conv_buf) {
+            ESP_LOGE(TAG, "yuv_conv_buf alloc failed (%zu bytes)", s_yuv_conv_buf_sz);
+            goto fail;
+        }
+        ESP_LOGI(TAG, "yuv422 staging buf %zu bytes, unpacking to %s",
+                 s_yuv_conv_buf_sz,
+                 (s_yuv_path == CAMERA_YUV_PATH_YUV420) ? "yuv420" : "rgb565");
+    }
+
     // buffer_size must be a multiple of the cache line size per
     // ppa_do_scale_rotate_mirror()'s alignment check; pad the allocation
     // up to the next cache line. PPA only writes s_preview_w * s_preview_h
@@ -430,27 +534,50 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
     // sensor already delivers RGB565, ISP is in bypass mode so the
     // CSI bridge still routes data through it but no color processing
     // happens).
-    bool        bayer_input    = false;
-    cam_ctlr_color_t csi_in_ct = CAM_CTLR_COLOR_RGB565;
-    isp_color_t isp_in_ct      = ISP_COLOR_RGB565;
-    isp_color_t isp_out_ct     = ISP_COLOR_RGB565;
+    bool        bayer_input     = false;
+    cam_ctlr_color_t csi_in_ct  = CAM_CTLR_COLOR_RGB565;
+    cam_ctlr_color_t csi_out_ct = CAM_CTLR_COLOR_RGB565;
+    isp_color_t isp_in_ct       = ISP_COLOR_RGB565;
+    isp_color_t isp_out_ct      = ISP_COLOR_RGB565;
     switch (s_src_input_format) {
         case CAMERA_INPUT_RAW10:
             bayer_input = true;
             csi_in_ct   = CAM_CTLR_COLOR_RAW10;
+            csi_out_ct  = CAM_CTLR_COLOR_RGB565;
             isp_in_ct   = ISP_COLOR_RAW10;
             isp_out_ct  = ISP_COLOR_RGB565;
             break;
         case CAMERA_INPUT_RAW8:
             bayer_input = true;
             csi_in_ct   = CAM_CTLR_COLOR_RAW8;
+            csi_out_ct  = CAM_CTLR_COLOR_RGB565;
             isp_in_ct   = ISP_COLOR_RAW8;
             isp_out_ct  = ISP_COLOR_RGB565;
+            break;
+        case CAMERA_INPUT_YUV422:
+            // Nothing converts anything here: the ISP is in bypass, so
+            // input and output must name the same format (isp_core.c
+            // rejects a mismatch outright), and the bytes reach PSRAM
+            // exactly as the sensor sent them. maybe_convert() picks
+            // them up from there.
+            //
+            // These enums are, on this chip, purely documentary: the
+            // CSI and ISP drivers use the colour type only to look up
+            // a bit depth, and color_hal reports 16 bits for YUV422
+            // and RGB565 alike. Naming the real format anyway costs
+            // nothing and stops the next reader from concluding the
+            // pipeline thinks this is RGB.
+            bayer_input = false;
+            csi_in_ct   = CAM_CTLR_COLOR_YUV422;
+            csi_out_ct  = CAM_CTLR_COLOR_YUV422;
+            isp_in_ct   = ISP_COLOR_YUV422;
+            isp_out_ct  = ISP_COLOR_YUV422;
             break;
         case CAMERA_INPUT_RGB565:
         default:
             bayer_input = false;
             csi_in_ct   = CAM_CTLR_COLOR_RGB565;
+            csi_out_ct  = CAM_CTLR_COLOR_RGB565;
             isp_in_ct   = ISP_COLOR_RGB565;
             isp_out_ct  = ISP_COLOR_RGB565;
             break;
@@ -463,7 +590,7 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
         .data_lane_num          = PREVIEW_LANE_COUNT,
         .lane_bit_rate_mbps     = s_src_lane_rate,
         .input_data_color_type  = csi_in_ct,
-        .output_data_color_type = CAM_CTLR_COLOR_RGB565,
+        .output_data_color_type = csi_out_ct,
         .queue_items            = 1,
         .byte_swap_en           = false,
         .bk_buffer_dis          = false,
@@ -540,7 +667,7 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
             ESP_LOGW(TAG, "autoexposure_init failed, software AE disabled");
         }
     } else {
-        ESP_LOGI(TAG, "AF + software AE disabled (RGB565 sensor, ISP in bypass)");
+        ESP_LOGI(TAG, "AF + software AE disabled (non-Bayer sensor, ISP in bypass)");
     }
 
     ppa_client_config_t ppa_cfg = {
@@ -680,6 +807,7 @@ void camera_preview_stop(void) {
     }
     s_cam_buf_sz = 0;
     if (s_preview_buffer) { free(s_preview_buffer); s_preview_buffer = NULL; s_preview_buffer_sz = 0; }
+    if (s_yuv_conv_buf)   { free(s_yuv_conv_buf);   s_yuv_conv_buf   = NULL; s_yuv_conv_buf_sz   = 0; }
 
     s_src_w            = 0;
     s_src_h            = 0;
@@ -773,6 +901,7 @@ esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w, uint32_t *ou
         free(snap);
         return ESP_ERR_INVALID_STATE;
     }
+    src = maybe_convert(src);
 
     ppa_srm_oper_config_t srm = {
         .in = {
@@ -783,7 +912,9 @@ esp_err_t camera_photo_snapshot(uint8_t **out_buf, uint32_t *out_w, uint32_t *ou
             .block_h        = s_src_h,
             .block_offset_x = 0,
             .block_offset_y = 0,
-            .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+            .srm_cm         = ppa_input_color_mode(),
+            .yuv_range      = PPA_COLOR_RANGE_LIMIT,
+            .yuv_std        = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
         },
         .out = {
             .buffer         = snap,
@@ -906,6 +1037,7 @@ esp_err_t camera_video_snapshot(uint8_t  *out_buf,
         xSemaphoreGive(s_ppa_mutex);
         return ESP_ERR_INVALID_STATE;
     }
+    src = maybe_convert(src);
 
     ppa_srm_oper_config_t srm = {
         .in = {
@@ -916,7 +1048,9 @@ esp_err_t camera_video_snapshot(uint8_t  *out_buf,
             .block_h        = s_src_h,
             .block_offset_x = 0,
             .block_offset_y = 0,
-            .srm_cm         = PPA_SRM_COLOR_MODE_RGB565,
+            .srm_cm         = ppa_input_color_mode(),
+            .yuv_range      = PPA_COLOR_RANGE_LIMIT,
+            .yuv_std        = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
         },
         .out = {
             .buffer         = out_buf,

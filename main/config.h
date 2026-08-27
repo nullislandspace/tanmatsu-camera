@@ -47,6 +47,27 @@
 //                            step 1 is ~30 us at unity gain. Adjusted
 //                            live with Q (brighter) / A (darker) in
 //                            photo and video mode.
+//   hdmi_probe=<0|1>        allow probing for a TC358743 HDMI-to-CSI
+//                            bridge when no ordinary camera answered.
+//                            DEFAULT 0, AND THAT IS DELIBERATE: the
+//                            probe drives GPIO6, which is the camera
+//                            connector's LED line and is also wired to
+//                            internal expansion pin E2. See camera.md
+//                            section 5. Nothing touches GPIO6 while
+//                            this is 0.
+//   hdmi_color_path=<0|1>   TC358743 only. How the CPU unpacks the
+//                            bridge's YUV422: 0 = straight to YUV420
+//                            (cheap, full chroma, needs PPA
+//                            YUV420-input), 1 = to RGB565 (roughly
+//                            ten times the CPU per frame and 5/6/5 of
+//                            colour, but every PPA call it makes is
+//                            one the OV5640/45 path already makes).
+//   hdmi_yuv_order=<0..7>   TC358743 only. Byte order within each
+//                            4-byte YUV422 macropixel; index into
+//                            YUV422_ORDERS in yuv_convert.h. Only
+//                            change this if the picture comes out
+//                            with wrong colours or a one-pixel comb
+//                            on vertical edges.
 //   mic_gain=<1..8>         digital gain STEP applied during slot
 //                            extraction (before the LPF + resampler).
 //                            Not a raw multiplier — each step is
@@ -69,6 +90,22 @@
 #define CONFIG_CAM_BRIGHTNESS_DEFAULT   10
 #define CONFIG_AUTO_EXPOSURE_DEFAULT    true
 
+// See hdmi_probe above. Off by default because it drives a pin the
+// project's own camera.md says not to drive speculatively.
+#define CONFIG_HDMI_PROBE_DEFAULT       false
+#define CONFIG_HDMI_YUV_ORDER_MIN       0
+#define CONFIG_HDMI_YUV_ORDER_MAX       7
+#define CONFIG_HDMI_YUV_ORDER_DEFAULT   4
+
+typedef enum {
+    HDMI_COLOR_PATH_YUV420 = 0,
+    HDMI_COLOR_PATH_RGB565,
+} hdmi_color_path_t;
+
+// Short name for the config file, and a label for the menu.
+const char *hdmi_color_path_config_name(hdmi_color_path_t p);
+const char *hdmi_color_path_display_name(hdmi_color_path_t p);
+
 typedef enum {
     MIC_TYPE_NONE = 0,
     MIC_TYPE_INMP441,
@@ -89,6 +126,9 @@ typedef struct {
     int        mic_gain;
     bool       auto_exposure;
     int        cam_brightness;
+    bool              hdmi_probe;
+    hdmi_color_path_t hdmi_color_path;
+    int               hdmi_yuv_order;
 } camera_config_t;
 
 // Populate *out with defaults, then overlay any values found in

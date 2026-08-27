@@ -21,6 +21,7 @@
 #include "nvs_flash.h"
 #include "bmp_writer.h"
 #include "camera_pipeline.h"
+#include "yuv_convert.h"
 #include "camera_sensor.h"
 #include "autoexposure.h"
 #include "config.h"
@@ -36,6 +37,8 @@
 #include "usb_device.h"
 #include "video.h"
 #include "viewer.h"
+
+static char const TAG[] = "main";
 
 #define DCIM_PATH "/sd/DCIM"
 
@@ -74,6 +77,10 @@ static const camera_source_t SRC_OV5647_VIDEO = {
 // reported back via set_format_*. Used for OV5640/OV5645 where the
 // dimensions and lane rate live entirely on the format struct so
 // there's nothing to hardcode.
+// Defined below with the rest of the runtime state; pick_source needs
+// it to honour the saved HDMI colour-path choice.
+static camera_config_t g_cfg;
+
 static camera_source_t source_from_format(const esp_cam_sensor_format_t *fmt,
                                           camera_input_format_t input_format) {
     camera_source_t src = {
@@ -105,6 +112,17 @@ static camera_source_t pick_source(camera_sensor_kind_t kind,
             // regardless of which Bayer position the demosaicer
             // assumes, with mild interpolation artifacts at edges.
             return source_from_format(fmt, CAMERA_INPUT_RAW10);
+        case CAMERA_SENSOR_TC358743: {
+            // HDMI bridge: packed YUV422, ISP in bypass, unpacked on
+            // the CPU before the PPA sees it. Which target it unpacks
+            // to is a saved setting, because the cheap one needs PPA
+            // YUV420-input, which nothing here has ever exercised.
+            camera_source_t src = source_from_format(fmt, CAMERA_INPUT_YUV422);
+            src.yuv_path = (g_cfg.hdmi_color_path == HDMI_COLOR_PATH_RGB565)
+                               ? CAMERA_YUV_PATH_RGB565
+                               : CAMERA_YUV_PATH_YUV420;
+            return src;
+        }
         case CAMERA_SENSOR_OV5640:
         case CAMERA_SENSOR_OV5645:
         default:
@@ -140,7 +158,7 @@ static const char *mode_name(app_mode_t m) {
 // session left the VCM at (e.g. after a lens swap). The driver itself
 // (real chip vs. simulator vs. off) is selected via the config menu;
 // see focus_driver.h.
-static camera_config_t g_cfg           = {0};
+static camera_config_t g_cfg           = {0};   // forward-declared above pick_source
 // The detected sensor, published so the config menu can act on the
 // Auto Exp toggle. Owned by app_main; NULL until detection succeeds.
 static camera_sensor_t *g_sensor       = NULL;
@@ -168,6 +186,18 @@ _Static_assert(CAMERA_BRIGHT_MAX == CONFIG_CAM_BRIGHTNESS_MAX &&
                CAMERA_BRIGHT_MIN == CONFIG_CAM_BRIGHTNESS_MIN,
                "config.h brightness range must match camera_sensor.h");
 
+// Geometry and mode the preview pipeline is currently running with.
+// Tracked at module scope so the config menu can rebuild the pipeline
+// without needing app_main's locals in scope.
+static bool     g_last_video_mode = false;
+static uint32_t g_preview_area_w  = 0;
+static uint32_t g_preview_area_h  = 0;
+
+static esp_err_t switch_pipeline_to_source(camera_sensor_t *sensor,
+                                           bool is_video_mode,
+                                           uint32_t preview_area_w,
+                                           uint32_t preview_area_h);
+
 // Defined below with the rest of the exposure plumbing; the config menu
 // needs them to apply the Auto Exp toggle immediately.
 static void apply_brightness(camera_sensor_t *sensor);
@@ -190,6 +220,7 @@ typedef enum {
     CFG_KIND_DRIVER,
     CFG_KIND_INT,
     CFG_KIND_MIC_TYPE,
+    CFG_KIND_HDMI_PATH,
 } cfg_kind_t;
 
 typedef struct {
@@ -211,6 +242,13 @@ static cfg_item_t g_cfg_items[] = {
     { "Microphone", CFG_KIND_MIC_TYPE, &g_cfg.mic_type,        0, 0 },
     { "Mic Gain",   CFG_KIND_INT,    &g_cfg.mic_gain,
                     CONFIG_MIC_GAIN_MIN, CONFIG_MIC_GAIN_MAX },
+    // HDMI bridge support. The probe row is the dangerous one and is
+    // drawn in red; the other two only mean anything once a bridge has
+    // actually been found, and are greyed out until then.
+    { "HDMI Probe", CFG_KIND_BOOL,   &g_cfg.hdmi_probe,        0, 0 },
+    { "HDMI Color", CFG_KIND_HDMI_PATH, &g_cfg.hdmi_color_path, 0, 0 },
+    { "HDMI Bytes", CFG_KIND_INT,    &g_cfg.hdmi_yuv_order,
+                    CONFIG_HDMI_YUV_ORDER_MIN, CONFIG_HDMI_YUV_ORDER_MAX },
 };
 #define CFG_ITEM_COUNT ((int)(sizeof(g_cfg_items) / sizeof(g_cfg_items[0])))
 static int g_cfg_sel = 0;
@@ -226,6 +264,13 @@ static bool cfg_item_enabled(const cfg_item_t *it) {
     // nothing at all on a sensor with no exposure registers to write.
     if (it->target == &g_cfg.cam_brightness) {
         return camera_sensor_has_manual_exposure(g_sensor) && !g_cfg.auto_exposure;
+    }
+    // The two HDMI tuning rows describe how to decode a bridge's
+    // output. With no bridge attached there is nothing to decode, and
+    // offering the knobs would suggest otherwise.
+    if (it->target == &g_cfg.hdmi_color_path ||
+        it->target == &g_cfg.hdmi_yuv_order) {
+        return g_sensor && g_sensor->kind == CAMERA_SENSOR_TC358743;
     }
     return true;
 }
@@ -284,6 +329,26 @@ static cfg_act_result_t cfg_item_activate(int idx) {
         return (*mt != prev) ? CFG_ACT_CHANGED : CFG_ACT_NOOP;
     }
 
+    if (it->kind == CFG_KIND_HDMI_PATH) {
+        hdmi_color_path_t *hp   = (hdmi_color_path_t *)it->target;
+        hdmi_color_path_t  prev = *hp;
+        *hp = (prev == HDMI_COLOR_PATH_YUV420) ? HDMI_COLOR_PATH_RGB565
+                                               : HDMI_COLOR_PATH_YUV420;
+        // Changing this changes both the staging buffer's size and the
+        // colour mode the PPA reads it as, so the pipeline has to come
+        // back up rather than just picking up a new value.
+        if (g_sensor) {
+            esp_err_t err = switch_pipeline_to_source(g_sensor, g_last_video_mode,
+                                                      g_preview_area_w, g_preview_area_h);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "hdmi_color_path switch failed: %d", err);
+                *hp = prev;
+                return CFG_ACT_NOOP;
+            }
+        }
+        return CFG_ACT_CHANGED;
+    }
+
     if (it->kind == CFG_KIND_INT) {
         int *iv   = (int *)it->target;
         int  prev = *iv;
@@ -292,6 +357,10 @@ static cfg_act_result_t cfg_item_activate(int idx) {
         *iv = next;
         if (iv == &g_cfg.mic_gain) {
             microphone_set_gain(*iv);
+        } else if (iv == &g_cfg.hdmi_yuv_order) {
+            // Read per frame by the conversion, so this takes effect
+            // on the very next one with no rebuild.
+            camera_pipeline_set_yuv_order(*iv);
         } else if (iv == &g_cfg.cam_brightness && g_sensor) {
             g_bright_step = *iv;
             apply_brightness(g_sensor);
@@ -347,8 +416,6 @@ static cfg_act_result_t cfg_item_activate(int idx) {
 
     return (*v != prev) ? CFG_ACT_CHANGED : CFG_ACT_NOOP;
 }
-
-static char const TAG[] = "main";
 
 static size_t                       display_h_res        = 0;
 static size_t                       display_v_res        = 0;
@@ -548,6 +615,10 @@ static esp_err_t switch_pipeline_to_source(camera_sensor_t *sensor,
                                            bool is_video_mode,
                                            uint32_t preview_area_w,
                                            uint32_t preview_area_h) {
+    g_last_video_mode = is_video_mode;
+    g_preview_area_w  = preview_area_w;
+    g_preview_area_h  = preview_area_h;
+
     // Stop sensor stream first so the CSI DMA stops firing while we
     // tear down the controller.
     camera_sensor_stream(sensor, false);
@@ -780,6 +851,7 @@ void app_main(void) {
     config_load(&g_cfg);
     camera_pipeline_set_rotate_180(g_cfg.rotate_180);
     microphone_set_gain(g_cfg.mic_gain);
+    camera_pipeline_set_yuv_order(g_cfg.hdmi_yuv_order);
     bool show_focus_missing_banner = false;
     if (g_cfg.focus_enabled) {
         if (focus_select(g_cfg.focus_driver) == ESP_OK) {
@@ -901,6 +973,9 @@ void app_main(void) {
     const uint32_t hud_area_w      = logical_w - preview_area_w; // 200
 
     camera_source_t initial_src = pick_source(sensor.kind, false, &initial_fmt);
+    g_last_video_mode = false;
+    g_preview_area_w  = preview_area_w;
+    g_preview_area_h  = preview_area_h;
     if (camera_preview_start(&initial_src, preview_area_w, preview_area_h) != ESP_OK) {
         splash(RED, WHITE, "Camera error", "Pipeline start failed");
         wait_for_esc();
@@ -1286,8 +1361,21 @@ void app_main(void) {
                                  it->label, shown);
                     } else if (it->kind == CFG_KIND_INT) {
                         int iv = *(int *)it->target;
-                        snprintf(row, sizeof(row), "%-9s < %d >",
-                                 it->label, iv);
+                        if (it->target == &g_cfg.hdmi_yuv_order) {
+                            // The number alone means nothing; the name
+                            // is what the reporter can compare against
+                            // what they see on screen.
+                            snprintf(row, sizeof(row), "%-9s < %d %s >",
+                                     it->label, iv,
+                                     YUV422_ORDER_NAMES[yuv422_order_clamp(iv)]);
+                        } else {
+                            snprintf(row, sizeof(row), "%-9s < %d >",
+                                     it->label, iv);
+                        }
+                    } else if (it->kind == CFG_KIND_HDMI_PATH) {
+                        hdmi_color_path_t hp = *(hdmi_color_path_t *)it->target;
+                        snprintf(row, sizeof(row), "%-9s < %s >",
+                                 it->label, hdmi_color_path_display_name(hp));
                     } else if (it->kind == CFG_KIND_MIC_TYPE) {
                         mic_type_t mt = *(mic_type_t *)it->target;
                         snprintf(row, sizeof(row), "%-9s < %s >",
@@ -1308,6 +1396,13 @@ void app_main(void) {
                         bool v = *(bool *)it->target;
                         snprintf(row, sizeof(row), "[%c] %s%s",
                                  v ? 'x' : ' ', it->label, why);
+                    }
+                    // The probe row drives GPIO6, which is the camera
+                    // connector's LED line and also internal expansion
+                    // pin E2 (camera.md section 5). Anyone enabling it
+                    // should see that it is not like the other rows.
+                    if (it->target == &g_cfg.hdmi_probe && avail) {
+                        col = sel ? YELLOW : RED;
                     }
                     fbdraw_hershey_string(&fb, col, mx, my, row, 18);
                     my += row_h;
