@@ -226,6 +226,16 @@ static void set_hdmi_phy(esp_sccb_io_handle_t h, const tc358743_format_params_t 
   tc358743_write8_and_or(h, PHY_EN, (uint8_t)~MASK_ENABLE_PHY, MASK_ENABLE_PHY);
 }
 
+/* Brings up the chip's HDMI-audio-to-I2S path: clock regeneration,
+ * auto-mute, buffer init, I2S framing, two channels out.
+ *
+ * On the Tanmatsu nothing receives it. The camera connector carries
+ * three CSI pairs, 3V3, CAM_IO0, E2/GPIO6 and the I2C pair, and no I2S
+ * pins whatsoever (camera.md section 2), so SCK/WS/SD have nowhere to
+ * go. Left enabled anyway: it costs a handful of I2C writes once, it
+ * is what the chip expects for a complete bring-up, and it means the
+ * device end is already done if a future board routes those signals.
+ * See "HDMI audio" in .claudeplans/testhardware.md. */
 static void set_hdmi_audio(esp_sccb_io_handle_t h) {
   tc358743_write8(h, FORCE_MUTE, 0x00);
   tc358743_write8(h, AUTO_CMD0,

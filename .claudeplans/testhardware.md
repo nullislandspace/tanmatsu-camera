@@ -573,6 +573,43 @@ printer switched off mid-transfer, print with paper out.
 
 ---
 
+## HDMI audio — investigated, not pursued
+
+**The chip does it, the driver already configures it, and the board cannot reach it.**
+
+The TC358743 extracts HDMI audio and re-emits it as I2S, and the vendored driver sets
+the whole block up in `set_hdmi_audio()`: audio clock regeneration in CTS mode with the
+standard PPM tolerances, auto-mute and auto-play, a 500 ms buffer init,
+`SDO_MODE1 = MASK_SDO_FMT_I2S`, and `CONFCTL |= MASK_AUDCHNUM_2 | MASK_AUDOUTSEL_I2S`
+for two-channel I2S out. `enable_stream()` raises `MASK_ABUFEN` alongside `MASK_VBUFEN`,
+so the audio buffer comes up with the video. There is nothing to write.
+
+What stops it is the connector. Per `camera.md` section 2 it carries three CSI
+differential pairs, 3V3, `CAM_IO0`, `E2`/GPIO6, `SYS_SDA` and `SYS_SCL` — and no I2S
+pins at all. The bridge's SCK/WS/SD have no path to the ESP32-P4.
+
+Hand-wiring them to the internal expansion header would still leave two problems:
+
+- **Clock role.** `microphone.c:440` opens its channel as `I2S_ROLE_MASTER` — the P4
+  generates BCLK and WS for the INMP441. The TC358743 regenerates its audio clock from
+  the HDMI stream, so it is an I2S *master* too. The P4 would have to run as slave,
+  which is a different path through `microphone.c`.
+- **Rate and channels.** HDMI audio is 48 kHz (or 44.1) stereo; the recording path
+  resamples to 22.05 kHz mono and hands that to shine as MONO MPEG-II.
+
+Not a blocker: `SOC_I2S_NUM` is 3 on the P4 and only two ports are in use (I2S0
+speaker, I2S1 mic), so bridge audio could have its own port and coexist with the
+microphone, given pins and a slave-mode configuration.
+
+**Decision: no audio from the bridge for now.** Nothing in phase 1 changes, and nothing
+is lost by leaving it — the driver already enables the audio block, so if a board ever
+routes those three signals the chip end is done. Worth asking the PR author whether
+their Waveshare board breaks I2S out to a header at all; that cannot be determined from
+here. If it does, this becomes its own small phase: a slave-mode I2S source in
+`microphone.c` plus a 48 kHz stereo path to shine.
+
+---
+
 ## Deferred / out of scope
 
 - **Convert-once dedup.** During recording, `render_task` and `camera_video_snapshot`
