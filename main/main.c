@@ -40,6 +40,15 @@
 
 static char const TAG[] = "main";
 
+// How long an HDMI bridge may go without delivering a frame before we
+// tear the pipeline down and bring it back up, and how long to wait
+// before trying that again. Four seconds is chosen to sit above the
+// time a source needs to read our EDID and start sending TMDS after
+// set_stream() raises HPD, which is comfortably over a second; a
+// shorter trigger would interrupt a link that was about to come up.
+#define NO_FRAME_REBUILD_MS   4000u
+#define NO_FRAME_COOLDOWN_MS  5000u
+
 #define DCIM_PATH "/sd/DCIM"
 
 // Cap the sensor at 15 fps. At the native 50 fps the CSI DMA alone
@@ -1131,6 +1140,11 @@ void app_main(void) {
     uint32_t preview_bars_pw    = 0;  // geometry the bars were painted for
     uint32_t preview_bars_ph    = 0;
 
+    // Stream-loss recovery for the HDMI bridge. Counted in units of
+    // the 100 ms camera_preview_wait_frame() timeout.
+    uint32_t no_frame_streak_ms       = 0;
+    int64_t  stream_recovery_after_us = 0;
+
     // The mic runs whenever the user is in video mode (actual or
     // via the config menu entered from it) AND mic_type is set to
     // something other than NONE. We reconcile declaratively once per
@@ -1386,18 +1400,49 @@ void app_main(void) {
         // View mode ignores camera frames — it renders the decoded JPEG
         // instead — but we still need the preview pipeline to keep running
         // so entering photo/video mode is instant.
+        // An HDMI bridge legitimately has no frames for seconds at a
+        // time: nothing plugged into the source, or the source
+        // renegotiating after a mode change. For an image sensor a
+        // missing frame is a glitch, and redrawing an identical HUD
+        // ten times a second to no purpose is what the `continue`
+        // below has always been there to avoid.
+        const bool tolerate_no_frame = (sensor.kind == CAMERA_SENSOR_TC358743);
+
         bool got_preview_frame = false;
         int64_t t_wait_start = esp_timer_get_time();
         if (mode != MODE_VIEW) {
             if (camera_preview_wait_frame(100) == ESP_OK) {
                 got_preview_frame = true;
-            } else {
-                // No fresh frame — skip this iteration so we don't redraw
-                // an identical HUD over a stale preview 10 times a second.
+            } else if (!tolerate_no_frame) {
                 continue;
             }
         }
         int64_t t_after_wait = esp_timer_get_time();
+
+        // Stream-loss recovery, bridge only. camera_preview_wait_frame
+        // already blocked for 100 ms, so this counts in those units.
+        // Not while recording: rebuilding the pipeline would stop the
+        // muxer mid-file. The cooldown stops a permanently absent
+        // source from rebuilding every four seconds forever.
+        if (mode != MODE_VIEW && tolerate_no_frame) {
+            if (got_preview_frame) {
+                no_frame_streak_ms = 0;
+            } else {
+                no_frame_streak_ms += 100u;
+                if (no_frame_streak_ms >= NO_FRAME_REBUILD_MS &&
+                    esp_timer_get_time() >= stream_recovery_after_us &&
+                    !video_is_recording()) {
+                    ESP_LOGW(TAG, "no frames for %" PRIu32 " ms — rebuilding the pipeline",
+                             no_frame_streak_ms);
+                    no_frame_streak_ms       = 0;
+                    stream_recovery_after_us = esp_timer_get_time() +
+                                               (int64_t)NO_FRAME_COOLDOWN_MS * 1000;
+                    switch_pipeline_to_source(&sensor, mode == MODE_VIDEO,
+                                              preview_area_w, preview_area_h);
+                    preview_bars_dirty = 2;
+                }
+            }
+        }
 
         // Skip drawing + blit entirely if the display is still DMA-ing
         // the previous frame. With double buffering this means we just
@@ -1515,6 +1560,22 @@ void app_main(void) {
                     fbdraw_hershey_string(&fb, col, mx, my, row, 18);
                     my += row_h;
                 }
+            } else if (mode != MODE_VIEW && !got_preview_frame) {
+                // No signal. Fill the whole preview area, which also
+                // takes care of the letterbox margins, and say so —
+                // an unexplained black rectangle reads as a crash.
+                fbdraw_fill_rect(&fb, 0, 0,
+                                 (int)preview_area_w, (int)preview_area_h, BLACK);
+                const int   ns_font = 28;
+                const char *ns_text = "NO SIGNAL";
+                int ns_w = fbdraw_hershey_string_width(ns_text, ns_font);
+                fbdraw_hershey_string(&fb, fbdraw_rgb(96, 96, 96),
+                                      ((int)preview_area_w - ns_w) / 2,
+                                      ((int)preview_area_h - ns_font) / 2,
+                                      ns_text, ns_font);
+                // The margins we just painted over are ours again, so
+                // the real preview has to repaint them when it returns.
+                preview_bars_dirty = 2;
             } else if (mode != MODE_VIEW) {
                 // camera_pipeline's PPA produced a 16:9 preview letterboxed
                 // into the 5:4 (600x480) preview area. The PPA output is

@@ -50,6 +50,31 @@ typedef struct {
 // The four standard YUV422 wire orders, then the same four with the
 // 4-byte word reversed. See the table in yuv_convert.c for why the
 // reversed half is not padding.
+//
+// If the default turns out to be wrong on real hardware, the picture
+// says which way. Cycle "HDMI Bytes" in the config menu and look for:
+//
+//   luma lanes swapped (Y0 <-> Y1)
+//       a one-pixel comb or shimmer along vertical edges; an isolated
+//       bright pixel sits one column left or right of where it should,
+//       depending on whether its column index is odd or even. Colour
+//       is otherwise fine.
+//
+//   chroma lanes swapped (U <-> V)
+//       skin tones go blue or green, sky goes orange. Luma is perfect,
+//       so the image is sharp and correctly positioned -- only the
+//       colours are wrong. Note that a chroma-row parity error in the
+//       YUV420 packer looks identical, and is corrected by the same
+//       table, so there is no separate control for it.
+//
+//   both
+//       both symptoms at once.
+//
+// Report the index that looks right. If it is one of 4..7, the real
+// fix may be csi_cfg.byte_swap_en or isp_cfg.flags.byte_swap_en, which
+// would be free in hardware instead of costing a permutation per
+// pixel -- worth trying once the correct order is known, but not worth
+// guessing at beforehand.
 #define YUV422_ORDER_COUNT   8
 #define YUV422_ORDER_DEFAULT 4
 

@@ -10,13 +10,13 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 1, step 1.9 (1.1-1.8 done, awaiting hardware confirmation)
+CURRENT POSITION: Phase 1 code complete (1.1-1.10). Untested on any hardware.
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
 |---|---|---|---|
 | 0 | Land this plan in the repo | yes | `[x]` |
-| 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[~]` |
+| 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[~]` code done, untested |
 | 2 | F5 fullscreen | yes | `[ ]` |
 | 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[ ]` |
 | 4 | BLE transport scaffold | no | `[ ]` |
@@ -282,7 +282,7 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
   *Verify:* with `hdmi_probe=0`, the OV boot log must never mention GPIO6. Scope the pin to
   confirm it stays Hi-Z.
 
-- `[ ]` **1.9 — "NO SIGNAL" overlay + stream recovery.** `main.c:1194-1201` currently
+- `[x]` **1.9 — "NO SIGNAL" overlay + stream recovery.** `main.c:1194-1201` currently
   `continue`s when no frame arrives, with an explicit comment about not redrawing an
   identical HUD ten times a second. The PR deletes that for all sensors. Gate it instead on
   `const bool tolerate_no_frame = (sensor.kind == CAMERA_SENSOR_TC358743);` — an HDMI bridge
@@ -300,7 +300,7 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
   start TMDS. Without the overlay the app just sits black at boot. Put that in the commit
   message.
 
-- `[ ]` **1.10 — Byte-order affordance for the author.** **Ship `[Y1, V, Y0, U]` as the
+- `[x]` **1.10 — Byte-order affordance for the author.** **Ship `[Y1, V, Y0, U]` as the
   default with high confidence.** The driver programs `MASK_YCBCRFMT_422_8_BIT`, emitting
   CSI-2 data type 0x1E whose spec wire order is `U, Y0, V, Y1` (UYVY) — and the PR's
   empirical order is the **exact 32-bit byte-reversal** of that. Not one of 24 arbitrary
