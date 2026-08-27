@@ -5,6 +5,7 @@ idf_component_register(
 		"fastopen.c"
 		"camera_sensor.c"
 		"camera_pipeline.c"
+		"yuv_convert.c"
 		"bmp_writer.c"
 		"fbdraw.c"
 		"photo.c"
@@ -44,6 +45,14 @@ idf_component_register(
 		"."
 		"focus"
 )
+
+# The YUV422 unpack runs over every pixel of every frame, and the
+# project default is CONFIG_COMPILER_OPTIMIZATION_DEBUG (-Og), which
+# roughly doubles what that loop costs. Raise it for this one file
+# only: doing it project-wide would change the codegen of the whole
+# camera pipeline, and the point of keeping this in its own
+# translation unit is that nothing else is affected.
+set_source_files_properties(yuv_convert.c PROPERTIES COMPILE_OPTIONS "-O2")
 
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=unused-variable" APPEND)
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=unused-const-variable" APPEND)

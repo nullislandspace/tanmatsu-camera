@@ -24,3 +24,4 @@ badgelink
 FOCUS_TRACKER.md
 tc358743_registers.md
 
+tests/host/test_yuv_convert
