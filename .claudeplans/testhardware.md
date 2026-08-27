@@ -10,14 +10,15 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 2 code complete. Phase 1 + 2 both untested on hardware. Next: phase 3.
+CURRENT POSITION: Phase 2 done and confirmed on hardware (OV sensors). Phase 1 still untested
+(needs a TC358743). Next: phase 3, the radio cost measurement.
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
 |---|---|---|---|
 | 0 | Land this plan in the repo | yes | `[x]` |
 | 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[~]` code done, untested |
-| 2 | F5 fullscreen | yes | `[~]` code done, untested |
+| 2 | F5 fullscreen | yes | `[x]` confirmed on hardware |
 | 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[ ]` |
 | 4 | BLE transport scaffold | no | `[ ]` |
 | 5 | Catprinter protocol driver | no | `[ ]` |
@@ -455,6 +456,13 @@ Note the OV5647 video preset is the one case where fullscreen is not an improvem
   body.** The PR left it un-indented, which poisons every future diff of that region.
 - `[x]` **2.4** Force `preview_bars_dirty = 2` in the F5 handler — the geometry check at
   `:1332` catches `pw` changes but not `preview_area_w` changes.
+
+Landed with three follow-ups found by using it: the hint belongs in the icon rows next
+to F1-F4 rather than as a text line among the diagnostics; the label reads "Fullscreen",
+not "full"; and Esc is now refused during recording, where it used to stop the muxer and
+restart into the launcher in a single brushed keypress. While recording the whole key
+legend is replaced by "keys locked", which also hands back ~170 px and incidentally fixed
+a pre-existing HUD overflow in video-with-mic-and-focus.
 
 *Verify:* F5 in photo and video mode on both sensors; toggle and back; no stale HUD pixels;
 F5 ignored while recording; F5→F1→ESC→F5 leaves consistent geometry. Also exercise
