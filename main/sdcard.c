@@ -1,5 +1,6 @@
 #include "sdcard.h"
 #include "driver/sdmmc_host.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
@@ -13,8 +14,20 @@ static const char* TAG = "sdcard";
 static bool mounted = false;
 static sd_pwr_ctrl_handle_t pwr_ctrl_handle = NULL;
 
-// DMA buffer in internal RAM (required for SDMMC)
-static DRAM_DMA_ALIGNED_ATTR uint8_t dma_buf[512 * 4];
+// Bounce buffer the SDMMC driver uses for multi-block transfers to/from
+// buffers that are not DMA-aligned. It has to come from the heap, because
+// the driver has no size field for it: it recovers the length by calling
+// heap_caps_get_allocated_size() on the pointer, which only resolves for
+// heap blocks.
+//
+// ESP-IDF 5.5 ignores host.dma_aligned_buffer altogether -- sdmmc_read_
+// sectors()/sdmmc_write_sectors() malloc a temporary buffer per call and
+// never read the field -- so a static array was harmless here, if also
+// useless. IDF 6 started honouring it, and the same static array then
+// tripped `assert failed: heap_caps_get_allocated_size` on the first
+// sector read, taking the app down while mounting the card.
+#define SDCARD_DMA_BUF_SIZE (512 * 4)
+static uint8_t* dma_buf = NULL;
 
 esp_err_t sdcard_init(void) {
     esp_err_t res;
@@ -55,6 +68,13 @@ esp_err_t sdcard_init(void) {
     host.slot = SDMMC_HOST_SLOT_0;          // Use SLOT0 for native IOMUX pins
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;  // 40MHz
     host.pwr_ctrl_handle = pwr_ctrl_handle;
+    if (dma_buf == NULL) {
+        dma_buf = heap_caps_aligned_alloc(64, SDCARD_DMA_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (dma_buf == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate %d byte SDMMC DMA buffer", SDCARD_DMA_BUF_SIZE);
+            return ESP_ERR_NO_MEM;
+        }
+    }
     host.dma_aligned_buffer = dma_buf;
 
     // SDMMC slot configuration with Tanmatsu pinout

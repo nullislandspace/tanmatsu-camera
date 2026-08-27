@@ -844,6 +844,23 @@ esp_err_t camera_video_snapshot(uint8_t  *out_buf,
     if (n_from_w == 0 || n_from_w > 16) return ESP_ERR_INVALID_ARG;
     if ((s_src_w  * n_from_w) / 16u != out_w) return ESP_ERR_INVALID_ARG;
     if ((s_src_h * n_from_w) / 16u != out_h) return ESP_ERR_INVALID_ARG;
+    // ...and n must be EVEN. The output colour mode below is YUV420,
+    // and ppa_srm.c masks the scale fraction for exactly that case:
+    //   if (out.srm_cm == PPA_SRM_COLOR_MODE_YUV420) {
+    //       scale_x_frag &= ~1; scale_y_frag &= ~1;
+    //   }
+    // It does not report this. An odd n is quietly rounded DOWN to the
+    // next even one -- 5/16 becomes 4/16 -- and the PPA then writes a
+    // block 4/5 of the size we sized the buffer for, leaving the rest
+    // of the frame at whatever it held (zeroed YUV420, i.e. green).
+    // Fail loudly here instead; pick_video_dims() only ever offers
+    // even scales now, so reaching this is a caller bug.
+    if (n_from_w & 1u) {
+        ESP_LOGE(TAG, "video snapshot scale %" PRIu32 "/16 is odd; the PPA "
+                      "silently uses %" PRIu32 "/16 for YUV420 output",
+                 n_from_w, n_from_w - 1u);
+        return ESP_ERR_INVALID_ARG;
+    }
     float scale = (float)n_from_w / 16.0f;
 
     // YUV420 packed is 1.5 bytes per pixel at the stride dims.

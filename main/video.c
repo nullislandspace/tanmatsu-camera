@@ -611,9 +611,30 @@ static bool pick_video_dims(uint32_t src_w, uint32_t src_h,
                             uint32_t *out_w, uint32_t *out_h) {
     if (src_w == 0 || src_h == 0) return false;
 
+    // k MUST BE EVEN. camera_video_snapshot() drives the PPA with an
+    // output colour mode of YUV420, and ppa_srm.c does this to us:
+    //
+    //   if (config->out.srm_cm == PPA_SRM_COLOR_MODE_YUV420) {
+    //       scale_x_frag = scale_x_frag & ~1;
+    //       scale_y_frag = scale_y_frag & ~1;
+    //   }
+    //
+    // -- the scale fraction is forced even, silently, with no error
+    // returned. An odd k is therefore not the scale you get: k=5 is
+    // masked to 4, so the OV9281's 1280x800 produced a 320x200 picture
+    // in the top-left of the 400x250 frame we asked for and left the
+    // other 80 columns and 50 rows at their zero-init. Zeroed YUV420
+    // is Y=0,U=0,V=0, which decodes to RGB (0,135,0) -- the green
+    // block visible in every OV9281 recording, and the blue-ish wash
+    // it turned into once the videoplayer's PPA converted it again.
+    //
+    // The OV5647 never showed this because its 800x640 lands on k=8.
+    // The camera PREVIEW never showed it either: that path outputs
+    // RGB565, so the mask does not apply and odd scales are fine there.
+    //
     // Pass 1: exact scale AND both dimensions a multiple of 16, i.e.
     // src * k divisible by 16*16.
-    for (uint32_t k = 16; k >= 1; k--) {
+    for (uint32_t k = 16; k >= 2; k -= 2) {
         if ((src_w * k) % 256u || (src_h * k) % 256u) continue;
         uint32_t w = src_w * k / 16u;
         uint32_t h = src_h * k / 16u;
@@ -622,7 +643,7 @@ static bool pick_video_dims(uint32_t src_w, uint32_t src_h,
         return true;
     }
     // Pass 2: exact scale, even dimensions, encoder pads the rest.
-    for (uint32_t k = 16; k >= 1; k--) {
+    for (uint32_t k = 16; k >= 2; k -= 2) {
         if ((src_w * k) % 16u || (src_h * k) % 16u) continue;
         uint32_t w = src_w * k / 16u;
         uint32_t h = src_h * k / 16u;
