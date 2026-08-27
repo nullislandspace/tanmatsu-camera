@@ -68,6 +68,25 @@ typedef struct {
 // wins. Wraps bus access in the BSP's I2C claim/release semaphore.
 esp_err_t camera_sensor_detect(camera_sensor_t *out);
 
+// Which drivers camera_sensor_detect_scoped() is allowed to try.
+//
+// The split exists because the TC358743 may need its enable line
+// asserted before it will answer on I2C at all, and that line is one
+// this project would rather not drive speculatively (camera.md
+// section 5). So ordinary cameras get a first pass with nothing
+// touched, and only if that finds nothing does the caller assert the
+// line and run a bridge-only second pass.
+typedef enum {
+    CAMERA_DETECT_ORDINARY = 0,  // everything except the HDMI bridge
+    CAMERA_DETECT_BRIDGE,        // the HDMI bridge and nothing else
+} camera_detect_scope_t;
+
+// As camera_sensor_detect(), but restricted to one class of driver.
+// Safe to call repeatedly: it clears *out and releases the SCCB handle
+// of every driver that declines.
+esp_err_t camera_sensor_detect_scoped(camera_sensor_t *out,
+                                      camera_detect_scope_t scope);
+
 // Release the SCCB handle for a previously-detected sensor.
 void camera_sensor_release(camera_sensor_t *sensor);
 

@@ -166,7 +166,21 @@ static void capture_fps_base(camera_sensor_t *sensor, const esp_cam_sensor_forma
     }
 }
 
+// The bridge is identified by its SCCB address rather than by its
+// detect function pointer, because ESP_CAM_SENSOR_DETECT_FN registers a
+// static wrapper -- the address in the table is not the public
+// tc358743_detect at all, so comparing against it would silently never
+// match. 0x0F is unique among the registered camera drivers (OV5647
+// 0x36, OV5640/45 0x3C, OV9281 0x60) and among the other devices on
+// this bus (coprocessor 0x5F, BMI270 0x68, ES8156 0x08).
+#define TC358743_DETECT_ADDR 0x0F
+
 esp_err_t camera_sensor_detect(camera_sensor_t *out) {
+    return camera_sensor_detect_scoped(out, CAMERA_DETECT_ORDINARY);
+}
+
+esp_err_t camera_sensor_detect_scoped(camera_sensor_t *out,
+                                      camera_detect_scope_t scope) {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out));
 
@@ -191,6 +205,11 @@ esp_err_t camera_sensor_detect(camera_sensor_t *out) {
     bsp_i2c_primary_bus_claim();
     for (esp_cam_sensor_detect_fn_t *p = &__esp_cam_sensor_detect_fn_array_start;
          p < &__esp_cam_sensor_detect_fn_array_end; ++p) {
+        const bool is_bridge = (p->sccb_addr == TC358743_DETECT_ADDR);
+        if (is_bridge != (scope == CAMERA_DETECT_BRIDGE)) {
+            continue;
+        }
+
         sccb_i2c_config_t i2c_cfg = {
             .scl_speed_hz    = SCCB_FREQ_HZ,
             .device_address  = p->sccb_addr,
@@ -214,7 +233,11 @@ esp_err_t camera_sensor_detect(camera_sensor_t *out) {
     bsp_i2c_primary_bus_release();
 
     if (!device) {
-        ESP_LOGE(TAG, "No camera sensor detected on the primary I2C bus");
+        if (scope == CAMERA_DETECT_BRIDGE) {
+            ESP_LOGW(TAG, "No HDMI bridge on the primary I2C bus either");
+        } else {
+            ESP_LOGE(TAG, "No camera sensor detected on the primary I2C bus");
+        }
         return ESP_ERR_NOT_FOUND;
     }
 

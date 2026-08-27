@@ -679,6 +679,95 @@ static esp_err_t switch_pipeline_to_source(camera_sensor_t *sensor,
     return ESP_OK;
 }
 
+// ---------------------------------------------------------------------
+// TC358743 enable line (GPIO6)
+//
+// GPIO6 is camera-connector pin 5 -- the LED control line -- and is
+// also wired to internal expansion pin E2. camera.md section 5 is
+// explicit: "Do not configure GPIO6 unless your specific camera module
+// actually has an LED and your application actually wants to control
+// it." An HDMI bridge board repurposes that line as its own enable,
+// which is why it has to be driven at all.
+//
+// It cannot be gated on having detected a bridge, because the bridge
+// may need it high before it will answer on I2C. So instead: ordinary
+// cameras are probed first with nothing touched, and only if that
+// finds nothing -- and only if the user has explicitly opted in -- is
+// the line examined and then driven.
+// ---------------------------------------------------------------------
+#define HDMI_ENABLE_GPIO 6
+
+// Put GPIO6 back the way we found it. GPIO_MODE_DISABLE with both
+// pulls off, NOT gpio_reset_pin(): that enables the internal pull-up,
+// which is not the same as leaving the pin alone.
+static void hdmi_enable_release(void) {
+    gpio_config_t cfg = {
+        .pin_bit_mask = BIT64(HDMI_ENABLE_GPIO),
+        .mode         = GPIO_MODE_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+}
+
+// Is anything else driving GPIO6?
+//
+// Configure it as an input with the internal pull-up and read, then
+// with the internal pull-down and read. The P4's internal pulls are
+// weak -- tens of kilohms, so tens of microamps at 3V3 -- which is
+// safe even into a hard short, and far too weak to override anything
+// that is genuinely driving the net. If the pin follows the pull both
+// ways, nothing else is on it and a push-pull output cannot contend.
+// If it is stuck either way, something is driving it (or holding it
+// with a strong external resistor) and we leave well alone.
+static bool hdmi_enable_line_is_free(void) {
+    gpio_config_t cfg = {
+        .pin_bit_mask = BIT64(HDMI_ENABLE_GPIO),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&cfg) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(2));
+    const int with_pullup = gpio_get_level(HDMI_ENABLE_GPIO);
+
+    cfg.pull_up_en   = GPIO_PULLUP_DISABLE;
+    cfg.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    if (gpio_config(&cfg) != ESP_OK) return false;
+    vTaskDelay(pdMS_TO_TICKS(2));
+    const int with_pulldown = gpio_get_level(HDMI_ENABLE_GPIO);
+
+    hdmi_enable_release();
+
+    const bool floating = (with_pullup == 1 && with_pulldown == 0);
+    if (!floating) {
+        ESP_LOGW(TAG, "GPIO%d is held (pu=%d pd=%d) -- something else is "
+                      "driving it; not asserting the HDMI enable",
+                 HDMI_ENABLE_GPIO, with_pullup, with_pulldown);
+    }
+    return floating;
+}
+
+static bool hdmi_enable_assert(void) {
+    if (!hdmi_enable_line_is_free()) return false;
+    gpio_config_t cfg = {
+        .pin_bit_mask = BIT64(HDMI_ENABLE_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&cfg) != ESP_OK) return false;
+    gpio_set_level(HDMI_ENABLE_GPIO, 1);
+    ESP_LOGW(TAG, "asserted GPIO%d (camera LED line / expansion pin E2) "
+                  "as an HDMI bridge enable -- see camera.md section 5",
+             HDMI_ENABLE_GPIO);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    return true;
+}
+
 static void wait_for_esc(void) {
     while (1) {
         bsp_input_event_t event;
@@ -875,10 +964,29 @@ void app_main(void) {
     // of OV5647/OV5640/OV5645 will bind here depending on what's
     // physically wired to the I2C bus.
     camera_sensor_t sensor = {0};
-    if (camera_sensor_detect(&sensor) != ESP_OK) {
-        splash(RED, WHITE, "Camera error", "No sensor detected");
-        wait_for_esc();
-        return;
+    if (camera_sensor_detect_scoped(&sensor, CAMERA_DETECT_ORDINARY) != ESP_OK) {
+        // Nothing ordinary answered. Only now, and only with explicit
+        // consent, is it worth waking a possible HDMI bridge -- doing
+        // so means driving a pin shared with an expansion header.
+        bool found = false;
+        if (g_cfg.hdmi_probe) {
+            ESP_LOGW(TAG, "no camera found; hdmi_probe is set, trying the "
+                          "HDMI bridge");
+            if (hdmi_enable_assert()) {
+                found = (camera_sensor_detect_scoped(&sensor, CAMERA_DETECT_BRIDGE)
+                         == ESP_OK);
+                if (!found) hdmi_enable_release();
+            }
+        }
+        if (!found) {
+            splash(RED, WHITE, "Camera error", "No sensor detected");
+            wait_for_esc();
+            return;
+        }
+    } else if (sensor.kind == CAMERA_SENSOR_TC358743) {
+        // A bridge that answered without its enable line may still
+        // need it to actually stream.
+        hdmi_enable_assert();
     }
     g_sensor = &sensor;
     esp_cam_sensor_format_t initial_fmt = {0};

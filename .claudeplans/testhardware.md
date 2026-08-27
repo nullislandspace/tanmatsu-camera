@@ -10,7 +10,7 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 1, step 1.8 (1.1-1.7 done, awaiting hardware confirmation)
+CURRENT POSITION: Phase 1, step 1.9 (1.1-1.8 done, awaiting hardware confirmation)
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
@@ -256,7 +256,7 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
   within noise. Confirm the log shows the TC358743 probe failing and the OV driver binding
   after it. Repeat on OV9281.
 
-- `[ ]` **1.8 — GPIO6, two-pass detect.** Gated entirely on `g_cfg.hdmi_probe`; with it off
+- `[x]` **1.8 — GPIO6, two-pass detect.** Gated entirely on `g_cfg.hdmi_probe`; with it off
   none of this runs and GPIO6 is never configured.
   ```
   1. camera_sensor_detect()
