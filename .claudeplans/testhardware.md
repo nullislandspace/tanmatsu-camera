@@ -10,7 +10,7 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 1, step 1.7 (1.1-1.6 done, awaiting hardware confirmation)
+CURRENT POSITION: Phase 1, step 1.8 (1.1-1.7 done, awaiting hardware confirmation)
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
@@ -238,7 +238,7 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
   `hdmi_color_path` changes both buffer size and PPA input colour mode, so its handler must
   call `switch_pipeline_to_source`. `hdmi_yuv_order` is read per frame; no rebuild.
 
-- `[ ]` **1.7 — Vendor the driver component (first OV-visible step).** Copy
+- `[x]` **1.7 — Vendor the driver component (first OV-visible step).** Copy
   `components/esp_cam_sensor_tc358743/` from `a4ca9b7`, all 9 files verbatim except the POR
   fix. Add to `main/CMakeLists.txt` `PRIV_REQUIRES`. Add to `sdkconfigs/tanmatsu` after
   line 53:

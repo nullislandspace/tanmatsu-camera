@@ -51,3 +51,9 @@ CONFIG_CAMERA_OV5640=y
 CONFIG_CAMERA_OV5640_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
 CONFIG_CAMERA_OV9281=y
 CONFIG_CAMERA_OV9281_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
+# Toshiba HDMI-to-MIPI-CSI bridge. Harmless to have compiled in: its
+# detect function just fails an I2C read at 0x0F on a board without
+# one. Whether it is ever probed at all is a runtime setting
+# (hdmi_probe in /sd/camera.cfg), off by default.
+CONFIG_CAMERA_TC358743=y
+CONFIG_CAMERA_TC358743_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y

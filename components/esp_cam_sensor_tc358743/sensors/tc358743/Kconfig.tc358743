@@ -1,0 +1,36 @@
+menuconfig CAMERA_TC358743
+    bool "TC358743"
+    default n
+    depends on SOC_LCDCAM_CAM_SUPPORTED
+    help
+        Enable support for the Toshiba TC358743 HDMI to MIPI CSI-2 bridge.
+
+if CAMERA_TC358743
+    menu "Auto detect TC358743"
+        config CAMERA_TC358743_AUTO_DETECT_MIPI_INTERFACE_SENSOR
+            bool "Detect for MIPI interface sensor"
+            default y
+            help
+                When enabled, the TC358743 will be automatically detected
+                and initialised on the MIPI CSI-2 interface at startup without
+                requiring a manual tc358743_detect() call in the application.
+    endmenu
+
+    config CAMERA_TC358743_MIPI_YUV422_800X480_60FPS
+        bool "MIPI 2-lane, 27 MHz input, 800x480 60fps, YUV422"
+        default y if IDF_TARGET_ESP32P4
+        default n
+        help
+            800x480 at 60 fps in YUV422 format.
+            Requires a 2-lane MIPI CSI-2 interface and a 27 MHz reference
+            clock. CSI-2 lane rate is 972 Mbps (p4kvm's proven waveshare_pi
+            config, far more than the ~184 Mbps this resolution needs).
+            The EDID advertises CVT 800x480 @ 60 Hz to the HDMI source.
+            This is the only supported format.
+
+    config CAMERA_TC358743_MIPI_IF_FORMAT_INDEX_DEFAULT
+        int
+        default 0
+        help
+            Index of the default format (always 0 — only one format exists).
+endif
