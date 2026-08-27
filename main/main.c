@@ -1231,8 +1231,14 @@ void app_main(void) {
                             mode = prev_mode;
                             break;
                         }
+                        // Esc used to stop the recording and leave for
+                        // the launcher in one press, which makes a
+                        // brushed key cost you the take. Recording is
+                        // ended deliberately, with SPACE, and only then
+                        // does Esc mean what it usually means.
                         if (video_is_recording()) {
-                            video_record_stop();
+                            SHOW_BANNER("Recording — SPACE to stop first");
+                            break;
                         }
                         viewer_close();
                         bsp_device_restart_to_launcher();
@@ -1807,21 +1813,28 @@ void app_main(void) {
                     { ICON_F2,  "F2",  "photo"  },
                     { ICON_F3,  "F3",  "video"  },
                     { ICON_F4,  "F4",  "Config" },
-                    { ICON_F5,  "F5",  "full"   },
+                    { ICON_F5,  "F5",  "Fullscreen" },
                     { ICON_ESC, "Esc", "exit"   },
                 };
-                for (size_t k = 0; k < sizeof(krows) / sizeof(krows[0]); k++) {
-                    // F5 is listed only where the key actually does
-                    // something: it is refused in the viewer and the
-                    // config menu, and while recording, because the
-                    // pipeline rebuild it triggers would stop the
-                    // muxer mid-file. That also happens to keep the
-                    // sixth row out of the one configuration where the
-                    // strip has no space for it — recording with both
-                    // a mic and a focus driver active.
+                // While recording, every one of these keys is refused
+                // — a mode switch or an exit would stop the muxer
+                // mid-file. Listing them anyway invites exactly the
+                // brushed keypress the refusal exists to survive, so
+                // say what the state is instead. Dropping the rows also
+                // gives the strip back ~170 px, which is what the
+                // recording layout (REC time, stop hint, audio meter)
+                // needs and never used to have.
+                if (video_is_recording()) {
+                    fbdraw_hershey_string(&fb, HUD_SEP, hud_pad_x, hud_y,
+                                          "keys locked", hud_font);
+                    hud_y += hud_line + 6;
+                }
+                for (size_t k = 0;
+                     !video_is_recording() && k < sizeof(krows) / sizeof(krows[0]);
+                     k++) {
+                    // F5 does nothing outside photo and video mode.
                     if (krows[k].icon == ICON_F5 &&
-                        ((mode != MODE_PHOTO && mode != MODE_VIDEO) ||
-                         video_is_recording())) {
+                        mode != MODE_PHOTO && mode != MODE_VIDEO) {
                         continue;
                     }
                     int label_x = hud_pad_x;
