@@ -1264,6 +1264,12 @@ void app_main(void) {
                         if (video_is_recording()) break;
                         if (mode == MODE_VIEW || mode == MODE_CONFIG) break;
                         fullscreen = !fullscreen;
+                        // Fullscreen hides the HUD, and with it the hint
+                        // that would tell you how to leave — so the only
+                        // moment to say it is on the way in. The banner
+                        // is drawn outside the fullscreen conditional
+                        // for exactly this reason.
+                        if (fullscreen) SHOW_BANNER("F5 exits fullscreen");
                         break;
 
                     case BSP_INPUT_NAVIGATION_KEY_RETURN:
@@ -2037,6 +2043,20 @@ void app_main(void) {
                     HUD_TEXT_LINE(WHITE, dl);
 
                     HUD_TEXT_LINE(WHITE, "UP/DN focus");
+                }
+
+                // Fullscreen hint, deliberately last. The icon rows at
+                // the top of the strip are drawn unconditionally, so
+                // anything added up there costs whatever sits at the
+                // bottom: in video mode with a mic and a focus driver
+                // the strip is already within a line of full, and a
+                // sixth icon row pushes the focus readout past
+                // HUD_BOTTOM_Y. Down here the hint is what yields
+                // instead, which is the right way round — a missing
+                // shortcut hint is recoverable, a missing focus
+                // position is not.
+                if (mode == MODE_PHOTO || mode == MODE_VIDEO) {
+                    HUD_TEXT_LINE(WHITE, "F5 fullscreen");
                 }
                 #undef HUD_TEXT_LINE
                 #undef HUD_BOTTOM_Y
