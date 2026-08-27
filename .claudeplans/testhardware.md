@@ -10,7 +10,7 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 1, step 1.4 (1.1-1.3 done, awaiting hardware confirmation)
+CURRENT POSITION: Phase 1, step 1.5 (1.1-1.4 done, awaiting hardware confirmation)
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
@@ -165,7 +165,7 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
   returning all-zero **before `default:`**; `format_name_for` case. Do not merge the PR's
   `printf` loop or its dead `return`.
 
-- `[ ]` **1.4 — HUD / config-menu gating.** `main/main.c`: `cfg_item_enabled` (`:220-228`)
+- `[x]` **1.4 — HUD / config-menu gating.** `main/main.c`: `cfg_item_enabled` (`:220-228`)
   gains `camera_sensor_has_manual_exposure(...) &&` on the `cam_brightness` row;
   `enter_manual_exposure` (`:476`) and the Q/A handler early-return; HUD exposure rows
   (`~:1589-1607`) skipped. `auto_exposure_possible` needs no change — `autoexposure_init`

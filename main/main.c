@@ -222,8 +222,11 @@ static bool cfg_item_enabled(const cfg_item_t *it) {
     // No automatic exposure to offer if the sensor has no AE loop and
     // the pipeline gives us no luminance statistics to build one from.
     if (it->target == &g_cfg.auto_exposure)  return auto_exposure_possible(g_sensor);
-    // The manual step does nothing while automatic is driving.
-    if (it->target == &g_cfg.cam_brightness) return !g_cfg.auto_exposure;
+    // The manual step does nothing while automatic is driving, and
+    // nothing at all on a sensor with no exposure registers to write.
+    if (it->target == &g_cfg.cam_brightness) {
+        return camera_sensor_has_manual_exposure(g_sensor) && !g_cfg.auto_exposure;
+    }
     return true;
 }
 
@@ -475,6 +478,9 @@ static bool enter_auto_exposure(camera_sensor_t *sensor) {
 // Take exposure away from automatic, seeding the ladder from whatever
 // it had converged to so the picture doesn't jump. The caller applies.
 static void enter_manual_exposure(camera_sensor_t *sensor) {
+    // Nothing to take over on a sensor with no exposure bank. Leaving
+    // g_bright_manual false keeps apply_brightness() a no-op too.
+    if (!camera_sensor_has_manual_exposure(sensor)) return;
     if (g_bright_manual) return;
     camera_exposure_t cur = {0};
     if (autoexposure_is_enabled()) {
@@ -499,6 +505,7 @@ static void enter_manual_exposure(camera_sensor_t *sensor) {
 // reads as "lock the exposure, then trim it" the way it would on any
 // real camera. Stepping below the bottom rung hands control back.
 static void adjust_brightness(camera_sensor_t *sensor, int delta) {
+    if (!camera_sensor_has_manual_exposure(sensor)) return;
     enter_manual_exposure(sensor);
 
     int next = g_bright_step + delta;
@@ -831,7 +838,12 @@ void app_main(void) {
     // This has to run after the fps override: capping to 15 fps
     // doubles VTS, and the exposure ceiling is derived from VTS.
     g_bright_step = g_cfg.cam_brightness;
-    if (g_cfg.auto_exposure && camera_sensor_has_auto_exposure(&sensor)) {
+    if (!camera_sensor_has_manual_exposure(&sensor)) {
+        // No exposure bank to program. Skipping the branches below
+        // also avoids apply_brightness() logging a failure for a
+        // sensor that was never going to accept the write.
+        g_bright_manual = false;
+    } else if (g_cfg.auto_exposure && camera_sensor_has_auto_exposure(&sensor)) {
         // The sensor's own loop is already running and is what "auto"
         // means here. Touching the exposure registers would switch it
         // off, so don't.
@@ -1572,7 +1584,9 @@ void app_main(void) {
             // actually reached the registers, which is what you need
             // when a frame comes back black and you're deciding
             // between "wrong exposure" and "wrong wiring".
-            if (mode == MODE_PHOTO || mode == MODE_VIDEO) {
+            if ((mode == MODE_PHOTO || mode == MODE_VIDEO) &&
+                (camera_sensor_has_manual_exposure(&sensor) ||
+                 auto_exposure_possible(&sensor))) {
                 hud_y += 10;
                 fbdraw_fill_rect(&fb, hud_pad_x, hud_y,
                                  (int)hud_area_w - 20, 1, HUD_SEP);
