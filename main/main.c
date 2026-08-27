@@ -1807,9 +1807,23 @@ void app_main(void) {
                     { ICON_F2,  "F2",  "photo"  },
                     { ICON_F3,  "F3",  "video"  },
                     { ICON_F4,  "F4",  "Config" },
+                    { ICON_F5,  "F5",  "full"   },
                     { ICON_ESC, "Esc", "exit"   },
                 };
                 for (size_t k = 0; k < sizeof(krows) / sizeof(krows[0]); k++) {
+                    // F5 is listed only where the key actually does
+                    // something: it is refused in the viewer and the
+                    // config menu, and while recording, because the
+                    // pipeline rebuild it triggers would stop the
+                    // muxer mid-file. That also happens to keep the
+                    // sixth row out of the one configuration where the
+                    // strip has no space for it — recording with both
+                    // a mic and a focus driver active.
+                    if (krows[k].icon == ICON_F5 &&
+                        ((mode != MODE_PHOTO && mode != MODE_VIDEO) ||
+                         video_is_recording())) {
+                        continue;
+                    }
                     int label_x = hud_pad_x;
                     if (icons_get(krows[k].icon)) {
                         icons_blit(&fb, krows[k].icon, hud_pad_x, hud_y);
@@ -2043,20 +2057,6 @@ void app_main(void) {
                     HUD_TEXT_LINE(WHITE, dl);
 
                     HUD_TEXT_LINE(WHITE, "UP/DN focus");
-                }
-
-                // Fullscreen hint, deliberately last. The icon rows at
-                // the top of the strip are drawn unconditionally, so
-                // anything added up there costs whatever sits at the
-                // bottom: in video mode with a mic and a focus driver
-                // the strip is already within a line of full, and a
-                // sixth icon row pushes the focus readout past
-                // HUD_BOTTOM_Y. Down here the hint is what yields
-                // instead, which is the right way round — a missing
-                // shortcut hint is recoverable, a missing focus
-                // position is not.
-                if (mode == MODE_PHOTO || mode == MODE_VIDEO) {
-                    HUD_TEXT_LINE(WHITE, "F5 fullscreen");
                 }
                 #undef HUD_TEXT_LINE
                 #undef HUD_BOTTOM_Y
