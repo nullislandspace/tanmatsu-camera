@@ -21,6 +21,13 @@ typedef enum {
     // luminance signal regardless of which Bayer position the
     // demosaicer assumes.
     CAMERA_SENSOR_OV9281,
+    // TC358743: not a camera at all, but a Toshiba HDMI-to-MIPI-CSI
+    // bridge that presents itself on the same connector and answers
+    // the same detect protocol. It emits YUV422 at a resolution its
+    // own EDID dictates to whatever is plugged into the HDMI side,
+    // and it carries none of the OmniVision register banks -- no
+    // exposure, no gain, no VTS.
+    CAMERA_SENSOR_TC358743,
 } camera_sensor_kind_t;
 
 // A single detected camera sensor plus the SCCB handle it was opened with.

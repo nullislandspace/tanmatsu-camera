@@ -10,7 +10,7 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 1, step 1.3 (1.1-1.2 done, awaiting hardware confirmation)
+CURRENT POSITION: Phase 1, step 1.4 (1.1-1.3 done, awaiting hardware confirmation)
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
@@ -160,7 +160,7 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
   *Verify:* all reachable kinds have `has_ov_regs = true` → every guard is `if (true)`.
   Test the OV9281 specifically; it already exercises the `gain_reg_h == 0` branch.
 
-- `[ ]` **1.3 — Introduce the sensor kind (still unreachable).** Enum value appended after
+- `[x]` **1.3 — Introduce the sensor kind (still unreachable).** Enum value appended after
   `CAMERA_SENSOR_OV9281`; `SHARED_FORMAT_TC358743`; `name_to_kind` strcmp; `ae_caps` case
   returning all-zero **before `default:`**; `format_name_for` case. Do not merge the PR's
   `printf` loop or its dead `return`.

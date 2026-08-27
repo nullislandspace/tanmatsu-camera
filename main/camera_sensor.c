@@ -31,6 +31,10 @@ static const char *TAG = "camera_sensor";
 // and video, identical handling to the OV5640/45 RGB565 sensors —
 // PHOTO↔VIDEO is a no-op format-wise.
 #define SHARED_FORMAT_OV9281    "MIPI_2lane_24Minput_RAW10_1280x800_30fps"
+// The TC358743 ships exactly one format, and its EDID advertises the
+// matching mode as the only one it supports, so the HDMI source is
+// told to send precisely this. Preview and video share it.
+#define SHARED_FORMAT_TC358743  "MIPI_2lane_27Minput_YUV422_800x480_60fps"
 
 // OmniVision Timing Group VTS (vertical total size / frame length in
 // lines) register pair. Identical on OV5640, OV5645 and OV5647 — it is
@@ -92,6 +96,11 @@ static sensor_ae_caps_t ae_caps(camera_sensor_kind_t kind) {
             // ceiling of VTS-12 matches the mainline Linux ov9282
             // driver's OV9282_EXPOSURE_OFFSET.
             return (sensor_ae_caps_t){ true, false, 0x0000, 0x3509, 0x00FF, 12 };
+        case CAMERA_SENSOR_TC358743:
+            // An HDMI receiver, not an imager. There is no exposure,
+            // no gain and no frame-length bank to speak of, and its
+            // register space is a different map entirely.
+            return (sensor_ae_caps_t){ false, false, 0x0000, 0x0000, 0x0000, 0 };
         case CAMERA_SENSOR_OV5647:
         case CAMERA_SENSOR_OV5640:
         case CAMERA_SENSOR_OV5645:
@@ -116,6 +125,7 @@ static camera_sensor_kind_t name_to_kind(const char *name) {
     if (strcmp(name, "OV5640") == 0) return CAMERA_SENSOR_OV5640;
     if (strcmp(name, "OV5645") == 0) return CAMERA_SENSOR_OV5645;
     if (strcmp(name, "OV9281") == 0) return CAMERA_SENSOR_OV9281;
+    if (strcmp(name, "TC358743") == 0) return CAMERA_SENSOR_TC358743;
     return CAMERA_SENSOR_UNKNOWN;
 }
 
@@ -300,6 +310,8 @@ static const char *format_name_for(const camera_sensor_t *sensor, bool video) {
             // Monochrome RAW10 1280x800. Same format string for both
             // modes — OV9281 has no dedicated low-res video preset.
             return SHARED_FORMAT_OV9281;
+        case CAMERA_SENSOR_TC358743:
+            return SHARED_FORMAT_TC358743;
         case CAMERA_SENSOR_UNKNOWN:
         default:
             // Unknown sensor — fall back to the OV5647 names. If the
