@@ -10,13 +10,13 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 1, not started
+CURRENT POSITION: Phase 1, step 1.2 (1.1 done, awaiting hardware confirmation)
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
 |---|---|---|---|
 | 0 | Land this plan in the repo | yes | `[x]` |
-| 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[ ]` |
+| 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[~]` |
 | 2 | F5 fullscreen | yes | `[ ]` |
 | 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[ ]` |
 | 4 | BLE transport scaffold | no | `[ ]` |
@@ -134,7 +134,7 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
 
 ### Steps
 
-- `[ ]` **1.1 — Fix the latent `esp_isp_enable` abort.** `main/camera_pipeline.c`: add
+- `[x]` **1.1 — Fix the latent `esp_isp_enable` abort.** `main/camera_pipeline.c`: add
   `static bool s_isp_enabled`, guard the enable at `:504` with `if (bayer_input)`, guard
   `esp_isp_disable` at `:632` with the flag, clear on the `fail:` path. Comment citing
   `isp_core.c:234`. *Verify:* `bayer_input` is true for RAW8/RAW10 → OV path identical.
@@ -420,6 +420,9 @@ on the P4, already shared with the CSI/PPA/H.264 working set.
   calls — no `ble_peer.c`, no `catprinter.c`, no UI. Build.
 - `[ ]` **3.2** Record `idf.py size` / `size-components` before and after. **Gate: does the
   binary still fit in 2048 KB, with headroom?**
+  **Baseline measured at step 1.1: `application.bin` = 0xccfd0 = 838096 bytes (819 KB),
+  leaving 0x133030 = 1257520 bytes (60%) free in the 2048 KB partition.** Re-measure at
+  the end of phase 2 before adding the radio, so the delta is attributable.
 - `[ ]` **3.3** Add heap logging to `app_main` (there is none today):
   `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)` and `MALLOC_CAP_SPIRAM`, logged before
   radio init, after radio init, and after `camera_preview_start`. **Gate: how much internal

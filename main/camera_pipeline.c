@@ -70,6 +70,16 @@ static esp_cam_ctlr_handle_t s_csi      = NULL;
 static isp_proc_handle_t     s_isp      = NULL;
 static ppa_client_handle_t   s_ppa      = NULL;
 
+// Whether esp_isp_enable() was actually called on s_isp. It cannot be
+// called for a bypassed processor -- esp_isp_enable() opens with
+//   ESP_RETURN_ON_FALSE(proc->bypass_isp == false, ESP_ERR_INVALID_STATE,
+//                       TAG, "processor is configured to be bypassed");
+// (esp-idf/components/esp_driver_isp/src/isp_core.c:234) -- and
+// esp_isp_disable() likewise refuses a processor that was never
+// enabled. So the enable/disable pair has to be tracked rather than
+// assumed, and only the demosaicer path gets it.
+static bool                  s_isp_enabled = false;
+
 // DOUBLE-BUFFERED CSI TARGETS. The ESP-IDF CSI driver only lets us
 // queue one trans at a time (queue_items=1) and the on_get_new_trans
 // callback has to return a buffer every time it fires, so we flip
@@ -501,7 +511,17 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
         ESP_LOGE(TAG, "esp_isp_new_processor: %d", err);
         goto fail;
     }
-    ESP_ERROR_CHECK(esp_isp_enable(s_isp));
+    // Only the Bayer path runs the ISP as a demosaicer; bypass_isp is
+    // set from !bayer_input just above, and enabling a bypassed
+    // processor is an error the driver reports rather than tolerates.
+    // This used to be unconditional, which meant every non-Bayer
+    // sensor aborted here inside the ESP_ERROR_CHECK -- the RGB565
+    // OV5640/OV5645 path has never actually run.
+    s_isp_enabled = false;
+    if (bayer_input) {
+        ESP_ERROR_CHECK(esp_isp_enable(s_isp));
+        s_isp_enabled = true;
+    }
 
     // Hardware autofocus statistics tap. Only meaningful when the ISP
     // is running as a demosaicer — the AF block consumes ISP edge
@@ -629,7 +649,10 @@ void camera_preview_stop(void) {
     if (s_isp) {
         autofocus_shutdown();
         autoexposure_shutdown();
-        esp_isp_disable(s_isp);
+        if (s_isp_enabled) {
+            esp_isp_disable(s_isp);
+            s_isp_enabled = false;
+        }
         esp_isp_del_processor(s_isp);
         s_isp = NULL;
     }
