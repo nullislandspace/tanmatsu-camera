@@ -69,6 +69,14 @@ static const char *TAG = "camera_sensor";
 
 // Per-sensor description of that bank.
 typedef struct {
+    // Does this part carry the OmniVision timing/AEC/AGC bank at all?
+    // False means every 0x35xx / 0x380x access below is not merely
+    // meaningless but unsafe: camera_sensor_read_reg/write_reg go
+    // through ESP_CAM_SENSOR_IOC_G_REG/S_REG, which each driver
+    // implements against its own address space. On the TC358743 that
+    // is a live 16-bit write, so "exposure register 0x3503" lands on
+    // whatever the Toshiba bridge happens to keep at 0x3503.
+    bool     has_ov_regs;
     bool     has_auto_ae;  // on-chip AE loop that must be switched off first
     uint16_t gain_reg_h;   // 0 = gain is a single byte at gain_reg_l
     uint16_t gain_reg_l;
@@ -83,7 +91,7 @@ static sensor_ae_caps_t ae_caps(camera_sensor_kind_t kind) {
             // at 0x3509 (0x10 = 1.0x .. 0xFF = 15.94x). The exposure
             // ceiling of VTS-12 matches the mainline Linux ov9282
             // driver's OV9282_EXPOSURE_OFFSET.
-            return (sensor_ae_caps_t){ false, 0x0000, 0x3509, 0x00FF, 12 };
+            return (sensor_ae_caps_t){ true, false, 0x0000, 0x3509, 0x00FF, 12 };
         case CAMERA_SENSOR_OV5647:
         case CAMERA_SENSOR_OV5640:
         case CAMERA_SENSOR_OV5645:
@@ -93,7 +101,7 @@ static sensor_ae_caps_t ae_caps(camera_sensor_kind_t kind) {
             // the detect loop already proved this chip answers to the
             // standard OV register bank, and the 5MP layout is the one
             // every OV part except the OV9281 uses.
-            return (sensor_ae_caps_t){ true, 0x350A, 0x350B, 0x03FF, 4 };
+            return (sensor_ae_caps_t){ true, true, 0x350A, 0x350B, 0x03FF, 4 };
     }
 }
 
@@ -124,6 +132,11 @@ static void capture_fps_base(camera_sensor_t *sensor, const esp_cam_sensor_forma
 
     sensor->cur_vts_lines   = 0;
     sensor->row_time_ns     = 0;
+
+    // Nothing below applies to a part without the OV bank. Leaving
+    // base_vts_lines and row_time_ns at 0 is also what makes the
+    // exposure and fps entry points refuse cleanly further down.
+    if (!ae_caps(sensor->kind).has_ov_regs) return;
 
     uint8_t vts_h = 0, vts_l = 0;
     if (camera_sensor_read_reg(sensor, OV_REG_TIMING_VTS_H, &vts_h) != ESP_OK) return;
@@ -398,6 +411,11 @@ esp_err_t camera_sensor_set_preview_fps(camera_sensor_t *sensor, uint32_t target
     if (sensor == NULL || target_fps == 0) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!ae_caps(sensor->kind).has_ov_regs) {
+        // No VTS bank to stretch. The frame rate of a bridge chip is
+        // whatever its upstream source sends.
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     if (sensor->base_vts_lines == 0 || sensor->base_fps == 0) {
         // No active format captured yet — caller forgot to call
         // camera_sensor_set_format_*() first, or the VTS read-back
@@ -465,6 +483,11 @@ bool camera_sensor_has_auto_exposure(const camera_sensor_t *sensor) {
     return ae_caps(sensor->kind).has_auto_ae;
 }
 
+bool camera_sensor_has_manual_exposure(const camera_sensor_t *sensor) {
+    if (sensor == NULL) return false;
+    return ae_caps(sensor->kind).has_ov_regs;
+}
+
 uint32_t camera_sensor_eg_min_us(const camera_sensor_t *sensor) {
     if (sensor == NULL || sensor->row_time_ns == 0) return 1;
     // One row at unity gain is the shortest thing we can express.
@@ -484,6 +507,7 @@ uint32_t camera_sensor_eg_max_us(const camera_sensor_t *sensor) {
 esp_err_t camera_sensor_set_exposure_eg(camera_sensor_t *sensor, uint32_t eg_us,
                                         camera_exposure_t *out) {
     if (sensor == NULL || sensor->device == NULL) return ESP_ERR_INVALID_ARG;
+    if (!ae_caps(sensor->kind).has_ov_regs) return ESP_ERR_NOT_SUPPORTED;
     if (sensor->row_time_ns == 0) {
         // No format bound yet, or the VTS read-back in capture_fps_base
         // failed. Without a row time we cannot turn microseconds into
@@ -586,6 +610,7 @@ esp_err_t camera_sensor_set_brightness(camera_sensor_t *sensor, int step,
 esp_err_t camera_sensor_read_exposure(camera_sensor_t *sensor, camera_exposure_t *out) {
     if (sensor == NULL || sensor->device == NULL || out == NULL) return ESP_ERR_INVALID_ARG;
     const sensor_ae_caps_t caps = ae_caps(sensor->kind);
+    if (!caps.has_ov_regs) return ESP_ERR_NOT_SUPPORTED;
 
     uint8_t h = 0, m = 0, l = 0;
     if (camera_sensor_read_reg(sensor, OV_REG_EXP_H, &h) != ESP_OK) return ESP_FAIL;
@@ -633,6 +658,7 @@ int camera_sensor_brightness_step_for(const camera_sensor_t *sensor,
 esp_err_t camera_sensor_set_auto_exposure(camera_sensor_t *sensor) {
     if (sensor == NULL || sensor->device == NULL) return ESP_ERR_INVALID_ARG;
     const sensor_ae_caps_t caps = ae_caps(sensor->kind);
+    if (!caps.has_ov_regs)      return ESP_ERR_NOT_SUPPORTED;
     if (!caps.has_auto_ae)      return ESP_ERR_NOT_SUPPORTED;
     if (!sensor->ae_mode_valid) return ESP_OK;  // never took over, nothing to undo
     return camera_sensor_write_reg(sensor, OV_REG_AEC_MODE, sensor->ae_mode_saved);

@@ -10,7 +10,7 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 1, step 1.2 (1.1 done, awaiting hardware confirmation)
+CURRENT POSITION: Phase 1, step 1.3 (1.1-1.2 done, awaiting hardware confirmation)
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
@@ -140,7 +140,7 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
   `isp_core.c:234`. *Verify:* `bayer_input` is true for RAW8/RAW10 → OV path identical.
   Flash; check preview, photo, video, F1/F2/F3 (these exercise `camera_preview_stop`).
 
-- `[ ]` **1.2 — Capability gate for the OmniVision register bank.**
+- `[x]` **1.2 — Capability gate for the OmniVision register bank.**
   `main/camera_sensor.{c,h}`: extend `sensor_ae_caps_t` (`:71-77`) with a leading
   `bool has_ov_regs` rather than adding a parallel `sensor_is_omnivision()` predicate — the
   struct already *is* the per-kind register-bank description (`gain_reg_h/l`,

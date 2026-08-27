@@ -161,6 +161,14 @@ typedef struct {
 // which is why it needs this control far more than the others.
 bool camera_sensor_has_auto_exposure(const camera_sensor_t *sensor);
 
+// True when the sensor exposes an exposure/gain register bank we know
+// how to drive at all. False for bridge chips that carry no imaging
+// pipeline of their own, in which case every exposure entry point
+// below returns ESP_ERR_NOT_SUPPORTED and the caller should hide its
+// exposure controls rather than issue writes that would land on
+// unrelated registers of a completely different chip.
+bool camera_sensor_has_manual_exposure(const camera_sensor_t *sensor);
+
 // Apply a brightness step (clamped to CAMERA_BRIGHT_MIN..MAX). Switches
 // the sensor's AEC/AGC to manual first when it has an auto loop, then
 // writes the exposure and analog-gain registers. The resolved values
