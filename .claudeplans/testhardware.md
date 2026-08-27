@@ -10,14 +10,14 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 1 code complete (1.1-1.10). Untested on any hardware.
+CURRENT POSITION: Phase 2 code complete. Phase 1 + 2 both untested on hardware. Next: phase 3.
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
 |---|---|---|---|
 | 0 | Land this plan in the repo | yes | `[x]` |
 | 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[~]` code done, untested |
-| 2 | F5 fullscreen | yes | `[ ]` |
+| 2 | F5 fullscreen | yes | `[~]` code done, untested |
 | 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[ ]` |
 | 4 | BLE transport scaffold | no | `[ ]` |
 | 5 | Catprinter protocol driver | no | `[ ]` |
@@ -429,17 +429,31 @@ Geometry checks out. `camera_preview_start:335-352` gives:
 | OV5647 1920×1080 | existing | frag 6 → 720×480 |
 | OV9281 1280×800 | existing | frag 9 → 720×450 |
 
-The 1:1 fullscreen mode is clearly why the author wanted this.
+The 1:1 fullscreen mode is clearly why the author wanted this. Measured, both layouts,
+panel-native w x h after the 90 degree rotation:
 
-- `[ ]` **2.1** De-`const` `preview_area_w/h`, `hud_area_x/w` (`main.c:886-889`). Keep the
+| Sensor | Source | Windowed (600x480) | Fullscreen (800x480) |
+|---|---|---|---|
+| OV5647 photo | 1920x1080 | 5/16 -> 337x600 | 6/16 -> 405x720 |
+| OV5647 video | 800x640 | 12/16 -> 480x600 **exact** | 12/16 -> 480x600 |
+| OV9281 | 1280x800 | 7/16 -> 350x560 | 9/16 -> 450x720 |
+| OV5640 | 1280x720 | 7/16 -> 315x560 | 10/16 -> 450x800 |
+| OV5645 | 1280x960 | 7/16 -> 420x560 | 8/16 -> 480x640 |
+| TC358743 | 800x480 | 12/16 -> 360x600 | **16/16 -> 480x800, exact 1:1, no bars** |
+
+Note the OV5647 video preset is the one case where fullscreen is not an improvement:
+5:4 content in an 800-wide area still lands on 12/16, so it gains nothing and picks up
+100 px pillars. Not a bug, just geometry.
+
+- `[x]` **2.1** De-`const` `preview_area_w/h`, `hud_area_x/w` (`main.c:886-889`). Keep the
   derived expressions (`hud_area_x = preview_area_w`) rather than the PR's hardcoded `600`.
-- `[ ]` **2.2** `bool fullscreen = false;` near `prev_mode` (`~:738`). F5 handler: no-op
+- `[x]` **2.2** `bool fullscreen = false;` near `prev_mode` (`~:738`). F5 handler: no-op
   while recording, no-op in `MODE_VIEW`/`MODE_CONFIG`, else toggle and
   `switch_pipeline_to_source(...)`. `BSP_INPUT_NAVIGATION_KEY_F5` exists
   (`badge-bsp/bsp/input.h:177`) and is currently unbound.
-- `[ ]` **2.3** Wrap the HUD block (`:1420-1408`) in `if (!fullscreen)` **and re-indent the
+- `[x]` **2.3** Wrap the HUD block (`:1420-1408`) in `if (!fullscreen)` **and re-indent the
   body.** The PR left it un-indented, which poisons every future diff of that region.
-- `[ ]` **2.4** Force `preview_bars_dirty = 2` in the F5 handler — the geometry check at
+- `[x]` **2.4** Force `preview_bars_dirty = 2` in the F5 handler — the geometry check at
   `:1332` catches `pw` changes but not `preview_area_w` changes.
 
 *Verify:* F5 in photo and video mode on both sensors; toggle and back; no stale HUD pixels;

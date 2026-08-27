@@ -46,6 +46,10 @@ static char const TAG[] = "main";
 // time a source needs to read our EDID and start sending TMDS after
 // set_stream() raises HPD, which is comfortably over a second; a
 // shorter trigger would interrupt a link that was about to come up.
+// Width of the preview area with the HUD strip visible. The strip
+// takes the remaining 200 px of the 800 px panel.
+#define PREVIEW_AREA_W_WINDOWED 600u
+
 #define NO_FRAME_REBUILD_MS   4000u
 #define NO_FRAME_COOLDOWN_MS  5000u
 
@@ -1084,10 +1088,16 @@ void app_main(void) {
     // height.
     const uint32_t logical_w       = fb.user_w;                  // 800
     const uint32_t logical_h       = fb.user_h;                  // 480
-    const uint32_t preview_area_w  = 600;
-    const uint32_t preview_area_h  = logical_h;                  // 480
-    const uint32_t hud_area_x      = preview_area_w;             // 600
-    const uint32_t hud_area_w      = logical_w - preview_area_w; // 200
+
+    // Not const: F5 gives the preview the whole panel and hides the
+    // HUD. The derived values are recomputed from preview_area_w
+    // rather than re-hardcoded, so there is exactly one place that
+    // knows how wide the strip is.
+    bool     fullscreen     = false;
+    uint32_t preview_area_w = PREVIEW_AREA_W_WINDOWED;
+    uint32_t preview_area_h = logical_h;                       // 480
+    uint32_t hud_area_x     = preview_area_w;                  // 600
+    uint32_t hud_area_w     = logical_w - preview_area_w;      // 200
 
     camera_source_t initial_src = pick_source(sensor.kind, false, &initial_fmt);
     g_last_video_mode = false;
@@ -1237,6 +1247,23 @@ void app_main(void) {
                             mode      = MODE_CONFIG;
                             g_cfg_sel = 0;
                         }
+                        break;
+
+                    case BSP_INPUT_NAVIGATION_KEY_F5:
+                        // Give the preview the whole panel and hide the
+                        // HUD. Not while recording: the pipeline rebuild
+                        // below would stop the muxer mid-file. Not in the
+                        // viewer or the config menu either, where there
+                        // is no preview to enlarge and the HUD is the
+                        // interface.
+                        // Recording would be stopped by the pipeline
+                        // rebuild this eventually triggers. In the
+                        // viewer and the config menu there is no
+                        // preview to enlarge, and the toggle would
+                        // look like it had done nothing.
+                        if (video_is_recording()) break;
+                        if (mode == MODE_VIEW || mode == MODE_CONFIG) break;
+                        fullscreen = !fullscreen;
                         break;
 
                     case BSP_INPUT_NAVIGATION_KEY_RETURN:
@@ -1394,6 +1421,41 @@ void app_main(void) {
                     adjust_brightness(&sensor, (kc == 'q' || kc == 'Q') ? +1 : -1);
                 }
             }
+        }
+
+        // Fullscreen only means anything where there is a preview to
+        // enlarge. The viewer and the config menu always get the
+        // windowed layout, so their HUD has somewhere to live —
+        // otherwise entering the viewer from a fullscreen preview
+        // strands you with no hints and no way back, since F5 is
+        // rightly inert there.
+        const bool layout_fullscreen =
+            fullscreen && (mode == MODE_PHOTO || mode == MODE_VIDEO);
+        const uint32_t want_area_w =
+            layout_fullscreen ? logical_w : PREVIEW_AREA_W_WINDOWED;
+        if (want_area_w != preview_area_w) {
+            preview_area_w = want_area_w;
+            hud_area_x     = preview_area_w;
+            hud_area_w     = logical_w - preview_area_w;
+            // The margins move and the HUD strip changes hands.
+            preview_bars_dirty = 2;
+        }
+
+        // Rebuild only when the preview's target size has actually
+        // changed AND something is going to draw it. That keeps F4 and
+        // F1 as cheap as they have always been, and defers the cost of
+        // an F5 pressed just before F1 until it is worth paying — which
+        // matters most on the HDMI bridge, where every rebuild drops
+        // HPD and costs seconds of renegotiation.
+        if (mode != MODE_VIEW && mode != MODE_CONFIG &&
+            preview_area_w != g_preview_area_w && !video_is_recording()) {
+            esp_err_t ferr = switch_pipeline_to_source(&sensor, mode == MODE_VIDEO,
+                                                       preview_area_w, preview_area_h);
+            if (ferr != ESP_OK) {
+                SHOW_BANNER("Fullscreen failed (%d)", ferr);
+                fullscreen = false;
+            }
+            preview_bars_dirty = 2;
         }
 
         // Pull one frame from the preview pipeline in photo/video mode.
@@ -1692,296 +1754,300 @@ void app_main(void) {
                 autofocus_tick(&g_focus_pos);
             }
 
-            // HUD strip on the right. All coordinates are in the 200-pixel
-            // wide user-space strip starting at hud_area_x.
-            const int hud_pad_x = (int)hud_area_x + 10;
-            const int hud_font  = 16;
-            const int hud_line  = hud_font + 4;
-            int hud_y = 14;
+            // The HUD strip is hidden in fullscreen; hud_font is not,
+            // because the transient banner below still uses it.
+            const int hud_font = 16;
+            if (!layout_fullscreen) {
+                // HUD strip on the right. All coordinates are in the 200-pixel
+                // wide user-space strip starting at hud_area_x.
+                const int hud_pad_x = (int)hud_area_x + 10;
+                const int hud_line  = hud_font + 4;
+                int hud_y = 14;
 
-            // The strip is a fixed 480 px tall and three of the blocks
-            // below are variable-height (audio meter, exposure, focus),
-            // so recording video with both a mic and a focus driver
-            // active can run them into the sensor-name footer pinned at
-            // y=458. Drop whatever no longer fits instead of
-            // overprinting it — a missing hint line is recoverable, an
-            // unreadable one is not.
-            #define HUD_BOTTOM_Y   440
-            #define HUD_TEXT_LINE(col, str)                                        \
-                do {                                                               \
-                    if (hud_y + hud_font <= HUD_BOTTOM_Y) {                        \
-                        fbdraw_hershey_string(&fb, (col), hud_pad_x, hud_y,        \
-                                              (str), hud_font);                    \
-                        hud_y += hud_line;                                         \
-                    }                                                              \
-                } while (0)
+                // The strip is a fixed 480 px tall and three of the blocks
+                // below are variable-height (audio meter, exposure, focus),
+                // so recording video with both a mic and a focus driver
+                // active can run them into the sensor-name footer pinned at
+                // y=458. Drop whatever no longer fits instead of
+                // overprinting it — a missing hint line is recoverable, an
+                // unreadable one is not.
+                #define HUD_BOTTOM_Y   440
+                #define HUD_TEXT_LINE(col, str)                                        \
+                    do {                                                               \
+                        if (hud_y + hud_font <= HUD_BOTTOM_Y) {                        \
+                            fbdraw_hershey_string(&fb, (col), hud_pad_x, hud_y,        \
+                                                  (str), hud_font);                    \
+                            hud_y += hud_line;                                         \
+                        }                                                              \
+                    } while (0)
 
-            // Mode header in a contrasting colour.
-            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
-                                  mode_name(mode), 20);
-            hud_y += 28;
+                // Mode header in a contrasting colour.
+                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
+                                      mode_name(mode), 20);
+                hud_y += 28;
 
-            // Key hint lines: 32x32 colour icon + label, with the
-            // text fallback ("F1", etc.) used when the launcher icon
-            // PNGs aren't installed yet.
-            #define KEY_ROW_H    32
-            #define KEY_ICON_GAP 6
-            #define KEY_TEXT_DY  ((KEY_ROW_H - hud_font) / 2)
-            const struct {
-                icon_key_t  icon;
-                const char *fallback;
-                const char *label;
-            } krows[] = {
-                { ICON_F1,  "F1",  "view"   },
-                { ICON_F2,  "F2",  "photo"  },
-                { ICON_F3,  "F3",  "video"  },
-                { ICON_F4,  "F4",  "Config" },
-                { ICON_ESC, "Esc", "exit"   },
-            };
-            for (size_t k = 0; k < sizeof(krows) / sizeof(krows[0]); k++) {
-                int label_x = hud_pad_x;
-                if (icons_get(krows[k].icon)) {
-                    icons_blit(&fb, krows[k].icon, hud_pad_x, hud_y);
-                    label_x = hud_pad_x + icons_width(krows[k].icon) + KEY_ICON_GAP;
-                } else {
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y + KEY_TEXT_DY,
-                                          krows[k].fallback, hud_font);
-                    label_x = hud_pad_x + 36;
-                }
-                fbdraw_hershey_string(&fb, WHITE, label_x, hud_y + KEY_TEXT_DY,
-                                      krows[k].label, hud_font);
-                hud_y += KEY_ROW_H + 2;
-            }
-            hud_y += 4;
-
-            // Mode-specific hint and state.
-            switch (mode) {
-                case MODE_PHOTO:
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE photo", hud_font);
-                    hud_y += hud_line;
-                    break;
-                case MODE_VIDEO:
-                    if (video_is_recording()) {
-                        uint32_t ms = video_recording_duration_ms();
-                        uint32_t s  = ms / 1000u;
-                        char rec_line[32];
-                        snprintf(rec_line, sizeof(rec_line), "REC %02u:%02u",
-                                 (unsigned)(s / 60u), (unsigned)(s % 60u));
-                        fbdraw_hershey_string(&fb, RED, hud_pad_x, hud_y, rec_line, hud_font);
-                        hud_y += hud_line;
-                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE stop", hud_font);
-                        hud_y += hud_line;
+                // Key hint lines: 32x32 colour icon + label, with the
+                // text fallback ("F1", etc.) used when the launcher icon
+                // PNGs aren't installed yet.
+                #define KEY_ROW_H    32
+                #define KEY_ICON_GAP 6
+                #define KEY_TEXT_DY  ((KEY_ROW_H - hud_font) / 2)
+                const struct {
+                    icon_key_t  icon;
+                    const char *fallback;
+                    const char *label;
+                } krows[] = {
+                    { ICON_F1,  "F1",  "view"   },
+                    { ICON_F2,  "F2",  "photo"  },
+                    { ICON_F3,  "F3",  "video"  },
+                    { ICON_F4,  "F4",  "Config" },
+                    { ICON_ESC, "Esc", "exit"   },
+                };
+                for (size_t k = 0; k < sizeof(krows) / sizeof(krows[0]); k++) {
+                    int label_x = hud_pad_x;
+                    if (icons_get(krows[k].icon)) {
+                        icons_blit(&fb, krows[k].icon, hud_pad_x, hud_y);
+                        label_x = hud_pad_x + icons_width(krows[k].icon) + KEY_ICON_GAP;
                     } else {
-                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE rec", hud_font);
-                        hud_y += hud_line;
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y + KEY_TEXT_DY,
+                                              krows[k].fallback, hud_font);
+                        label_x = hud_pad_x + 36;
                     }
-                    // Audio level meter. Shown whenever the mic is
-                    // actually running so the user can verify at a
-                    // glance that sound is reaching the chip — no
-                    // need to record, transfer and play back a clip
-                    // just to check wiring / enable. Peak value is
-                    // [0..32767]; we map it to a bar that fills the
-                    // HUD strip width minus the pad on either side.
-                    if (microphone_is_running()) {
-                        // Digital gain readout. Shown above the peak
-                        // bar so the user knows what VOL+/- adjusts
-                        // without having to enter the config menu.
-                        // mic_gain is a step on a ~3 dB ladder, so we
-                        // show the step (what VOL+/- and the config
-                        // menu move) alongside the factor it actually
-                        // applies.
-                        char gain_line[24];
-                        snprintf(gain_line, sizeof(gain_line),
-                                 "Gain %d (%dx)", g_cfg.mic_gain,
-                                 microphone_gain_multiplier(g_cfg.mic_gain));
-                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
-                                              gain_line, hud_font);
-                        hud_y += hud_line;
+                    fbdraw_hershey_string(&fb, WHITE, label_x, hud_y + KEY_TEXT_DY,
+                                          krows[k].label, hud_font);
+                    hud_y += KEY_ROW_H + 2;
+                }
+                hud_y += 4;
 
-                        uint16_t peak    = microphone_peak_level();
-                        int      bar_x   = hud_pad_x;
-                        int      bar_w   = (int)hud_area_w - 20;
-                        int      bar_h   = 8;
-                        int      fill_w  = (int)((uint32_t)peak * (uint32_t)bar_w / 32768u);
-                        if (fill_w > bar_w) fill_w = bar_w;
-                        // Colour shifts green → yellow → red as the
-                        // signal approaches clipping, matching the
-                        // convention every audio tool on the planet
-                        // uses so the user reads it instantly.
-                        uint16_t fill_col =
-                            (peak > 26000) ? RED :
-                            (peak > 16000) ? YELLOW :
-                                             fbdraw_rgb(0, 200, 0);
-                        fbdraw_fill_rect(&fb, bar_x, hud_y, bar_w, bar_h, HUD_BG);
-                        if (fill_w > 0) {
-                            fbdraw_fill_rect(&fb, bar_x, hud_y, fill_w, bar_h, fill_col);
+                // Mode-specific hint and state.
+                switch (mode) {
+                    case MODE_PHOTO:
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE photo", hud_font);
+                        hud_y += hud_line;
+                        break;
+                    case MODE_VIDEO:
+                        if (video_is_recording()) {
+                            uint32_t ms = video_recording_duration_ms();
+                            uint32_t s  = ms / 1000u;
+                            char rec_line[32];
+                            snprintf(rec_line, sizeof(rec_line), "REC %02u:%02u",
+                                     (unsigned)(s / 60u), (unsigned)(s % 60u));
+                            fbdraw_hershey_string(&fb, RED, hud_pad_x, hud_y, rec_line, hud_font);
+                            hud_y += hud_line;
+                            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE stop", hud_font);
+                            hud_y += hud_line;
+                        } else {
+                            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE rec", hud_font);
+                            hud_y += hud_line;
                         }
-                        hud_y += bar_h + 4;
-                    }
-                    break;
-                case MODE_VIEW:
-                    if (viewer_has_image()) {
-                        char line[32];
-                        snprintf(line, sizeof(line), "%d / %d",
-                                 viewer_get_index() + 1, viewer_get_total());
-                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, line, hud_font);
-                        hud_y += hud_line;
-                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "< newer", hud_font); hud_y += hud_line;
-                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "> older", hud_font); hud_y += hud_line;
+                        // Audio level meter. Shown whenever the mic is
+                        // actually running so the user can verify at a
+                        // glance that sound is reaching the chip — no
+                        // need to record, transfer and play back a clip
+                        // just to check wiring / enable. Peak value is
+                        // [0..32767]; we map it to a bar that fills the
+                        // HUD strip width minus the pad on either side.
+                        if (microphone_is_running()) {
+                            // Digital gain readout. Shown above the peak
+                            // bar so the user knows what VOL+/- adjusts
+                            // without having to enter the config menu.
+                            // mic_gain is a step on a ~3 dB ladder, so we
+                            // show the step (what VOL+/- and the config
+                            // menu move) alongside the factor it actually
+                            // applies.
+                            char gain_line[24];
+                            snprintf(gain_line, sizeof(gain_line),
+                                     "Gain %d (%dx)", g_cfg.mic_gain,
+                                     microphone_gain_multiplier(g_cfg.mic_gain));
+                            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y,
+                                                  gain_line, hud_font);
+                            hud_y += hud_line;
+
+                            uint16_t peak    = microphone_peak_level();
+                            int      bar_x   = hud_pad_x;
+                            int      bar_w   = (int)hud_area_w - 20;
+                            int      bar_h   = 8;
+                            int      fill_w  = (int)((uint32_t)peak * (uint32_t)bar_w / 32768u);
+                            if (fill_w > bar_w) fill_w = bar_w;
+                            // Colour shifts green → yellow → red as the
+                            // signal approaches clipping, matching the
+                            // convention every audio tool on the planet
+                            // uses so the user reads it instantly.
+                            uint16_t fill_col =
+                                (peak > 26000) ? RED :
+                                (peak > 16000) ? YELLOW :
+                                                 fbdraw_rgb(0, 200, 0);
+                            fbdraw_fill_rect(&fb, bar_x, hud_y, bar_w, bar_h, HUD_BG);
+                            if (fill_w > 0) {
+                                fbdraw_fill_rect(&fb, bar_x, hud_y, fill_w, bar_h, fill_col);
+                            }
+                            hud_y += bar_h + 4;
+                        }
+                        break;
+                    case MODE_VIEW:
+                        if (viewer_has_image()) {
+                            char line[32];
+                            snprintf(line, sizeof(line), "%d / %d",
+                                     viewer_get_index() + 1, viewer_get_total());
+                            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, line, hud_font);
+                            hud_y += hud_line;
+                            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "< newer", hud_font); hud_y += hud_line;
+                            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "> older", hud_font); hud_y += hud_line;
+                        } else {
+                            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "no pics", hud_font);
+                            hud_y += hud_line;
+                        }
+                        break;
+                    case MODE_CONFIG:
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "UP/DN sel",   hud_font); hud_y += hud_line;
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE tog",   hud_font); hud_y += hud_line;
+                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F4/Esc back", hud_font); hud_y += hud_line;
+                        break;
+                }
+
+                // Exposure readout. Drawn identically in PHOTO and VIDEO
+                // so the value you trim while framing is visibly the same
+                // value you record with — on a sensor with no on-chip AE
+                // this is the single most important number on the screen.
+                // The step is what Q/A move; the line underneath is what
+                // actually reached the registers, which is what you need
+                // when a frame comes back black and you're deciding
+                // between "wrong exposure" and "wrong wiring".
+                if ((mode == MODE_PHOTO || mode == MODE_VIDEO) &&
+                    (camera_sensor_has_manual_exposure(&sensor) ||
+                     auto_exposure_possible(&sensor))) {
+                    hud_y += 10;
+                    fbdraw_fill_rect(&fb, hud_pad_x, hud_y,
+                                     (int)hud_area_w - 20, 1, HUD_SEP);
+                    hud_y += 8;
+
+                    // Three states share this block, and the first line
+                    // says which one is driving: our software AE loop, the
+                    // sensor's own on-chip loop, or the user.
+                    char bl[24];
+                    char el[24];
+                    uint16_t bcol = WHITE;
+                    camera_exposure_t shown = g_bright_now;
+
+                    if (autoexposure_is_enabled() && autoexposure_available()) {
+                        autoexposure_last_exposure(&shown);
+                        switch (autoexposure_hud_state()) {
+                            case AE_HUD_LOCKED:
+                                snprintf(bl, sizeof(bl), "AE lock %d",
+                                         autoexposure_hud_luma());
+                                break;
+                            case AE_HUD_LIMIT:
+                                // Out of sensor range — the scene is beyond
+                                // what exposure and gain together can reach.
+                                // Worth saying so, or a stuck-looking loop
+                                // reads as a bug.
+                                snprintf(bl, sizeof(bl), "AE limit %d",
+                                         autoexposure_hud_luma());
+                                bcol = YELLOW;
+                                break;
+                            case AE_HUD_HUNTING:
+                                snprintf(bl, sizeof(bl), "AE hunt %d",
+                                         autoexposure_hud_luma());
+                                break;
+                            case AE_HUD_OFF:
+                            default:
+                                // Unreachable while the statistics block is
+                                // up — kept so a future state doesn't fall
+                                // through to a stale label.
+                                snprintf(bl, sizeof(bl), "AE ...");
+                                break;
+                        }
+                    } else if (g_bright_manual) {
+                        snprintf(bl, sizeof(bl), "Bright %d/%d",
+                                 g_bright_step, CAMERA_BRIGHT_MAX);
                     } else {
-                        fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "no pics", hud_font);
-                        hud_y += hud_line;
+                        snprintf(bl, sizeof(bl), "Bright AUTO");
                     }
-                    break;
-                case MODE_CONFIG:
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "UP/DN sel",   hud_font); hud_y += hud_line;
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE tog",   hud_font); hud_y += hud_line;
-                    fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "F4/Esc back", hud_font); hud_y += hud_line;
-                    break;
-            }
 
-            // Exposure readout. Drawn identically in PHOTO and VIDEO
-            // so the value you trim while framing is visibly the same
-            // value you record with — on a sensor with no on-chip AE
-            // this is the single most important number on the screen.
-            // The step is what Q/A move; the line underneath is what
-            // actually reached the registers, which is what you need
-            // when a frame comes back black and you're deciding
-            // between "wrong exposure" and "wrong wiring".
-            if ((mode == MODE_PHOTO || mode == MODE_VIDEO) &&
-                (camera_sensor_has_manual_exposure(&sensor) ||
-                 auto_exposure_possible(&sensor))) {
-                hud_y += 10;
-                fbdraw_fill_rect(&fb, hud_pad_x, hud_y,
-                                 (int)hud_area_w - 20, 1, HUD_SEP);
-                hud_y += 8;
-
-                // Three states share this block, and the first line
-                // says which one is driving: our software AE loop, the
-                // sensor's own on-chip loop, or the user.
-                char bl[24];
-                char el[24];
-                uint16_t bcol = WHITE;
-                camera_exposure_t shown = g_bright_now;
-
-                if (autoexposure_is_enabled() && autoexposure_available()) {
-                    autoexposure_last_exposure(&shown);
-                    switch (autoexposure_hud_state()) {
-                        case AE_HUD_LOCKED:
-                            snprintf(bl, sizeof(bl), "AE lock %d",
-                                     autoexposure_hud_luma());
-                            break;
-                        case AE_HUD_LIMIT:
-                            // Out of sensor range — the scene is beyond
-                            // what exposure and gain together can reach.
-                            // Worth saying so, or a stuck-looking loop
-                            // reads as a bug.
-                            snprintf(bl, sizeof(bl), "AE limit %d",
-                                     autoexposure_hud_luma());
-                            bcol = YELLOW;
-                            break;
-                        case AE_HUD_HUNTING:
-                            snprintf(bl, sizeof(bl), "AE hunt %d",
-                                     autoexposure_hud_luma());
-                            break;
-                        case AE_HUD_OFF:
-                        default:
-                            // Unreachable while the statistics block is
-                            // up — kept so a future state doesn't fall
-                            // through to a stale label.
-                            snprintf(bl, sizeof(bl), "AE ...");
-                            break;
-                    }
-                } else if (g_bright_manual) {
-                    snprintf(bl, sizeof(bl), "Bright %d/%d",
-                             g_bright_step, CAMERA_BRIGHT_MAX);
-                } else {
-                    snprintf(bl, sizeof(bl), "Bright AUTO");
-                }
-
-                if (shown.exposure_us > 0) {
-                    const uint32_t us = shown.exposure_us;
-                    const unsigned gi = (unsigned)(shown.gain_q4 / 16u);
-                    const unsigned gf = (unsigned)(((shown.gain_q4 % 16u) * 10u) / 16u);
-                    if (us >= 1000u) {
-                        snprintf(el, sizeof(el), "%u.%ums %u.%ux",
-                                 (unsigned)(us / 1000u),
-                                 (unsigned)((us % 1000u) / 100u), gi, gf);
+                    if (shown.exposure_us > 0) {
+                        const uint32_t us = shown.exposure_us;
+                        const unsigned gi = (unsigned)(shown.gain_q4 / 16u);
+                        const unsigned gf = (unsigned)(((shown.gain_q4 % 16u) * 10u) / 16u);
+                        if (us >= 1000u) {
+                            snprintf(el, sizeof(el), "%u.%ums %u.%ux",
+                                     (unsigned)(us / 1000u),
+                                     (unsigned)((us % 1000u) / 100u), gi, gf);
+                        } else {
+                            snprintf(el, sizeof(el), "%uus %u.%ux", (unsigned)us, gi, gf);
+                        }
+                        // Amber once the frame period has run out of room
+                        // and further light is being bought with analog
+                        // gain instead of time — i.e. from here up you are
+                        // trading noise for brightness.
+                        if (shown.exposure_capped && bcol == WHITE) bcol = YELLOW;
                     } else {
-                        snprintf(el, sizeof(el), "%uus %u.%ux", (unsigned)us, gi, gf);
+                        // Nothing has written the registers: the sensor's
+                        // own AE loop is in charge and we never asked it
+                        // what it settled on.
+                        snprintf(el, sizeof(el), "sensor AE");
                     }
-                    // Amber once the frame period has run out of room
-                    // and further light is being bought with analog
-                    // gain instead of time — i.e. from here up you are
-                    // trading noise for brightness.
-                    if (shown.exposure_capped && bcol == WHITE) bcol = YELLOW;
-                } else {
-                    // Nothing has written the registers: the sensor's
-                    // own AE loop is in charge and we never asked it
-                    // what it settled on.
-                    snprintf(el, sizeof(el), "sensor AE");
-                }
 
-                // The hint says what the keys do from HERE, not in
-                // general. "Step below the bottom rung to get back to
-                // automatic" is not a thing anyone guesses, so the
-                // bottom rung says it out loud.
-                const char *hint = "Q/A bright";
-                if (!g_bright_manual) {
-                    hint = "Q/A manual";
-                } else if (g_bright_step == CAMERA_BRIGHT_MIN &&
-                           auto_exposure_possible(&sensor)) {
-                    hint = "A = auto";
-                }
-
-                HUD_TEXT_LINE(bcol, bl);
-                HUD_TEXT_LINE(bcol, el);
-                HUD_TEXT_LINE(WHITE, hint);
-            }
-
-            // Focus readout — visible whenever a focus driver is
-            // active and we're not in the config menu (the menu shows
-            // the state already) or the file viewer. Drawn as its own
-            // block separated from the interaction hints above by a
-            // gap and a thin divider line so it reads as a state
-            // panel rather than another keybinding.
-            if (g_focus_present &&
-                mode != MODE_VIEW && mode != MODE_CONFIG) {
-                hud_y += 14;  // gap above the focus block
-                fbdraw_fill_rect(&fb, hud_pad_x, hud_y,
-                                 (int)hud_area_w - 20, 1, HUD_SEP);
-                hud_y += 8;
-
-                char fl[16];
-                snprintf(fl, sizeof(fl), "Focus %4u", (unsigned)g_focus_pos);
-                HUD_TEXT_LINE(WHITE, fl);
-
-                const char *af_msg = "AF: none";
-                if (g_cfg.autofocus_enabled) {
-                    switch (autofocus_hud_state()) {
-                        case AF_HUD_SEARCH:   af_msg = "AF: searching"; break;
-                        case AF_HUD_LOCK:     af_msg = "AF: locked";    break;
-                        case AF_HUD_OVERRIDE: af_msg = "AF: manual";    break;
-                        default:              af_msg = "AF: off";       break;
+                    // The hint says what the keys do from HERE, not in
+                    // general. "Step below the bottom rung to get back to
+                    // automatic" is not a thing anyone guesses, so the
+                    // bottom rung says it out loud.
+                    const char *hint = "Q/A bright";
+                    if (!g_bright_manual) {
+                        hint = "Q/A manual";
+                    } else if (g_bright_step == CAMERA_BRIGHT_MIN &&
+                               auto_exposure_possible(&sensor)) {
+                        hint = "A = auto";
                     }
+
+                    HUD_TEXT_LINE(bcol, bl);
+                    HUD_TEXT_LINE(bcol, el);
+                    HUD_TEXT_LINE(WHITE, hint);
                 }
-                HUD_TEXT_LINE(WHITE, af_msg);
 
-                char dl[24];
-                snprintf(dl, sizeof(dl), "DRV: %s", focus_active_name());
-                HUD_TEXT_LINE(WHITE, dl);
+                // Focus readout — visible whenever a focus driver is
+                // active and we're not in the config menu (the menu shows
+                // the state already) or the file viewer. Drawn as its own
+                // block separated from the interaction hints above by a
+                // gap and a thin divider line so it reads as a state
+                // panel rather than another keybinding.
+                if (g_focus_present &&
+                    mode != MODE_VIEW && mode != MODE_CONFIG) {
+                    hud_y += 14;  // gap above the focus block
+                    fbdraw_fill_rect(&fb, hud_pad_x, hud_y,
+                                     (int)hud_area_w - 20, 1, HUD_SEP);
+                    hud_y += 8;
 
-                HUD_TEXT_LINE(WHITE, "UP/DN focus");
-            }
-            #undef HUD_TEXT_LINE
-            #undef HUD_BOTTOM_Y
+                    char fl[16];
+                    snprintf(fl, sizeof(fl), "Focus %4u", (unsigned)g_focus_pos);
+                    HUD_TEXT_LINE(WHITE, fl);
 
-            // Sensor model footer at the bottom of the HUD strip.
-            // Pinned to a fixed y rather than appended to hud_y so it
-            // never collides with whatever the variable-height blocks
-            // above it (audio meter, focus readout) push down to.
-            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, 458,
-                                  camera_sensor_name(&sensor), hud_font);
+                    const char *af_msg = "AF: none";
+                    if (g_cfg.autofocus_enabled) {
+                        switch (autofocus_hud_state()) {
+                            case AF_HUD_SEARCH:   af_msg = "AF: searching"; break;
+                            case AF_HUD_LOCK:     af_msg = "AF: locked";    break;
+                            case AF_HUD_OVERRIDE: af_msg = "AF: manual";    break;
+                            default:              af_msg = "AF: off";       break;
+                        }
+                    }
+                    HUD_TEXT_LINE(WHITE, af_msg);
+
+                    char dl[24];
+                    snprintf(dl, sizeof(dl), "DRV: %s", focus_active_name());
+                    HUD_TEXT_LINE(WHITE, dl);
+
+                    HUD_TEXT_LINE(WHITE, "UP/DN focus");
+                }
+                #undef HUD_TEXT_LINE
+                #undef HUD_BOTTOM_Y
+
+                // Sensor model footer at the bottom of the HUD strip.
+                // Pinned to a fixed y rather than appended to hud_y so it
+                // never collides with whatever the variable-height blocks
+                // above it (audio meter, focus readout) push down to.
+                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, 458,
+                                      camera_sensor_name(&sensor), hud_font);
+            }  // !fullscreen
 
             // Transient banner (e.g. "Saved IMG_xxx.jpg"). Draw it
             // left-aligned over the preview area so long filenames
