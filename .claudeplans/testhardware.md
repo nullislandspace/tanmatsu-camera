@@ -361,6 +361,61 @@ timing number and the winning byte-order index.
 
 ---
 
+## Test list — Phase 1 (TC358743)
+
+Three tiers, by who can run them.
+
+### A. Automated, no hardware — runnable now, in CI
+
+| # | Test | Status |
+|---|---|---|
+| A1 | 8 byte orders are distinct permutations; 4..7 are 0..3 word-reversed; index 0 is real UYVY; default matches the PR's measured order | **passing** (`tests/host`) |
+| A2 | `yuv422_to_yuv420` emits O_UYY_E_VYY exactly, all 8 orders, chroma row parity correct | **passing** |
+| A3 | `yuv422_to_rgb565` BT.601 primaries: black/white/grey/R/G/B | **passing** |
+| A4 | Neither converter writes past its destination | **passing** |
+| A5 | EDID: header, both checksums, CVT 800x480 @ 59.476 Hz, HDMI VSDB with OUI 000C03 | **passing** (ad hoc — should move into `tests/host`) |
+| A6 | `pick_video_dims(800,480)` -> 400x240, both mult of 16, under `VIDEO_MAX_PIXELS` | **not written** — needs the function extracted or a test shim |
+| A7 | Cross-check `yuv422_to_rgb565` against ffmpeg on a real image rather than 6 synthetic colours | **not written** |
+| A8 | `config_save`/`config_load` round-trip for the three new keys, incl. rejecting junk and accepting a file that predates them | **not written** |
+
+### B. On cavac's hardware (OV5647 / OV9281) — regression, plus one real unknown
+
+Everything in Phase 1 is meant to be invisible here. Baseline against `03fac5f`.
+
+| # | Test | Why |
+|---|---|---|
+| B1 | Boot both sensors; sensor named correctly in HUD; **time from reset to first preview frame unchanged** | Catches the 500 ms POR regression if the fix is wrong |
+| B2 | Preview, photo capture, video record, playback in videoplayer, F1/F2/F3, Q/A brightness, F4 menu | Broad regression |
+| B3 | Config menu: 3 new rows present; HDMI Probe drawn **red**; Color/Bytes **greyed out** | Gating correct on a non-bridge |
+| B4 | `/sd/camera.cfg` gains 3 keys; an old file without them still loads | Config compatibility |
+| B5 | **GPIO6 stays Hi-Z through boot** (scope or meter) with `hdmi_probe=0` | The one that matters — this is a shared expansion pin |
+| B6 | Set `hdmi_probe=1` with a camera attached: bridge pass must never run, GPIO6 still untouched | Two-pass ordering |
+| B7 | Set `hdmi_probe=1` with **no** camera attached: probe runs, reports the line free, drives it, finds nothing, releases it | Exercises the probe path itself |
+| B8 | Boot log shows the TC358743 declining at 0x0F, then the OV driver binding | Detect ordering |
+| B9 | **PPA YUV420-input harness** — synthetic 800x480 pattern through the real conversion + real PPA config, blitted | Risk #5, the biggest blind unknown. Needs ~100 lines of throwaway code |
+
+### C. Needs the TC358743 board — for the PR author
+
+Ordered so each answer narrows the next.
+
+| # | Test | What it settles |
+|---|---|---|
+| C1 | Bridge detected at 0x0F, `CHIPID=0x0000`, format set | I2C + driver bring-up |
+| C2 | **Do frames arrive at all?** Watch `s_cnt_get_new_trans` / `s_cnt_trans_finished` / `s_cnt_srm_done` | Risk #1 — ISP bypass has never worked in this repo. These three separate "CSI never started" from "CSI runs, PPA doesn't" |
+| C3 | Preview geometry: 600x360 centred with 60 px bars | PPA YUV420 in -> RGB565 out, with rotation |
+| C4 | Colour correct? If not, cycle HDMI Bytes and report the index | Byte order |
+| C5 | Report the `yuv422->yuv420: N us/frame` log line | Whether -O2 is enough or SIMD is needed |
+| C6 | Switch HDMI Color to RGB565 — does the picture change? | Isolates a YUV420-input failure from a conversion failure |
+| C7 | Photo: 800x480 JPEG + BMP, viewer displays it | Photo path |
+| C8 | Video: records 400x240, plays in the videoplayer | Video path end to end |
+| C9 | Unplug the HDMI source: NO SIGNAL appears; replug: recovers within ~4 s | Overlay + recovery |
+| C10 | Unplug **while recording**: must not rebuild mid-file; AVI still playable | Recovery is correctly suppressed |
+| C11 | F2/F3 mode switches (each drops HPD and renegotiates) | The 1-3 s black gap is expected, not a bug |
+
+**C2 before anything else.** If frames never arrive, C3-C11 are all noise.
+
+---
+
 ## Phase 2 — F5 fullscreen
 
 Sensor-agnostic, fully testable here, and it must land **before phase 6** because the
