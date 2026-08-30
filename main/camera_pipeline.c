@@ -125,6 +125,9 @@ static SemaphoreHandle_t s_ppa_mutex    = NULL;  // serialises s_ppa access betw
 
 static TaskHandle_t s_receive_task = NULL;
 static TaskHandle_t s_render_task  = NULL;
+// Only ever non-NULL on the CAMERA_INPUT_TEST path, where it stands in
+// for the CSI hardware and its completion ISR.
+static TaskHandle_t s_test_task    = NULL;
 static volatile bool s_running     = false;
 
 // DRAM counters so we can see from task context whether the ISR callbacks
@@ -250,6 +253,97 @@ static const uint8_t *maybe_convert(const uint8_t *src) {
                  YUV422_ORDER_NAMES[yuv422_order_clamp(s_yuv_order)]);
     }
     return s_yuv_conv_buf;
+}
+
+// ---------------------------------------------------------------------
+// Synthetic source (CAMERA_INPUT_TEST)
+//
+// Stands in for the CSI receiver when no sensor was found. It obeys
+// exactly the contract on_get_new_trans + on_trans_finished obey --
+// paint the inactive buffer, promote it to stable, flip active, give
+// s_transfer_done, and freeze the promotion while s_photo_lock is set
+// -- so render_task, camera_photo_snapshot and camera_video_snapshot
+// need to know nothing about any of this.
+// ---------------------------------------------------------------------
+#define TEST_FPS        15u
+#define TEST_GREEN      0x07E0u   // RGB565 pure green
+#define TEST_BAR        0xFFFFu   // RGB565 white
+#define TEST_BAR_W      16u
+
+// Where each buffer's bar was left, so the next repaint only has to
+// erase those columns instead of refilling the whole frame. -1 = the
+// buffer is plain green.
+static int32_t s_test_bar_x[2] = {-1, -1};
+
+// Fill a vertical column range of one camera buffer with a solid
+// colour. Rows are s_src_w pixels of RGB565; s_cam_buf_sz is rounded
+// up to a cache line beyond that, and the tail is never touched.
+static void test_fill_cols(uint8_t *buf, uint32_t x0, uint32_t w, uint16_t color) {
+    if (buf == NULL || x0 >= s_src_w) return;
+    if (x0 + w > s_src_w) w = s_src_w - x0;
+    for (uint32_t y = 0; y < s_src_h; y++) {
+        uint16_t *row = (uint16_t *)(buf + (size_t)y * s_src_w * BYTES_PER_PIXEL);
+        for (uint32_t x = x0; x < x0 + w; x++) {
+            row[x] = color;
+        }
+    }
+}
+
+static void test_source_task(void *arg) {
+    (void)arg;
+
+    // Paint both buffers green once. Everything after this is the bar
+    // moving, which is a couple of columns per frame rather than the
+    // 768 KB a full repaint would cost at 15 Hz.
+    for (int i = 0; i < 2; i++) {
+        test_fill_cols(s_cam_buf[i], 0, s_src_w, TEST_GREEN);
+        s_test_bar_x[i] = -1;
+    }
+
+    // A frame with nothing moving in it cannot tell you whether the
+    // pipeline is running or wedged, and it would also compress to
+    // almost nothing -- a recorded video of a still image exercises
+    // the H.264 encoder barely at all. One sweeping bar fixes both,
+    // crossing the frame in about two seconds.
+    const uint32_t   step   = (s_src_w / (TEST_FPS * 2u)) ? (s_src_w / (TEST_FPS * 2u)) : 1u;
+    const TickType_t period = pdMS_TO_TICKS(1000u / TEST_FPS);
+    uint32_t         bar_x  = 0;
+    TickType_t       last   = xTaskGetTickCount();
+
+    while (s_running) {
+        vTaskDelayUntil(&last, period);
+        if (!s_running) break;
+
+        const int idx = s_cam_active_idx;
+        uint8_t  *buf = s_cam_buf[idx];
+        if (buf) {
+            if (s_test_bar_x[idx] >= 0) {
+                test_fill_cols(buf, (uint32_t)s_test_bar_x[idx], TEST_BAR_W, TEST_GREEN);
+            }
+            test_fill_cols(buf, bar_x, TEST_BAR_W, TEST_BAR);
+            s_test_bar_x[idx] = (int32_t)bar_x;
+        }
+
+        // Same rule as on_get_new_trans: a photo capture in progress
+        // means the stable pointer stays put. We keep painting the
+        // active buffer, exactly as CSI DMA would keep filling it.
+        if (!s_photo_lock) {
+            s_cam_stable     = buf;
+            s_cam_active_idx = idx ^ 1;
+        }
+
+        bar_x += step;
+        if (bar_x >= s_src_w) bar_x = 0;
+
+        // Null-check for the same reason on_trans_finished has one:
+        // camera_preview_stop deletes the semaphore, and we may not
+        // have observed s_running yet.
+        SemaphoreHandle_t sem = s_transfer_done;
+        if (sem) xSemaphoreGive(sem);
+    }
+
+    s_test_task = NULL;
+    vTaskDelete(NULL);
 }
 
 static void render_task(void *arg) {
@@ -413,7 +507,13 @@ static void render_task(void *arg) {
 
 esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint32_t req_h) {
     if (s_running) return ESP_ERR_INVALID_STATE;
-    if (!src || src->width == 0 || src->height == 0 || src->lane_rate_mbps == 0) {
+    if (!src || src->width == 0 || src->height == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Every real source has to name a lane rate; the synthetic one has
+    // no MIPI link to describe and reports 0 rather than inventing a
+    // plausible-looking number.
+    if (src->input_format != CAMERA_INPUT_TEST && src->lane_rate_mbps == 0) {
         return ESP_ERR_INVALID_ARG;
     }
     if (req_w == 0 || req_h == 0) return ESP_ERR_INVALID_ARG;
@@ -573,6 +673,11 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
             isp_in_ct   = ISP_COLOR_YUV422;
             isp_out_ct  = ISP_COLOR_YUV422;
             break;
+        case CAMERA_INPUT_TEST:
+            // Neither the CSI controller nor the ISP is created on
+            // this path, so none of these are ever read. Listed
+            // explicitly so the compiler keeps flagging this switch
+            // when a format is added.
         case CAMERA_INPUT_RGB565:
         default:
             bayer_input = false;
@@ -582,6 +687,12 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
             isp_out_ct  = ISP_COLOR_RGB565;
             break;
     }
+
+    // The synthetic source owns the camera buffers directly. Skip
+    // straight to the PPA -- there is no CSI receiver to configure, no
+    // MIPI PHY to lock, and no ISP to route data through.
+    const bool synthetic = (s_src_input_format == CAMERA_INPUT_TEST);
+    if (synthetic) goto ppa_setup;
 
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id                = 0,
@@ -670,6 +781,7 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
         ESP_LOGI(TAG, "AF + software AE disabled (non-Bayer sensor, ISP in bypass)");
     }
 
+ppa_setup: ;
     ppa_client_config_t ppa_cfg = {
         .oper_type             = PPA_OPERATION_SRM,
         .max_pending_trans_num = 1,
@@ -687,6 +799,16 @@ esp_err_t camera_preview_start(const camera_source_t *src, uint32_t req_w, uint3
 
     s_running = true;
     xTaskCreate(render_task,  "cam_render",  4096, NULL, 5, &s_render_task);
+
+    if (synthetic) {
+        // Same priority as render_task: this task IS the frame source,
+        // and starving it would look exactly like a dead sensor.
+        xTaskCreate(test_source_task, "cam_test", 3072, NULL, 5, &s_test_task);
+        ESP_LOGI(TAG, "preview pipeline started (test pattern, %" PRIu32 "x%" PRIu32
+                      " @ %u fps, no sensor)",
+                 s_src_w, s_src_h, (unsigned)TEST_FPS);
+        return ESP_OK;
+    }
 
     ESP_ERROR_CHECK(esp_cam_ctlr_start(s_csi));
 
@@ -741,6 +863,19 @@ void camera_preview_stop(void) {
     // "assert failed: xQueueGiveFromISR queue.c:1358 (pxQueue)".
     // Graceful exit means render_task always finishes its current
     // ppa op before breaking the loop.
+    // Join the synthetic source first: it writes into s_cam_buf and
+    // gives s_transfer_done, so it has to be gone before either is
+    // torn down. Same clear-the-pointer-then-delete-self handshake as
+    // render_task below.
+    for (int i = 0; i < 200 && s_test_task; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_test_task) {
+        ESP_LOGW(TAG, "test_source_task did not exit cleanly, forcing delete");
+        vTaskDelete(s_test_task);
+        s_test_task = NULL;
+    }
+
     for (int i = 0; i < 200 && s_render_task; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -804,6 +939,7 @@ void camera_preview_stop(void) {
     s_cam_active_idx = 0;
     for (int i = 0; i < 2; i++) {
         if (s_cam_buf[i]) { free(s_cam_buf[i]); s_cam_buf[i] = NULL; }
+        s_test_bar_x[i] = -1;
     }
     s_cam_buf_sz = 0;
     if (s_preview_buffer) { free(s_preview_buffer); s_preview_buffer = NULL; s_preview_buffer_sz = 0; }

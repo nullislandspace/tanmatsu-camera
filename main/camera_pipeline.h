@@ -30,6 +30,20 @@ typedef enum {
     CAMERA_INPUT_RAW10,
     CAMERA_INPUT_RGB565,
     CAMERA_INPUT_YUV422,
+    // No sensor at all. The CSI receiver and the ISP are never
+    // created; a task paints an RGB565 test pattern straight into the
+    // camera buffers and hands them to the render task on the same
+    // double-buffer discipline the CSI completion ISR uses. Everything
+    // downstream -- PPA scale, preview, photo snapshot, video snapshot
+    // -- runs completely unmodified, because from their point of view
+    // a frame is a frame.
+    //
+    // This exists so the application is reachable with no camera
+    // plugged in, which is not a debugging nicety: the HDMI bridge
+    // has to be enabled from the settings menu, and with the old
+    // "no sensor -> error splash -> exit" behaviour that menu could
+    // never be opened on a machine that had nothing else attached.
+    CAMERA_INPUT_TEST,
 } camera_input_format_t;
 
 // What the CPU unpacks CAMERA_INPUT_YUV422 frames into before the PPA

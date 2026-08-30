@@ -35,6 +35,16 @@ static const char *TAG = "camera_sensor";
 // matching mode as the only one it supports, so the HDMI source is
 // told to send precisely this. Preview and video share it.
 #define SHARED_FORMAT_TC358743  "MIPI_2lane_27Minput_YUV422_800x480_60fps"
+// The synthetic source. 800x480 is not an arbitrary choice: it is the
+// panel's own resolution (so F5 fullscreen is an exact 1:1 blit), and
+// pick_video_dims() lands it on k=8 -> 400x240, both multiples of 16,
+// so recording needs no encoder padding. It is also exactly what the
+// TC358743's EDID asks its source for, which makes the test pattern a
+// dry run of the bridge's geometry on hardware nobody has yet.
+#define DUMMY_FORMAT_NAME       "TESTPATTERN_RGB565_800x480_15fps"
+#define DUMMY_WIDTH             800
+#define DUMMY_HEIGHT            480
+#define DUMMY_FPS               15
 
 // OmniVision Timing Group VTS (vertical total size / frame length in
 // lines) register pair. Identical on OV5640, OV5645 and OV5647 — it is
@@ -100,6 +110,10 @@ static sensor_ae_caps_t ae_caps(camera_sensor_kind_t kind) {
             // An HDMI receiver, not an imager. There is no exposure,
             // no gain and no frame-length bank to speak of, and its
             // register space is a different map entirely.
+            return (sensor_ae_caps_t){ false, false, 0x0000, 0x0000, 0x0000, 0 };
+        case CAMERA_SENSOR_DUMMY:
+            // No chip, no bus, no registers. Same answer as the
+            // bridge, for a more emphatic reason.
             return (sensor_ae_caps_t){ false, false, 0x0000, 0x0000, 0x0000, 0 };
         case CAMERA_SENSOR_OV5647:
         case CAMERA_SENSOR_OV5640:
@@ -252,10 +266,40 @@ esp_err_t camera_sensor_detect_scoped(camera_sensor_t *out,
 }
 
 const char *camera_sensor_name(const camera_sensor_t *sensor) {
+    // Checked before the device pointer, which the dummy does not have.
+    // The HUD prints this, so it is also the standing on-screen notice
+    // that what you are looking at is not a camera.
+    if (sensor != NULL && sensor->kind == CAMERA_SENSOR_DUMMY) return "DUMMY";
     if (sensor == NULL || sensor->device == NULL || sensor->device->name == NULL) {
         return "?";
     }
     return sensor->device->name;
+}
+
+// The format the dummy reports. Static rather than built on the stack
+// because callers keep the esp_cam_sensor_format_t they are handed and
+// its `name` has to stay valid; every field a real driver would fill
+// from its register tables is left at zero, including mipi_clk --
+// there is no MIPI link to describe, and camera_preview_start()
+// accepts a zero lane rate for exactly this input format.
+static const esp_cam_sensor_format_t s_dummy_format = {
+    .name      = DUMMY_FORMAT_NAME,
+    .port      = ESP_CAM_SENSOR_MIPI_CSI,
+    .width     = DUMMY_WIDTH,
+    .height    = DUMMY_HEIGHT,
+    .fps       = DUMMY_FPS,
+    .isp_info  = NULL,
+};
+
+void camera_sensor_attach_dummy(camera_sensor_t *out) {
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    out->kind      = CAMERA_SENSOR_DUMMY;
+    out->base_fps  = DUMMY_FPS;
+    // base_vts_lines / cur_vts_lines / row_time_ns stay 0, which is
+    // what makes the fps and exposure entry points decline cleanly.
+    ESP_LOGW(TAG, "No camera sensor -- attaching the %ux%u test pattern",
+             (unsigned)DUMMY_WIDTH, (unsigned)DUMMY_HEIGHT);
 }
 
 void camera_sensor_release(camera_sensor_t *sensor) {
@@ -271,9 +315,17 @@ void camera_sensor_release(camera_sensor_t *sensor) {
 
 esp_err_t camera_sensor_set_format_by_name(camera_sensor_t *sensor, const char *exact_name,
                                            esp_cam_sensor_format_t *out_fmt) {
-    if (sensor == NULL || sensor->device == NULL || exact_name == NULL) {
-        return ESP_ERR_INVALID_ARG;
+    if (sensor == NULL || exact_name == NULL) return ESP_ERR_INVALID_ARG;
+
+    // The dummy has one format and no device to query it from. Answer
+    // before the device null-check so it does not read as an error.
+    if (sensor->kind == CAMERA_SENSOR_DUMMY) {
+        if (strcmp(exact_name, DUMMY_FORMAT_NAME) != 0) return ESP_ERR_NOT_FOUND;
+        if (out_fmt) *out_fmt = s_dummy_format;
+        return ESP_OK;
     }
+
+    if (sensor->device == NULL) return ESP_ERR_INVALID_ARG;
 
     esp_cam_sensor_format_array_t fmt_array = {0};
     bsp_i2c_primary_bus_claim();
@@ -335,6 +387,10 @@ static const char *format_name_for(const camera_sensor_t *sensor, bool video) {
             return SHARED_FORMAT_OV9281;
         case CAMERA_SENSOR_TC358743:
             return SHARED_FORMAT_TC358743;
+        case CAMERA_SENSOR_DUMMY:
+            // One format for every mode, like the single-preset
+            // sensors: PHOTO<->VIDEO changes nothing about the source.
+            return DUMMY_FORMAT_NAME;
         case CAMERA_SENSOR_UNKNOWN:
         default:
             // Unknown sensor — fall back to the OV5647 names. If the
@@ -359,7 +415,14 @@ esp_err_t camera_sensor_set_format_video(camera_sensor_t *sensor, esp_cam_sensor
 }
 
 esp_err_t camera_sensor_set_format_photo(camera_sensor_t *sensor, esp_cam_sensor_format_t *out_fmt) {
-    if (sensor == NULL || sensor->device == NULL) return ESP_ERR_INVALID_ARG;
+    if (sensor == NULL) return ESP_ERR_INVALID_ARG;
+    if (sensor->kind == CAMERA_SENSOR_DUMMY) {
+        // Nothing to walk: the "highest resolution mode" is the only
+        // mode.
+        if (out_fmt) *out_fmt = s_dummy_format;
+        return ESP_OK;
+    }
+    if (sensor->device == NULL) return ESP_ERR_INVALID_ARG;
 
     // Walk the supported format list and pick the highest-resolution MIPI CSI
     // entry. This is version-tolerant: the OV5647 driver has historically
@@ -404,7 +467,13 @@ esp_err_t camera_sensor_set_format_photo(camera_sensor_t *sensor, esp_cam_sensor
 }
 
 esp_err_t camera_sensor_stream(camera_sensor_t *sensor, bool enable) {
-    if (sensor == NULL || sensor->device == NULL) return ESP_ERR_INVALID_ARG;
+    if (sensor == NULL) return ESP_ERR_INVALID_ARG;
+    // The generator task runs for as long as the pipeline does; there
+    // is no stream to start or stop. Reporting success matters: the
+    // photo path stops the stream before snapshotting and app_main
+    // treats a stream failure as fatal.
+    if (sensor->kind == CAMERA_SENSOR_DUMMY) return ESP_OK;
+    if (sensor->device == NULL) return ESP_ERR_INVALID_ARG;
     int flag = enable ? 1 : 0;
 
     bsp_i2c_primary_bus_claim();

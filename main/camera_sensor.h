@@ -28,6 +28,14 @@ typedef enum {
     // and it carries none of the OmniVision register banks -- no
     // exposure, no gain, no VTS.
     CAMERA_SENSOR_TC358743,
+    // Not hardware at all. A stand-in bound by
+    // camera_sensor_attach_dummy() when nothing answered on the bus,
+    // so the application still starts and its settings menu is still
+    // reachable. It owns no SCCB handle and no esp_cam_sensor device;
+    // every register entry point below refuses it, and the pipeline
+    // draws a test pattern instead of receiving frames
+    // (CAMERA_INPUT_TEST in camera_pipeline.h).
+    CAMERA_SENSOR_DUMMY,
 } camera_sensor_kind_t;
 
 // A single detected camera sensor plus the SCCB handle it was opened with.
@@ -86,6 +94,19 @@ typedef enum {
 // of every driver that declines.
 esp_err_t camera_sensor_detect_scoped(camera_sensor_t *out,
                                       camera_detect_scope_t scope);
+
+// Bind *out to the synthetic test-pattern source. Always succeeds and
+// touches no hardware -- there is deliberately no probing involved,
+// because the whole point is to have something to fall back to when
+// probing has already failed.
+//
+// This is not a diagnostic aid bolted on for convenience. The HDMI
+// bridge is only probed for when the user has opted in from the
+// settings menu, and until this existed a device with no other camera
+// attached could not reach that menu: detection failed, the app put
+// up an error splash and stopped. The fallback is what makes the
+// opt-in reachable.
+void camera_sensor_attach_dummy(camera_sensor_t *out);
 
 // Release the SCCB handle for a previously-detected sensor.
 void camera_sensor_release(camera_sensor_t *sensor);

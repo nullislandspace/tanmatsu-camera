@@ -136,6 +136,12 @@ static camera_source_t pick_source(camera_sensor_kind_t kind,
                                : CAMERA_YUV_PATH_YUV420;
             return src;
         }
+        case CAMERA_SENSOR_DUMMY:
+            // No sensor was found and the pipeline generates its own
+            // frames. Dimensions still come from the format so there
+            // is exactly one place that decides them; lane_rate_mbps
+            // stays 0 because there is no MIPI link.
+            return source_from_format(fmt, CAMERA_INPUT_TEST);
         case CAMERA_SENSOR_OV5640:
         case CAMERA_SENSOR_OV5645:
         default:
@@ -428,6 +434,22 @@ static cfg_act_result_t cfg_item_activate(int idx) {
     }
 
     return (*v != prev) ? CFG_ACT_CHANGED : CFG_ACT_NOOP;
+}
+
+// Message to flash after a successful change, or NULL for the usual
+// silent save.
+//
+// Only the HDMI probe needs one. Detection runs once, at boot, so
+// switching the probe on changes nothing until the next reset — and
+// the user most likely to switch it on is the one staring at the test
+// pattern, for whom "nothing happened" is exactly the wrong
+// conclusion to draw.
+static const char *cfg_change_hint(int idx) {
+    const cfg_item_t *it = &g_cfg_items[idx];
+    if (it->target == &g_cfg.hdmi_probe && g_cfg.hdmi_probe) {
+        return "Saved - reboot to probe";
+    }
+    return NULL;
 }
 
 static size_t                       display_h_res        = 0;
@@ -955,6 +977,7 @@ void app_main(void) {
     microphone_set_gain(g_cfg.mic_gain);
     camera_pipeline_set_yuv_order(g_cfg.hdmi_yuv_order);
     bool show_focus_missing_banner = false;
+    bool show_no_camera_banner      = false;
     if (g_cfg.focus_enabled) {
         if (focus_select(g_cfg.focus_driver) == ESP_OK) {
             g_focus_pos     = focus_active()->pos_default;
@@ -992,9 +1015,18 @@ void app_main(void) {
             }
         }
         if (!found) {
-            splash(RED, WHITE, "Camera error", "No sensor detected");
-            wait_for_esc();
-            return;
+            // Falling back rather than stopping. The old behaviour --
+            // error splash, wait for ESC, exit -- made the settings
+            // menu unreachable, and the settings menu is where the
+            // HDMI bridge probe is switched on. A user with nothing
+            // but a bridge attached could therefore never enable the
+            // one thing that would have detected it.
+            //
+            // The test pattern is not disguised as a camera: the HUD
+            // reports the sensor as DUMMY, and a banner says so at
+            // startup.
+            camera_sensor_attach_dummy(&sensor);
+            show_no_camera_banner = true;
         }
     } else if (sensor.kind == CAMERA_SENSOR_TC358743) {
         // A bridge that answered without its enable line may still
@@ -1124,7 +1156,14 @@ void app_main(void) {
     char       banner_text[64] = {0};
     TickType_t banner_until    = 0;
 
-    if (show_focus_missing_banner) {
+    if (show_no_camera_banner) {
+        // Longer than the focus banner and checked first: a green
+        // screen with a bar sweeping across it is not self-explanatory,
+        // and mistaking it for a broken camera would be an easy thing
+        // to do.
+        snprintf(banner_text, sizeof(banner_text), "No camera - test pattern");
+        banner_until = xTaskGetTickCount() + pdMS_TO_TICKS(6000);
+    } else if (show_focus_missing_banner) {
         snprintf(banner_text, sizeof(banner_text), "%s not detected",
                  g_cfg.focus_driver);
         banner_until = xTaskGetTickCount() + pdMS_TO_TICKS(3500);
@@ -1283,6 +1322,8 @@ void app_main(void) {
                             cfg_act_result_t r = cfg_item_activate(g_cfg_sel);
                             if (r == CFG_ACT_CHANGED) {
                                 config_save(&g_cfg);
+                                const char *hint = cfg_change_hint(g_cfg_sel);
+                                if (hint) SHOW_BANNER("%s", hint);
                             } else if (r == CFG_ACT_PROBE_FAILED) {
                                 SHOW_BANNER("%s not detected", g_cfg.focus_driver);
                             }
@@ -1417,6 +1458,8 @@ void app_main(void) {
                             cfg_act_result_t r = cfg_item_activate(g_cfg_sel);
                             if (r == CFG_ACT_CHANGED) {
                                 config_save(&g_cfg);
+                                const char *hint = cfg_change_hint(g_cfg_sel);
+                                if (hint) SHOW_BANNER("%s", hint);
                             } else if (r == CFG_ACT_PROBE_FAILED) {
                                 SHOW_BANNER("%s not detected", g_cfg.focus_driver);
                             }

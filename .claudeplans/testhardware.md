@@ -10,8 +10,9 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 2 done and confirmed on hardware (OV sensors). Phase 1 still untested
-(needs a TC358743). Next: phase 3, the radio cost measurement.
+CURRENT POSITION: Phase 2 done and confirmed on hardware (OV sensors). Phase 2b written and
+building, not yet flashed. Phase 1 still untested (needs a TC358743).
+Next: phase 3, the radio cost measurement.
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
@@ -19,6 +20,7 @@ CURRENT POSITION: Phase 2 done and confirmed on hardware (OV sensors). Phase 1 s
 | 0 | Land this plan in the repo | yes | `[x]` |
 | 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[~]` code done, untested |
 | 2 | F5 fullscreen | yes | `[x]` confirmed on hardware |
+| 2b | Test-pattern source when no camera is found | **yes** (unplug the camera) | `[~]` built, not flashed |
 | 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[ ]` |
 | 4 | BLE transport scaffold | no | `[ ]` |
 | 5 | Catprinter protocol driver | no | `[ ]` |
@@ -469,6 +471,59 @@ F5 ignored while recording; F5→F1→ESC→F5 leaves consistent geometry. Also 
 `viewer_open(DCIM_PATH, preview_area_w, preview_area_h)` (`:1069`) and the banner
 `fill_rect` (`:1714`), which now see 800 in fullscreen — both are generic (`viewer.c:214-225`
 scales by n/16 to fit) but confirm.
+
+---
+
+## Phase 2b — Test-pattern source (unblocks the phase 1 opt-in)
+
+Found by walking through what a TC358743 owner would actually have to do: phase 1.8 puts
+the bridge probe behind a settings toggle that defaults to off, and phase 1.8's own
+fallback on a failed probe was the "No sensor detected" splash, which waits for Esc and
+exits. **A device with nothing but a bridge attached could therefore never reach the menu
+that enables bridge detection.** The opt-in was unreachable by exactly the users it was
+written for.
+
+Fix: when both detection passes come up empty, bind a synthetic source instead of giving
+up.
+
+- `[x]` **2b.1 — `CAMERA_SENSOR_DUMMY` + `camera_sensor_attach_dummy()`.** No SCCB handle,
+  no `esp_cam_sensor_device_t`. `ae_caps` reports no register bank, so every exposure and
+  fps entry point already refuses it through the phase-1.2 guards — no new gating needed.
+  `camera_sensor_stream()` returns `ESP_OK` (there is no stream, and both the photo path
+  and `app_main` treat a stream failure as fatal); the format calls answer from one static
+  `esp_cam_sensor_format_t` rather than querying a device.
+- `[x]` **2b.2 — `CAMERA_INPUT_TEST` in the pipeline.** `camera_preview_start` skips the
+  CSI controller and the ISP entirely and jumps to the PPA client; a generator task paints
+  the camera buffers and drives the same double-buffer handshake `on_get_new_trans` /
+  `on_trans_finished` implement, `s_photo_lock` included. Everything downstream — PPA
+  scale, preview, `camera_photo_snapshot`, `camera_video_snapshot` — is untouched, because
+  a frame is a frame.
+- `[x]` **2b.3 — Fallback + disclosure.** `app_main` attaches the dummy instead of
+  splashing and exiting. The HUD prints the sensor as `DUMMY`, a 6 s banner says
+  "No camera - test pattern" at boot, and toggling HDMI Probe on now flashes
+  "Saved - reboot to probe" — detection only runs at boot, and the user most likely to
+  set that toggle is the one staring at the test pattern.
+- `[ ]` **2b.4 — Confirm on hardware.** Unplug the camera, boot, check: green screen with
+  a bar sweeping across it in ~2 s, HUD says DUMMY, exposure rows greyed out, settings
+  menu reachable, HDMI Probe togglable and persisted. Then reattach a camera and confirm
+  it binds exactly as before.
+
+**Geometry: 800x480 @ 15 fps.** Not arbitrary — it is the panel's own resolution, so F5
+fullscreen is a 1:1 blit, and `pick_video_dims` lands it on k=8 → **400x240**, both
+multiples of 16, so recording needs no encoder padding. It is also precisely what the
+TC358743's EDID demands of its source, which makes the test pattern a dry run of the
+bridge's geometry on hardware nobody has yet.
+
+The pattern is green with one white bar sweeping across in about two seconds. A wholly
+static frame would be cheaper, but it could not tell you whether the pipeline was running
+or wedged, and it would compress to nothing — a recording of a still image exercises the
+H.264 encoder barely at all. The bar costs two column repaints per frame rather than a
+768 KB refill.
+
+**Second use, unplanned but real:** this is a camera-independent load generator. Phase 3
+wants to know what the radio stack costs a running video recording, and the dummy records
+video with no sensor, no CSI DMA and no ISP in the measurement — a cleaner baseline than
+any OV board provides.
 
 ---
 
