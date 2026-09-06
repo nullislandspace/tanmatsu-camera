@@ -68,6 +68,17 @@
 //                            change this if the picture comes out
 //                            with wrong colours or a one-pixel comb
 //                            on vertical edges.
+//   radio_enabled=<0|1>     bring up the WiFi/Bluetooth stack at boot.
+//                            DEFAULT 0. The radio is only needed by the
+//                            BLE thermal printer; with this off nothing
+//                            of it is initialised, so it costs no
+//                            internal SRAM, no SDIO traffic and no boot
+//                            time — the app behaves exactly as it did
+//                            before the stack existed. (It still costs
+//                            flash either way: the code is linked in
+//                            regardless.) Changing this restarts the
+//                            app, because the stack is brought up once
+//                            at boot and never torn down.
 //   mic_gain=<1..8>         digital gain STEP applied during slot
 //                            extraction (before the LPF + resampler).
 //                            Not a raw multiplier — each step is
@@ -96,6 +107,11 @@
 #define CONFIG_HDMI_YUV_ORDER_MIN       0
 #define CONFIG_HDMI_YUV_ORDER_MAX       7
 #define CONFIG_HDMI_YUV_ORDER_DEFAULT   4
+
+// See radio_enabled above. Off by default so the radio stack is opt-in:
+// the printer is a feature used seconds at a time, and the SRAM it wants
+// is the same SRAM the CSI/PPA/H.264 working set lives in.
+#define CONFIG_RADIO_ENABLED_DEFAULT    false
 
 typedef enum {
     HDMI_COLOR_PATH_YUV420 = 0,
@@ -129,6 +145,7 @@ typedef struct {
     bool              hdmi_probe;
     hdmi_color_path_t hdmi_color_path;
     int               hdmi_yuv_order;
+    bool              radio_enabled;
 } camera_config_t;
 
 // Populate *out with defaults, then overlay any values found in

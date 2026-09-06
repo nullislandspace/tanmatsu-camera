@@ -12,6 +12,7 @@
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -268,6 +269,11 @@ static cfg_item_t g_cfg_items[] = {
     { "HDMI Color", CFG_KIND_HDMI_PATH, &g_cfg.hdmi_color_path, 0, 0 },
     { "HDMI Bytes", CFG_KIND_INT,    &g_cfg.hdmi_yuv_order,
                     CONFIG_HDMI_YUV_ORDER_MIN, CONFIG_HDMI_YUV_ORDER_MAX },
+    // The WiFi/Bluetooth stack, needed only by the BLE thermal printer.
+    // Off means genuinely absent: nothing is initialised, so it costs no
+    // internal SRAM, no SDIO traffic and no boot time. Toggling it
+    // restarts the app -- see cfg_change_restarts().
+    { "Radio",      CFG_KIND_BOOL,   &g_cfg.radio_enabled,     0, 0 },
 };
 #define CFG_ITEM_COUNT ((int)(sizeof(g_cfg_items) / sizeof(g_cfg_items[0])))
 static int g_cfg_sel = 0;
@@ -439,17 +445,49 @@ static cfg_act_result_t cfg_item_activate(int idx) {
 // Message to flash after a successful change, or NULL for the usual
 // silent save.
 //
-// Only the HDMI probe needs one. Detection runs once, at boot, so
-// switching the probe on changes nothing until the next reset — and
-// the user most likely to switch it on is the one staring at the test
-// pattern, for whom "nothing happened" is exactly the wrong
-// conclusion to draw.
+// Only the two boot-time rows need one, and both of them get their
+// effect from cfg_change_restarts() below rather than from the hint
+// alone. The hint exists so the restart is announced rather than
+// simply happening.
 static const char *cfg_change_hint(int idx) {
     const cfg_item_t *it = &g_cfg_items[idx];
-    if (it->target == &g_cfg.hdmi_probe && g_cfg.hdmi_probe) {
-        return "Saved - reboot to probe";
+    if (it->target == &g_cfg.hdmi_probe) {
+        return g_cfg.hdmi_probe ? "Probe on - restarting..."
+                                : "Probe off - restarting...";
+    }
+    if (it->target == &g_cfg.radio_enabled) {
+        return g_cfg.radio_enabled ? "Radio on - restarting..."
+                                   : "Radio off - restarting...";
     }
     return NULL;
+}
+
+// Rows whose value is only ever read during boot, so changing one does
+// nothing at all until the next one.
+//
+// Sensor detection runs once, before the pipeline exists, so the HDMI
+// probe cannot be re-run in place. The radio stack is deliberately the
+// same: bringing it up once at boot and never tearing it down means no
+// deinit path has to exist, and the NimBLE and esp-hosted teardown
+// paths are exactly the ones worth not writing. Restarting is the
+// cheaper correctness.
+static bool cfg_change_restarts(int idx) {
+    const cfg_item_t *it = &g_cfg_items[idx];
+    return it->target == &g_cfg.hdmi_probe ||
+           it->target == &g_cfg.radio_enabled;
+}
+
+// Restart back into this app rather than into the launcher.
+//
+// bsp_device_restart_to_launcher() works by zeroing the magic value the
+// launcher left in RTC retain memory, which invalidates the appfs boot
+// struct the bootloader consults; the bootloader then falls back to the
+// launcher. Leaving that magic intact and simply resetting should bring
+// us back up here, since RTC retain memory survives a soft reset.
+static void restart_into_app(void) {
+    viewer_close();
+    ESP_LOGI(TAG, "restarting to apply a boot-time setting");
+    esp_restart();
 }
 
 static size_t                       display_h_res        = 0;
@@ -1155,6 +1193,10 @@ void app_main(void) {
     // Banner state for brief on-screen messages after a save.
     char       banner_text[64] = {0};
     TickType_t banner_until    = 0;
+    // Non-zero once a boot-time setting has been changed: the tick at
+    // which to reset. Deferred rather than immediate so the banner
+    // saying so reaches the panel first.
+    TickType_t restart_at      = 0;
 
     if (show_no_camera_banner) {
         // Longer than the focus banner and checked first: a green
@@ -1324,6 +1366,10 @@ void app_main(void) {
                                 config_save(&g_cfg);
                                 const char *hint = cfg_change_hint(g_cfg_sel);
                                 if (hint) SHOW_BANNER("%s", hint);
+                                if (cfg_change_restarts(g_cfg_sel)) {
+                                    restart_at = xTaskGetTickCount() +
+                                                 pdMS_TO_TICKS(1200);
+                                }
                             } else if (r == CFG_ACT_PROBE_FAILED) {
                                 SHOW_BANNER("%s not detected", g_cfg.focus_driver);
                             }
@@ -1460,6 +1506,10 @@ void app_main(void) {
                                 config_save(&g_cfg);
                                 const char *hint = cfg_change_hint(g_cfg_sel);
                                 if (hint) SHOW_BANNER("%s", hint);
+                                if (cfg_change_restarts(g_cfg_sel)) {
+                                    restart_at = xTaskGetTickCount() +
+                                                 pdMS_TO_TICKS(1200);
+                                }
                             } else if (r == CFG_ACT_PROBE_FAILED) {
                                 SHOW_BANNER("%s not detected", g_cfg.focus_driver);
                             }
@@ -2151,6 +2201,12 @@ void app_main(void) {
                                       display_h_res, display_v_res, fb.pixels);
             fbdraw_swap(&fb);
             t_after_blit = esp_timer_get_time();
+        }
+
+        // A boot-time setting was changed. The banner announcing it has
+        // now been submitted to the panel, so it is safe to go.
+        if (restart_at && xTaskGetTickCount() >= restart_at) {
+            restart_into_app();
         }
 
         // Dump per-stage timings every ~1 s so we can see which step
