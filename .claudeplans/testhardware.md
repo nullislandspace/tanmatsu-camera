@@ -23,7 +23,7 @@ Next: phase 3, the radio cost measurement -- the gate for the catprinter half.
 | 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[x]` complete — bridge itself unverified, author tests |
 | 2 | F5 fullscreen | yes | `[x]` confirmed on hardware |
 | 2b | Test-pattern source when no camera is found | **yes** (`FORCE_NO_SENSOR`) | `[x]` |
-| 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[ ]` |
+| 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[~]` 3.1-3.3 pass; 3.4/3.5 recording outstanding |
 | 4 | BLE transport scaffold | no | `[ ]` |
 | 5 | Catprinter protocol driver | no | `[ ]` |
 | 6 | Print UI integration | no | `[ ]` |
@@ -554,22 +554,78 @@ Second constraint: `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` is **not set**
 (`sdkconfig_tanmatsu:1626`), so WiFi/LWIP buffers land in **internal SRAM** — 768 KB total
 on the P4, already shared with the CSI/PPA/H.264 working set.
 
-- `[ ]` **3.1** On a throwaway branch, add only the three dependencies and the bring-up
+- `[x]` **3.1** On a throwaway branch, add only the three dependencies and the bring-up
   calls — no `ble_peer.c`, no `catprinter.c`, no UI. Build.
-- `[ ]` **3.2** Record `idf.py size` / `size-components` before and after. **Gate: does the
-  binary still fit in 2048 KB, with headroom?**
-  **Baseline measured at step 1.1: `application.bin` = 0xccfd0 = 838096 bytes (819 KB),
-  leaving 0x133030 = 1257520 bytes (60%) free in the 2048 KB partition.** Re-measure at
-  the end of phase 2 before adding the radio, so the delta is attributable.
-- `[ ]` **3.3** Add heap logging to `app_main` (there is none today):
+  **Done on branch `radio-cost`.** Only one registry dependency is actually needed,
+  `nicolaielectronics/tanmatsu-wifi ^1.2.0`; it pulls in `esp-hosted-tanmatsu`,
+  `esp-wifi-remote-tanmatsu` and `wifi-manager` transitively. `bt` and the P4-only
+  `esp-hosted-tanmatsu` go in `PRIV_REQUIRES`. **No sdkconfig change was needed** —
+  `CONFIG_BT_ENABLED`, `CONFIG_BT_NIMBLE_ENABLED`, `CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE`
+  and `CONFIG_ESP_HOSTED_RESET_SLAVE_USING_CALLBACK` were already set in
+  `sdkconfigs/tanmatsu`. The bring-up lives in `main/radio.c`, runs *after* the camera
+  rather than before it, and every failure is a warning.
+- `[x]` **3.2** Record `idf.py size` / `size-components` before and after. **Gate: does the
+  binary still fit in 2048 KB, with headroom?** — **PASSES on the partition, but the
+  partition turned out not to be the real ceiling. See AppFS below.**
+
+  | Build | `application.bin` | Δ |
+  |---|---|---|
+  | Phase 2b tip, no radio | 0x0d0c50 — 855120 B (835 KB) | — |
+  | Dependencies linked, no calls | 0x13b5e0 — 1291232 B (1261 KB) | +426 KB |
+  | Dependencies + bring-up | 0x1525e0 — 1385952 B (1354 KB) | **+519 KB** |
+
+  Leaves 0xada20 = 711200 B (695 KB, 34%) free in the 2048 KB partition. Per-archive:
+  `esp-hosted-tanmatsu` 164994 B (and it is linked `--whole-archive`, so none of it can
+  be dropped by the linker), `lwip` 106594 B, `bt` 88960 B, `esp_netif` 8762 B,
+  `esp-wifi-remote-tanmatsu` 2475 B, `wifi-manager` 1012 B, `tanmatsu-wifi` 249 B.
+
+  **All of this is paid whether or not `radio_enabled` is ever set** — the runtime toggle
+  buys SRAM and CPU, never flash.
+
+  **The constraint the plan missed: AppFS, not the OTA partition.** `make install`
+  uploads into AppFS (8128 KB total), not to `ota_0`. On a badge with six other apps
+  installed the upload failed outright with `Out of FLASH space`: 6848 KB used, and
+  freeing the camera's own ~896 KB left 1280 KB against the 1354 KB needed — 74 KB
+  short. Uploading *deletes the installed copy first*, so a failed upload leaves no
+  camera app on the badge at all. Anyone repeating this should check
+  `badgelink.sh appfs usage` before flashing a grown binary.
+- `[x]` **3.3** Add heap logging to `app_main` (there is none today):
   `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)` and `MALLOC_CAP_SPIRAM`, logged before
   radio init, after radio init, and after `camera_preview_start`. **Gate: how much internal
-  SRAM does the radio stack cost?**
-- `[ ]` **3.4** With the radio up and BLE scanning forever (the PR uses
+  SRAM does the radio stack cost?** — **PASSES, and by a wide margin.**
+
+  Measured on hardware, OV5647 attached, two consecutive boots of the same binary
+  differing only by the `radio_enabled` config bool:
+
+  | Sample | Internal free | PSRAM free | Largest internal block |
+  |---|---|---|---|
+  | boot (after `config_load`) | 479539 | 31113564 | 319488 |
+  | camera up (streaming) | 473947 | 18266072 | 319488 |
+  | radio up (NimBLE synced, scanning) | 432811 | 18265668 | 319488 |
+
+  **The whole radio stack costs 41136 bytes of internal SRAM — 40 KB — and 404 bytes of
+  PSRAM.** The camera pipeline, for comparison, costs 5592 B internal and 12.25 MB PSRAM.
+  The largest free internal block does not move at any point, so nothing here fragments
+  the internal heap. The radio-off boot reproduces the first two rows byte for byte.
+
+  This is far below what the plan feared. `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP` being
+  unset matters much less than expected, presumably because nothing ever associates to an
+  AP — `wifi_connection_init_stack()` is called but no connection is made, so the WiFi RX
+  buffer pools are never populated. **If the printer half ever grows a WiFi feature, this
+  number must be re-measured**; it is a measurement of an idle stack.
+
+  Bring-up is clean: `vhci_drv: Host BT Support: Enabled`, `NimBLE host synced`,
+  `BLE scanning (passive, forever)`, no errors. Radio bring-up costs about 1.1 s of boot
+  time (14338 ms to 15488 ms), most of it the mandatory power cycle in
+  `hosted_reset_slave_callback()` (radio off, 500 ms, radio to application mode, 1200 ms).
+- `[~]` **3.4** With the radio up and BLE scanning forever (the PR uses
   `ble_gap_disc(own_addr_type, BLE_HS_FOREVER, ...)`, passive, filter_duplicates), record
   a video. Compare against a phase-2 baseline recording: preview fps, dropped frames, any
   `srm_done timeout` warnings, AVI frame count vs wall clock, and audio continuity.
   **Gate: is recording still clean?**
+  **Preview fps is already a strong hint: 9.70 fps with the radio up and scanning
+  forever, against 9.73 fps with the radio off, on back-to-back boots. No
+  `srm_done timeout` warnings either way. The recording measurement is still outstanding.**
 - `[ ]` **3.5** Repeat 3.4 with scanning stopped after boot, to separate "the stack exists"
   from "the stack is actively scanning". This directly informs step 4.2.
 
