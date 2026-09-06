@@ -10,15 +10,17 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phases 2 and 2b done and confirmed on hardware. Phase 1 still untested
-(needs a TC358743).
-Next: phase 3, the radio cost measurement.
+CURRENT POSITION: Phases 0, 1, 2 and 2b complete. Steps 1.1-1.10 all landed; no-regression
+testing on OV5647/OV9281 passed. The bridge path itself has never seen a TC358743 -- that
+is the author's to verify, and the byte-order cycler + counters exist for exactly that. No
+further work planned on phase 1 unless hardware turns up or the author reports back.
+Next: phase 3, the radio cost measurement -- the gate for the catprinter half.
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
 |---|---|---|---|
 | 0 | Land this plan in the repo | yes | `[x]` |
-| 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[~]` code done, untested |
+| 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[x]` complete — bridge itself unverified, author tests |
 | 2 | F5 fullscreen | yes | `[x]` confirmed on hardware |
 | 2b | Test-pattern source when no camera is found | **yes** (`FORCE_NO_SENSOR`) | `[x]` |
 | 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[ ]` |
