@@ -901,7 +901,7 @@ void app_main(void) {
     // flip above — the Tanmatsu's monitor mode can take several seconds to
     // re-enumerate, and without this pause the first chunk of startup logs
     // is lost. Uncomment when you need to capture the very first boot logs.
-    vTaskDelay(pdMS_TO_TICKS(10000));
+    // vTaskDelay(pdMS_TO_TICKS(10000));
     // ===== END FOR DEVELOPMENT ONLY =====
 
     // Start the GPIO interrupt service

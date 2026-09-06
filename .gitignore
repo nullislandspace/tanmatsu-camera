@@ -25,3 +25,7 @@ FOCUS_TRACKER.md
 tc358743_registers.md
 
 tests/host/test_yuv_convert
+
+# Editor scratch files
+.*.sw[a-p]
+*~

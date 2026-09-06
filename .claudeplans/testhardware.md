@@ -14,12 +14,17 @@ CURRENT POSITION: Phases 0, 1, 2 and 2b complete. Steps 1.1-1.10 all landed; no-
 testing on OV5647/OV9281 passed. The bridge path itself has never seen a TC358743 -- that
 is the author's to verify, and the byte-order cycler + counters exist for exactly that. No
 further work planned on phase 1 unless hardware turns up or the author reports back.
-Phases 4, 5 and 6 are code-complete on branch `radio-cost` and cannot be tested here --
-no BLE printer. Standing decision from cavac: for anything touching Bluetooth or hardware,
-stay as close to the PR author's implementation as possible, since that code has actually
-talked to a printer and ours never has. The UI and gating decisions remain ours.
-Next: 3.4/3.5 (record a video with the radio on, then off), then hand the printer half to
-the author.
+The catprinter half is DONE and merged to main (v1.6.0, appfs revision 16). Phases 4, 5
+and 6 are code-complete and untestable here -- no BLE printer. Standing decision from
+cavac: for anything touching Bluetooth or hardware, stay as close to the PR author's
+implementation as possible, since that code has actually talked to a printer and ours
+never has. The UI and gating decisions remained ours.
+
+Everything in this plan is now landed except two measurements that need cavac's hardware
+and one that needs the author's:
+  - 3.4/3.5: record a video with the radio on, then off, and compare.
+  - 5.4: time the synchronous dither (needs a connected printer).
+  - Phase 1 end to end (needs a TC358743).
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
@@ -29,9 +34,9 @@ the author.
 | 2 | F5 fullscreen | yes | `[x]` confirmed on hardware |
 | 2b | Test-pattern source when no camera is found | **yes** (`FORCE_NO_SENSOR`) | `[x]` |
 | 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[~]` 3.1-3.3 pass; 3.4/3.5 recording outstanding |
-| 4 | BLE transport scaffold | no | `[x]` code done, untested |
-| 5 | Catprinter protocol driver | no | `[x]` code done, untested |
-| 6 | Print UI integration | no | `[x]` code done, untested |
+| 4 | BLE transport scaffold | no | `[x]` done, untestable here |
+| 5 | Catprinter protocol driver | no | `[x]` done, untestable here |
+| 6 | Print UI integration | no | `[x]` done, untestable here |
 
 Per-step checkboxes live in each phase below. Update both the table and the
 `CURRENT POSITION` line as work proceeds, and commit the change with the code.
