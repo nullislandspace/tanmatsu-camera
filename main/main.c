@@ -30,6 +30,7 @@
 #include "focus/focus_driver.h"
 #include "fbdraw.h"
 #include "photo.h"
+#include "radio.h"
 #include "icons.h"
 #include "intfs.h"
 #include "microphone.h"
@@ -274,6 +275,7 @@ static cfg_item_t g_cfg_items[] = {
     // internal SRAM, no SDIO traffic and no boot time. Toggling it
     // restarts the app -- see cfg_change_restarts().
     { "Radio",      CFG_KIND_BOOL,   &g_cfg.radio_enabled,     0, 0 },
+    { "BLE Scan",   CFG_KIND_BOOL,   &g_cfg.radio_scan,        0, 0 },
 };
 #define CFG_ITEM_COUNT ((int)(sizeof(g_cfg_items) / sizeof(g_cfg_items[0])))
 static int g_cfg_sel = 0;
@@ -297,6 +299,8 @@ static bool cfg_item_enabled(const cfg_item_t *it) {
         it->target == &g_cfg.hdmi_yuv_order) {
         return g_sensor && g_sensor->kind == CAMERA_SENSOR_TC358743;
     }
+    // Nothing to scan with while the stack is not being brought up.
+    if (it->target == &g_cfg.radio_scan) return g_cfg.radio_enabled;
     return true;
 }
 
@@ -459,6 +463,10 @@ static const char *cfg_change_hint(int idx) {
         return g_cfg.radio_enabled ? "Radio on - restarting..."
                                    : "Radio off - restarting...";
     }
+    if (it->target == &g_cfg.radio_scan) {
+        return g_cfg.radio_scan ? "Scan on - restarting..."
+                                : "Scan off - restarting...";
+    }
     return NULL;
 }
 
@@ -474,7 +482,8 @@ static const char *cfg_change_hint(int idx) {
 static bool cfg_change_restarts(int idx) {
     const cfg_item_t *it = &g_cfg_items[idx];
     return it->target == &g_cfg.hdmi_probe ||
-           it->target == &g_cfg.radio_enabled;
+           it->target == &g_cfg.radio_enabled ||
+           it->target == &g_cfg.radio_scan;
 }
 
 // Restart back into this app rather than into the launcher.
@@ -1011,6 +1020,11 @@ void app_main(void) {
     // can (a) apply the mid-range starting position and (b) warn via
     // banner if the module isn't actually attached.
     config_load(&g_cfg);
+    // First of three heap samples. The app has never had any heap
+    // instrumentation, and phase 3 turns on what is by far its largest
+    // consumer of internal SRAM, so "what was free before" has to be a
+    // measured number rather than an assumption.
+    radio_log_heap("boot");
     camera_pipeline_set_rotate_180(g_cfg.rotate_180);
     microphone_set_gain(g_cfg.mic_gain);
     camera_pipeline_set_yuv_order(g_cfg.hdmi_yuv_order);
@@ -1185,6 +1199,21 @@ void app_main(void) {
         splash(RED, WHITE, "Camera error", "Stream start failed");
         wait_for_esc();
         return;
+    }
+    radio_log_heap("camera up");
+
+    // The radio comes up last, and deliberately so. The PR brings it up
+    // in app_main before the camera and splashes fatally if it fails,
+    // which turns a printer problem into a camera that will not boot.
+    // Here the camera already has everything it asked for, and a radio
+    // that does not come up costs exactly the printer.
+    if (g_cfg.radio_enabled) {
+        splash(WHITE, BLACK, "Camera", "Starting radio...");
+        esp_err_t rerr = radio_start(g_cfg.radio_scan);
+        if (rerr != ESP_OK) {
+            ESP_LOGW(TAG, "radio unavailable (%d); continuing without it", rerr);
+        }
+        radio_log_heap("radio up");
     }
 
     app_mode_t mode          = MODE_PHOTO;

@@ -46,7 +46,9 @@ static const char CFG_HEADER[] =
     "# radio_enabled      bring up WiFi/Bluetooth at boot. Only the BLE\n"
     "#                     thermal printer needs it. Off by default: it\n"
     "#                     costs internal SRAM shared with the camera\n"
-    "#                     pipeline. Changing it restarts the app.\n";
+    "#                     pipeline. Changing it restarts the app.\n"
+    "# radio_scan         keep a passive BLE scan running. Needs\n"
+    "#                     radio_enabled=1. Changing it restarts the app.\n";
 
 const char *hdmi_color_path_config_name(hdmi_color_path_t p) {
     return (p == HDMI_COLOR_PATH_RGB565) ? "rgb565" : "yuv420";
@@ -123,6 +125,7 @@ static void defaults(camera_config_t *out) {
     out->hdmi_color_path   = HDMI_COLOR_PATH_YUV420;
     out->hdmi_yuv_order    = CONFIG_HDMI_YUV_ORDER_DEFAULT;
     out->radio_enabled     = CONFIG_RADIO_ENABLED_DEFAULT;
+    out->radio_scan        = CONFIG_RADIO_SCAN_DEFAULT;
 }
 
 static int clamp_mic_gain(int v) {
@@ -180,6 +183,7 @@ esp_err_t config_save(const camera_config_t *cfg) {
     fprintf(f, "hdmi_color_path=%s\n",  hdmi_color_path_config_name(cfg->hdmi_color_path));
     fprintf(f, "hdmi_yuv_order=%d\n",   clamp_hdmi_yuv_order(cfg->hdmi_yuv_order));
     fprintf(f, "radio_enabled=%d\n",    cfg->radio_enabled ? 1 : 0);
+    fprintf(f, "radio_scan=%d\n",       cfg->radio_scan ? 1 : 0);
     fclose(f);
     ESP_LOGI(TAG, "saved %s (driver=%s focus=%d af=%d rot180=%d mic=%s gain=%d ae=%d bright=%d)",
              CONFIG_PATH, cfg->focus_driver,
@@ -295,6 +299,10 @@ esp_err_t config_load(camera_config_t *out) {
         } else if (strcmp(key, "radio_enabled") == 0) {
             if (!parse_bool(val, &out->radio_enabled)) {
                 ESP_LOGW(TAG, "bad value for radio_enabled: '%s'", val);
+            }
+        } else if (strcmp(key, "radio_scan") == 0) {
+            if (!parse_bool(val, &out->radio_scan)) {
+                ESP_LOGW(TAG, "bad value for radio_scan: '%s'", val);
             }
         } else {
             ESP_LOGW(TAG, "unknown key '%s'", key);

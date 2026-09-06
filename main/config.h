@@ -79,6 +79,11 @@
 //                            regardless.) Changing this restarts the
 //                            app, because the stack is brought up once
 //                            at boot and never torn down.
+//   radio_scan=<0|1>        keep a passive BLE scan running while the
+//                            radio is up. Ignored when radio_enabled=0.
+//                            Exists so the cost of "the stack is there"
+//                            can be told apart from the cost of "the
+//                            stack is scanning" -- see phase 3.5.
 //   mic_gain=<1..8>         digital gain STEP applied during slot
 //                            extraction (before the LPF + resampler).
 //                            Not a raw multiplier — each step is
@@ -112,6 +117,7 @@
 // the printer is a feature used seconds at a time, and the SRAM it wants
 // is the same SRAM the CSI/PPA/H.264 working set lives in.
 #define CONFIG_RADIO_ENABLED_DEFAULT    false
+#define CONFIG_RADIO_SCAN_DEFAULT       true
 
 typedef enum {
     HDMI_COLOR_PATH_YUV420 = 0,
@@ -146,6 +152,7 @@ typedef struct {
     hdmi_color_path_t hdmi_color_path;
     int               hdmi_yuv_order;
     bool              radio_enabled;
+    bool              radio_scan;
 } camera_config_t;
 
 // Populate *out with defaults, then overlay any values found in
