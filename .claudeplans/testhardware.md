@@ -14,7 +14,12 @@ CURRENT POSITION: Phases 0, 1, 2 and 2b complete. Steps 1.1-1.10 all landed; no-
 testing on OV5647/OV9281 passed. The bridge path itself has never seen a TC358743 -- that
 is the author's to verify, and the byte-order cycler + counters exist for exactly that. No
 further work planned on phase 1 unless hardware turns up or the author reports back.
-Next: phase 3, the radio cost measurement -- the gate for the catprinter half.
+Phases 4, 5 and 6 are code-complete on branch `radio-cost` and cannot be tested here --
+no BLE printer. Standing decision from cavac: for anything touching Bluetooth or hardware,
+stay as close to the PR author's implementation as possible, since that code has actually
+talked to a printer and ours never has. The UI and gating decisions remain ours.
+Next: 3.4/3.5 (record a video with the radio on, then off), then hand the printer half to
+the author.
 ```
 
 | Phase | Scope | Testable by cavac? | Status |
@@ -24,9 +29,9 @@ Next: phase 3, the radio cost measurement -- the gate for the catprinter half.
 | 2 | F5 fullscreen | yes | `[x]` confirmed on hardware |
 | 2b | Test-pattern source when no camera is found | **yes** (`FORCE_NO_SENSOR`) | `[x]` |
 | 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[~]` 3.1-3.3 pass; 3.4/3.5 recording outstanding |
-| 4 | BLE transport scaffold | no | `[ ]` |
-| 5 | Catprinter protocol driver | no | `[ ]` |
-| 6 | Print UI integration | no | `[ ]` |
+| 4 | BLE transport scaffold | no | `[x]` code done, untested |
+| 5 | Catprinter protocol driver | no | `[x]` code done, untested |
+| 6 | Print UI integration | no | `[x]` code done, untested |
 
 Per-step checkboxes live in each phase below. Update both the table and the
 `CURRENT POSITION` line as work proceeds, and commit the change with the code.
@@ -646,25 +651,48 @@ Record the measurements in this file under phase 3 so the decision is auditable 
 ~1140 lines: `main/ble_peer.{c,h}` (NimBLE's stock `peer` GATT-cache helper, vendored) plus
 ~207 lines of GAP scaffold in `main.c`.
 
-- `[ ]` **4.1** Vendor `ble_peer.{c,h}` from `2c1d2dc` (take the post-`980051f` formatted
+- `[x]` **4.1** Vendor `ble_peer.{c,h}` from `2c1d2dc` (take the post-`980051f` formatted
   version to avoid re-formatting later). Add the three dependencies and the `main.c` GAP
   scaffold: `ble_gap_event`, `ble_on_disc_complete`, `ble_should_connect`,
   `ble_connect_to_device`, `ble_scan`, `ble_on_sync`, `ble_host_task`.
-- `[ ]` **4.2** **Make radio bring-up lazy and non-fatal.** The PR's version aborts the
+  **Done.** `ble_peer.{c,h}` taken verbatim from the PR tip. The GAP scaffold lives in
+  `main/radio.c` rather than `main.c` -- a move, not a rewrite: the logic is the author's,
+  reindented to this repo's 4-space style, and `main.c` has diverged far enough from the
+  PR's copy that pasting into it would have been the riskier option. One behavioural
+  addition: the PR leaves scanning stopped after a disconnect, so one printer walking out
+  of range ends discovery for the rest of the boot; `ble_scan_start()` is now called again
+  from `BLE_GAP_EVENT_DISCONNECT`.
+- `[x]` **4.2** **Make radio bring-up lazy and non-fatal.** Done in the phase 3 work: the
+  key is `radio_enabled` (default 0), bring-up runs *after* the camera rather than before,
+  and every failure is a logged warning. The PR's two `assert(ble_rc == 0)` calls became
+  logged errors -- aborting the app because a printer helper could not allocate is the
+  exact failure mode this gating exists to prevent. Original text: The PR's version aborts the
   whole app if the radio is unavailable — a camera that refuses to start because a printer
   stack failed. Move it behind a config key (`printer_enabled`, default `0`, same
   `config.c` pattern as phase 1.6) and demote every failure to a logged warning plus a
   disabled printer, never `splash` + `return`.
-- `[ ]` **4.3** **Make scanning on-demand, not `BLE_HS_FOREVER`.** Scan when the user opens
-  the print UI or explicitly enables the printer; stop on connect and on leaving the UI.
-  Continuous passive scanning is permanent SDIO traffic, CPU and power for a feature used
-  seconds at a time. Tune with phase 3.5's numbers. **Never scan while recording.**
-- `[ ]` **4.4** Fix the misleading comment claiming the radio shares the camera enable line
+- `[!]` **4.3** **Make scanning on-demand, not `BLE_HS_FOREVER`.** **Deliberately not done;
+  decision reversed by cavac.** Rewriting the author's scan lifecycle is exactly the kind
+  of untestable change we agreed not to make -- it is Bluetooth behaviour, and we have no
+  printer to prove a rewrite against. What we did instead is gate it: `radio_scan`
+  (default 1, greyed out unless `radio_enabled`) decides whether `ble_on_sync` starts the
+  scan at all, so the expensive behaviour is switchable without being restructured. Phase
+  3.4 also weakened the case for the rewrite: 9.70 fps scanning forever against 9.73 fps
+  with the radio off. **Still open: nothing stops scanning while recording.** Left for the
+  author, with the fps numbers attached. Original text: scan when the user opens the print
+  UI or explicitly enables the printer; stop on connect and on leaving the UI.
+- `[x]` **4.4** Fix the misleading comment claiming the radio shares the camera enable line
   "above" (i.e. GPIO6). It does not — camera enable is `CAM_IO0` via
   `bsp_power_set_radio_state()`. With phase 1.8's design GPIO6 is normally never touched, so
   the PR's comment would be doubly wrong.
-- `[ ]` **4.5** Make `ble_addr_str`'s `static char buf` non-reentrant hazard explicit
-  (caller-supplied buffer, or document it as log-only).
+  **Done by omission** -- neither the comment nor the `gpio_set_level(6, true)` it
+  describes was carried over. Radio power is handled entirely inside
+  `hosted_reset_slave_callback()` in `tanmatsu-wifi`, which does
+  `bsp_power_set_radio_state(OFF)`, 500 ms, `(APPLICATION)`, 1200 ms.
+- `[x]` **4.5** Make `ble_addr_str`'s `static char buf` non-reentrant hazard explicit
+  (caller-supplied buffer, or document it as log-only). **Documented as log-only**, called
+  only from the NimBLE host task. Changing the signature would have been a gratuitous
+  divergence from the author's code.
 
 *Verify:* with `printer_enabled=0`, boot time, heap and recording are identical to phase 2.
 With it on and no printer present, the app still starts and records; scanning starts and
@@ -677,38 +705,56 @@ stops where expected.
 ~525 lines, `main/catprinter.{c,h}`. Self-contained: GATT service 0xae30 (advertised
 0xaf30), TX characteristic 0xae01, RX 0xae02 for paper-status notifications.
 
-- `[ ]` **5.1** Vendor `catprinter.{c,h}` from the formatted tip. Route the GAP events from
+- `[x]` **5.1** Vendor `catprinter.{c,h}` from the formatted tip. Route the GAP events from
   phase 4 into `catprinter_on_disc_complete` / `_on_disconnect` / `_on_notify`.
-- `[ ]` **5.2** Review the image path. 384-dot fixed width; a 800×480 photo scales to
+  **Done, verbatim, not one line changed.** All three events are routed from
+  `radio.c`'s `ble_gap_event`.
+- `[x]` **5.2** Review the image path. 384-dot fixed width; a 800×480 photo scales to
   384×230, so the 1-bit bitmap is `230 × 48 ≈ 11 KB` — negligible. Floyd–Steinberg uses two
   `float` error rows (`calloc(out_w, sizeof(float))`); fine, though integer would be
-  cheaper if it ever shows up in profiling.
-- `[ ]` **5.3** Review the transfer path. Chunks at `peer->mtu - 3` with
+  cheaper if it ever shows up in profiling. **Reviewed, nothing changed.**
+- `[x]` **5.3** Review the transfer path. Chunks at `peer->mtu - 3` with
   `vTaskDelay(20 ms)` per chunk in an 8 KB-stack task at priority 5. A full page is ~23
   chunks ≈ 0.5 s of delays — acceptable, but **confirm priority 5 does not preempt the
   video encoder task**, and forbid starting a print while recording.
+  **Both confirmed/done.** Measured priorities: `catprinter_print` 5, `vid_rec` 6,
+  `aud_rec` 6, `mic_rx` 7, `avi_wr` 4, `cam_render` 5. The print task sits *below* both
+  encoder tasks and cannot preempt either; it ties with the preview render task, which is
+  harmless. Printing while recording is refused in `main.c` with a
+  "Recording - stop first" banner.
 - `[ ]` **5.4** `catprinter_print_rgb565` does the dither synchronously on the caller's
   thread before spawning the transfer task. On the main loop that is a visible stall.
   Measure it; move it into the task if it is more than a frame or two.
+  **Cannot be measured here** -- the function is only reachable once a printer is connected
+  and `catprinter_is_ready()`. Left as-is and handed to the author. Note that in photo mode
+  it is preceded by `camera_photo_snapshot()`, which already freezes the preview for most
+  of a second, so the dither is unlikely to be what anyone notices first.
 
 ---
 
 ## Phase 6 — Print UI integration
 
-- `[ ]` **6.1** `P` key handler (`main.c:~1011`), enabled in `MODE_PHOTO` and — from
+- `[x]` **6.1** `P` key handler (`main.c:~1011`), enabled in `MODE_PHOTO` and — from
   `009a2c7` — in `MODE_VIEW` when `viewer_has_image()`. All four viewer accessors
   (`viewer_has_image`, `_get_pixels`, `_get_width`, `_get_height`) already exist in current
   `main` (`viewer.h:31-38`), so that hunk applies cleanly.
-- `[ ]` **6.2** HUD rows: "P print" plus a `Printer: ready / sending / none` status line,
+- `[x]` **6.2** HUD rows: "P print" plus a `Printer: ready / sending / none` status line,
   inside the `if (!fullscreen)` block from phase 2.
-- `[ ]` **6.3** Banners: "Printer not connected" / "Printer busy" / "Printing..." /
+- `[x]` **6.3** Banners: "Printer not connected" / "Printer busy" / "Printing..." /
   "Print failed (%d)". In `MODE_VIEW` the viewer's already-decoded pre-scaled RGB565 bitmap
   is used directly — no snapshot needed, and the printer downscales to 384 dots anyway.
-- `[ ]` **6.4** Hide every printer UI element when `printer_enabled=0`, so the default build
-  looks exactly as it does today.
+- `[x]` **6.4** Hide every printer UI element when the **Radio** setting is off, so the
+  default build looks exactly as it does today. A separate `printer_enabled` key was
+  dropped as redundant: the radio stack exists only for the printer, so `radio_enabled`
+  already is that switch. `printer_ui_enabled()` in `main.c` is the single predicate --
+  it gates the P key, the "P print" hint and the status line.
 
 *Verify (author):* pair, print from photo mode, print from the viewer, print with the
 printer switched off mid-transfer, print with paper out.
+
+**Beyond the PR's UI:** the status line also reports `Printer: no paper` in red, off
+`catprinter_paper_status()` -- the driver already tracked it and the PR never surfaced it.
+`P` is refused while recording.
 
 ---
 

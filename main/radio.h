@@ -28,6 +28,12 @@ esp_err_t radio_start(bool scan_on_sync);
 // True once the NimBLE host has synced and is usable.
 bool radio_is_up(void);
 
+// Start a passive, forever, duplicate-filtered scan -- the same one the PR
+// runs. Called on NimBLE sync when the BLE Scan setting is on, and again
+// after a disconnect so one unplugged printer does not end discovery for
+// the rest of the boot.
+void ble_scan_start(void);
+
 // Free internal SRAM and PSRAM, in bytes. Used by the boot-time cost
 // logging in app_main -- the app has never had any heap instrumentation
 // and phase 3 needs to know what the stack actually costs.

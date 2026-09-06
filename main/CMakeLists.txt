@@ -29,6 +29,8 @@ idf_component_register(
 		"icons.c"
 		"microphone.c"
 		"radio.c"
+		"ble_peer.c"
+		"catprinter.c"
 	PRIV_REQUIRES
 		esp_lcd
 		nvs_flash

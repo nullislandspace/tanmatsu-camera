@@ -11,6 +11,7 @@
 #include "driver/gpio.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -24,6 +25,7 @@
 #include "camera_pipeline.h"
 #include "yuv_convert.h"
 #include "camera_sensor.h"
+#include "catprinter.h"
 #include "autoexposure.h"
 #include "config.h"
 #include "focus/autofocus.h"
@@ -470,6 +472,13 @@ static const char *cfg_change_hint(int idx) {
     return NULL;
 }
 
+// Whether to draw any printer UI at all. With the radio off there is no
+// stack to find a printer with, so a permanently dead "Printer: none"
+// row and a P key that can only ever say "not connected" would be pure
+// noise. This is what keeps the default build looking exactly as it did
+// before the printer existed.
+static bool printer_ui_enabled(void) { return g_cfg.radio_enabled; }
+
 // Rows whose value is only ever read during boot, so changing one does
 // nothing at all until the next one.
 //
@@ -516,6 +525,26 @@ static QueueHandle_t                input_event_queue    = NULL;
 #define HUD_SEP     fbdraw_rgb(96, 96, 96)    // divider line in HUD
 #define BANNER_BG   fbdraw_rgb(0, 0, 128)     // dark blue banner strip
 #define MENU_HL_BG  fbdraw_rgb(64, 64, 0)     // dark yellow highlight in menu
+
+// One-line printer state for the HUD. "none" covers both "the radio is up
+// but nothing answered" and "we found something that was not a printer" --
+// from the user's side those are the same situation. Paper status is shown
+// because the driver already tracks it and running out mid-print is the
+// failure people actually hit.
+static const char *printer_status_line(void) {
+    if (catprinter_is_busy())  return "Printer: sending";
+    if (!catprinter_is_ready()) return "Printer: none";
+    if (catprinter_paper_status() == CATPRINTER_PAPER_OUT) return "Printer: no paper";
+    return "Printer: ready";
+}
+
+static uint16_t printer_status_colour(void) {
+    if (catprinter_is_ready() &&
+        catprinter_paper_status() == CATPRINTER_PAPER_OUT) {
+        return RED;
+    }
+    return catprinter_is_ready() ? WHITE : HUD_SEP;
+}
 
 // Non-blocking display blit. We bypass bsp_display_blit() and manage
 // the DMA-done semaphore ourselves so we can skip frames when the
@@ -872,7 +901,7 @@ void app_main(void) {
     // flip above — the Tanmatsu's monitor mode can take several seconds to
     // re-enumerate, and without this pause the first chunk of startup logs
     // is lost. Uncomment when you need to capture the very first boot logs.
-    // vTaskDelay(pdMS_TO_TICKS(10000));
+    vTaskDelay(pdMS_TO_TICKS(10000));
     // ===== END FOR DEVELOPMENT ONLY =====
 
     // Start the GPIO interrupt service
@@ -1218,6 +1247,7 @@ void app_main(void) {
 
     app_mode_t mode          = MODE_PHOTO;
     bool       space_pending = false;
+    bool       print_pending = false;
 
     // Banner state for brief on-screen messages after a save.
     char       banner_text[64] = {0};
@@ -1546,6 +1576,10 @@ void app_main(void) {
                     } else {
                         space_pending = true;
                     }
+                } else if ((kc == 'p' || kc == 'P') && printer_ui_enabled() &&
+                           (mode == MODE_PHOTO ||
+                            (mode == MODE_VIEW && viewer_has_image()))) {
+                    print_pending = true;
                 } else if ((kc == 'q' || kc == 'Q' || kc == 'a' || kc == 'A') &&
                            (mode == MODE_PHOTO || mode == MODE_VIDEO)) {
                     // Q brighter / A darker. Live in both preview and
@@ -1979,6 +2013,13 @@ void app_main(void) {
                     case MODE_PHOTO:
                         fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "SPACE photo", hud_font);
                         hud_y += hud_line;
+                        if (printer_ui_enabled()) {
+                            fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "P print", hud_font);
+                            hud_y += hud_line;
+                            fbdraw_hershey_string(&fb, printer_status_colour(), hud_pad_x,
+                                                  hud_y, printer_status_line(), hud_font);
+                            hud_y += hud_line;
+                        }
                         break;
                     case MODE_VIDEO:
                         if (video_is_recording()) {
@@ -2048,6 +2089,13 @@ void app_main(void) {
                             hud_y += hud_line;
                             fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "< newer", hud_font); hud_y += hud_line;
                             fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "> older", hud_font); hud_y += hud_line;
+                            if (printer_ui_enabled()) {
+                                fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "P print", hud_font);
+                                hud_y += hud_line;
+                                fbdraw_hershey_string(&fb, printer_status_colour(), hud_pad_x,
+                                                      hud_y, printer_status_line(), hud_font);
+                                hud_y += hud_line;
+                            }
                         } else {
                             fbdraw_hershey_string(&fb, WHITE, hud_pad_x, hud_y, "no pics", hud_font);
                             hud_y += hud_line;
@@ -2252,6 +2300,54 @@ void app_main(void) {
                      (long long)(t_after_blit  - t_after_hud),
                      display_ready);
              */
+        }
+
+        // Cat printer: in photo mode this pays the same freeze-the-preview
+        // cost as a photo capture, because camera_photo_snapshot() does its
+        // own stop-stream/snapshot/resume internally. The dithered bitmap is
+        // then handed to a background task, so the multi-second BLE transfer
+        // does not block the UI loop.
+        if (print_pending) {
+            print_pending = false;
+            if (video_is_recording()) {
+                // The transfer task runs at the same priority as the video
+                // encoder and would be contending with it for seconds.
+                SHOW_BANNER("Recording - stop first");
+            } else if (!catprinter_is_ready()) {
+                SHOW_BANNER("Printer not connected");
+            } else if (catprinter_is_busy()) {
+                SHOW_BANNER("Printer busy");
+            } else if (mode == MODE_VIEW) {
+                // The viewer already holds a decoded, pre-scaled RGB565
+                // bitmap of what is on screen — no snapshot needed, and the
+                // printer downscales to 384 dots anyway.
+                if (viewer_has_image()) {
+                    esp_err_t err = catprinter_print_rgb565(
+                        (const uint16_t *)viewer_get_pixels(),
+                        viewer_get_width(), viewer_get_height());
+                    if (err == ESP_OK) {
+                        SHOW_BANNER("Printing...");
+                    } else {
+                        SHOW_BANNER("Print failed (%d)", err);
+                    }
+                }
+            } else {
+                uint8_t  *snap   = NULL;
+                uint32_t  snap_w = 0, snap_h = 0;
+                esp_err_t err = camera_photo_snapshot(&snap, &snap_w, &snap_h);
+                if (err == ESP_OK && snap != NULL) {
+                    err = catprinter_print_rgb565((const uint16_t *)snap,
+                                                  snap_w, snap_h);
+                    heap_caps_free(snap);
+                    if (err == ESP_OK) {
+                        SHOW_BANNER("Printing...");
+                    } else {
+                        SHOW_BANNER("Print failed (%d)", err);
+                    }
+                } else {
+                    SHOW_BANNER("Snapshot failed (%d)", err);
+                }
+            }
         }
 
         // Photo capture: the preview pipeline is torn down and rebuilt
