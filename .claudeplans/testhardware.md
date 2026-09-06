@@ -10,8 +10,8 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blocked
 
 ```
-CURRENT POSITION: Phase 2 done and confirmed on hardware (OV sensors). Phase 2b written and
-building, not yet flashed. Phase 1 still untested (needs a TC358743).
+CURRENT POSITION: Phases 2 and 2b done and confirmed on hardware. Phase 1 still untested
+(needs a TC358743).
 Next: phase 3, the radio cost measurement.
 ```
 
@@ -20,7 +20,7 @@ Next: phase 3, the radio cost measurement.
 | 0 | Land this plan in the repo | yes | `[x]` |
 | 1 | TC358743 HDMI→CSI support | partly (no-regression only) | `[~]` code done, untested |
 | 2 | F5 fullscreen | yes | `[x]` confirmed on hardware |
-| 2b | Test-pattern source when no camera is found | **yes** (unplug the camera) | `[~]` built, not flashed |
+| 2b | Test-pattern source when no camera is found | **yes** (`FORCE_NO_SENSOR`) | `[x]` |
 | 3 | Radio cost measurement — **gate for 4–6** | **yes** | `[ ]` |
 | 4 | BLE transport scaffold | no | `[ ]` |
 | 5 | Catprinter protocol driver | no | `[ ]` |
@@ -133,7 +133,9 @@ Thereafter: update the status table in the *repo copy* as part of each phase's c
 - **`CONFIG_PM_ENABLE=y` + `CONFIG_PM_DFS_INIT_AUTO=y`** (`sdkconfigs/tanmatsu:36-37`) —
   DFS adds frequency-ramp jitter to a newly CPU-bound path. Say so, so noisy fps numbers
   aren't misdiagnosed.
-- Build with `env -u IDF_PATH make build` — `IDF_PATH` leaks from the session env.
+- Build with plain `make build`. (The toolchain moved to `~/idf/v5.5.1/esp-idf` and the
+  session now exports a correct `IDF_PATH`; the old `env -u IDF_PATH` workaround now breaks
+  the build, because the Makefile's fallback path `./esp-idf` no longer exists.)
 
 ### Steps
 
@@ -345,7 +347,7 @@ logic) · the PR's unguarded GPIO6 block.
 
 ### Phase 1 verification
 
-Per step, on OV5647 and OV9281: `env -u IDF_PATH make build`, flash, confirm preview, photo
+Per step, on OV5647 and OV9281: `make build`, flash, confirm preview, photo
 capture, video record + playback, F1/F2/F3, Q/A brightness and the config menu are
 unchanged. Steps 1.1–1.6 should be observably identical; 1.7 is the first that can regress
 anything (boot time); 1.8–1.10 are inert with `hdmi_probe=0`.
@@ -503,10 +505,12 @@ up.
   "No camera - test pattern" at boot, and toggling HDMI Probe on now flashes
   "Saved - reboot to probe" — detection only runs at boot, and the user most likely to
   set that toggle is the one staring at the test pattern.
-- `[ ]` **2b.4 — Confirm on hardware.** Unplug the camera, boot, check: green screen with
-  a bar sweeping across it in ~2 s, HUD says DUMMY, exposure rows greyed out, settings
-  menu reachable, HDMI Probe togglable and persisted. Then reattach a camera and confirm
-  it binds exactly as before.
+- `[x]` **2b.4 — Confirm on hardware.** Done, and without unplugging anything:
+  `FORCE_NO_SENSOR` in `camera_sensor.c` makes the *ordinary* detect pass report nothing
+  while leaving the bridge pass alone, so HDMI Probe still does a real GPIO6 probe and a
+  real scan at 0x0F. Confirmed: green screen with the sweeping bar, HUD says DUMMY,
+  exposure rows greyed out, settings menu reachable, HDMI Probe togglable and persisted.
+  The hook lives at 0 in the repo; flip it locally to re-test.
 
 **Geometry: 800x480 @ 15 fps.** Not arbitrary — it is the panel's own resolution, so F5
 fullscreen is a 1:1 blit, and `pick_video_dims` lands it on k=8 → **400x240**, both

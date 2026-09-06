@@ -5,3 +5,8 @@ dependencies:
   robotman2412/pax-codecs: "^1.0.1"
   espressif/esp_cam_sensor: "^1.1.0"
   espressif/esp_h264: "^1.3.0"
+  # Not used directly. Pinned because badge-bsp 0.8.0 still passes
+  # .concurrency_semaphore to es8156_initialize, and es8156 0.1.0 dropped
+  # that field -- badge-bsp's own ">=0.0.2" lets the solver pick the
+  # version that does not build. Drop this once badge-bsp catches up.
+  nicolaielectronics/es8156: "0.0.*"

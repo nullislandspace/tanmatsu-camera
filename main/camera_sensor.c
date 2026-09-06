@@ -14,6 +14,15 @@ static const char *TAG = "camera_sensor";
 
 #define SCCB_FREQ_HZ            100000
 
+// Test hook. Set to 1 to make the ordinary detect pass report "nothing
+// there" even with a real sensor plugged in, so the no-camera fallback
+// (test pattern + reachable settings menu) can be exercised without
+// unplugging the camera. The bridge pass is deliberately left alone, so
+// HDMI Probe still does a real GPIO6 probe and a real scan at 0x0F and
+// still fails honestly. Always 0 in the repo -- flip it locally, flip
+// it back before committing.
+#define FORCE_NO_SENSOR         0
+
 // Per-sensor preview / video format names. preview is what mode PHOTO
 // (and VIEW, which reuses the preview as its backdrop) streams at;
 // video is what mode VIDEO streams at. On the OV5647 the two are
@@ -197,6 +206,13 @@ esp_err_t camera_sensor_detect_scoped(camera_sensor_t *out,
                                       camera_detect_scope_t scope) {
     if (out == NULL) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out));
+
+#if FORCE_NO_SENSOR
+    if (scope == CAMERA_DETECT_ORDINARY) {
+        ESP_LOGW(TAG, "FORCE_NO_SENSOR is set -- skipping the sensor scan");
+        return ESP_ERR_NOT_FOUND;
+    }
+#endif
 
     i2c_master_bus_handle_t bus = NULL;
     esp_err_t               err = bsp_i2c_primary_bus_get_handle(&bus);
