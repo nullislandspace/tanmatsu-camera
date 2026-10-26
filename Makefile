@@ -1,5 +1,9 @@
 PORT ?= /dev/ttyACM0
-BADGELINKPORT ?= $(PORT)
+# BadgeLink transport. Empty (the default) means raw USB through libusb, the
+# only thing the P4 exposes in BadgeLink mode (16d0:0f9a, vendor interface
+# ff:00:00, no CDC-ACM, so there is no /dev/ttyACM* for it). host:port
+# selects a TCP proxy, anything else a serial device.
+BADGELINKPORT ?=
 
 IDF_PATH ?= $(shell cat .IDF_PATH 2>/dev/null || echo `pwd`/esp-idf)
 IDF_TOOLS_PATH ?= $(shell cat .IDF_TOOLS_PATH 2>/dev/null || echo `pwd`/esp-idf-tools)
@@ -52,8 +56,9 @@ all: build
 
 # Badgelink
 
-# Determine badgelink connection argument: --tcp for host:port, --port for serial devices
-BADGELINK_CONN := $(if $(findstring :,$(BADGELINKPORT)),--tcp $(BADGELINKPORT),--port $(BADGELINKPORT))
+# Determine badgelink connection argument: --tcp for host:port, --port for serial
+# devices, nothing at all for raw USB (badgelink.py then uses libusb)
+BADGELINK_CONN := $(if $(BADGELINKPORT),$(if $(findstring :,$(BADGELINKPORT)),--tcp $(BADGELINKPORT),--port $(BADGELINKPORT)),)
 
 .PHONY: badgelink
 badgelink:
